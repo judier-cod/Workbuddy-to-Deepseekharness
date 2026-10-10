@@ -14,6 +14,8 @@ import { createServer } from 'node:http';
 
 import { WorkBuddyAdapter, mapUsage } from '../lib/adapter.mjs';
 import { BridgeClient } from '../lib/bridge.mjs';
+import { makeResolveImage } from '../lib/index.js';
+import { creditTag, withCreditTag, isPriceBadge, effectiveCredits, toAdapterModels } from '../lib/models.mjs';
 
 /** 起一个假桥：/health、/v1/models、/v1/chat/completions（SSE 回放）。 */
 async function startStub({ sseFrames = [], status = 200, errorBody = null, capture = null } = {}) {
@@ -67,21 +69,360 @@ async function startStub({ sseFrames = [], status = 200, errorBody = null, captu
   return { server, baseUrl: `http://127.0.0.1:${port}`, close: () => new Promise((r) => server.close(r)) };
 }
 
-function makeAdapter(baseUrl, capture) {
+function makeAdapter(baseUrl, capture, resolveImage, extra = {}) {
   const client = new BridgeClient({ baseUrl, token: 't', timeoutMs: 5000 });
   return new WorkBuddyAdapter({
     provider: 'workbuddy',
     displayName: 'WorkBuddy',
     client,
     ensureReady: async () => client,
-    resolveImage: async () => 'data:image/png;base64,AAAA',
+    resolveImage: resolveImage || (async () => 'data:image/png;base64,AAAA'),
     log: () => {},
     filter: { allow: [], deny: [] },
     catalogTtlMs: 0,
+    ...extra,
   });
 }
 
+/**
+ * 忠实复刻 dsh-attachment-local 的 readImage()：它会把引用里的
+ * mediaType/width/height/bytes 与落盘对象的真实元数据逐项核对，
+ * 对不上就抛 ATTACHMENT_CORRUPT。偏宽松的桩会让这类 bug 溜过去。
+ */
+function makeStrictImageStore(ref, bytes) {
+  const calls = [];
+  return {
+    calls,
+    async readImage(passed) {
+      calls.push(passed);
+      const ok =
+        passed &&
+        passed.attachmentId === ref.attachmentId &&
+        passed.mediaType === ref.mediaType &&
+        passed.width === ref.width &&
+        passed.height === ref.height &&
+        passed.bytes === ref.bytes;
+      if (!ok) {
+        const e = new Error('Stored attachment metadata does not match its reference.');
+        e.code = 'ATTACHMENT_CORRUPT';
+        throw e;
+      }
+      return { ref: passed, data: bytes };
+    },
+  };
+}
+
+/** 真 PNG 头 + 指定宽高，让字节本身也自洽。 */
+function pngBytes(width, height) {
+  const b = Buffer.alloc(24);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(b, 0);
+  b.writeUInt32BE(13, 8);
+  b.write('IHDR', 12, 'ascii');
+  b.writeUInt32BE(width, 16);
+  b.writeUInt32BE(height, 20);
+  return b;
+}
+
 const delta = (d, finish = null) => ({ choices: [{ index: 0, delta: d, finish_reason: finish }] });
+
+/**
+ * 上下文上限（`effectiveContext`）的语义测试。
+ *
+ * 这是"上限"而不是"声称值"，两条方向必须都不出错：
+ *   - 只能压小（目录 1M + 覆盖 200k → 200k）—— 这才是用户想要的
+ *   - **绝不放大**（目录 96k + 覆盖 1M → 96k）—— 放大会让 dsh 以为能塞更多
+ *     历史，然后在上游拿到 context 错误，是更难查的失败
+ */
+test('effectiveContext：只压小，绝不放大', () => {
+  const a = makeAdapter('http://127.0.0.1:1', null, null, {
+    contextOverrides: { 'm-big': 200000, 'm-small': 1000000 },
+    contextMaxTokens: 0,
+  });
+  // 压小：目录 1M，覆盖 200k → 200k
+  assert.equal(a.effectiveContext('m-big', 1000000), 200000);
+  // 不放大：目录 96k，覆盖 1M → 96k
+  assert.equal(a.effectiveContext('m-small', 96000), 96000);
+  // 没有覆盖时保持目录值
+  assert.equal(a.effectiveContext('m-plain', 128000), 128000);
+  // 目录没给值、也没有覆盖 → undefined（不编造）
+  assert.equal(a.effectiveContext('m-unknown', undefined), undefined);
+});
+
+test('effectiveContext：全局上限对所有模型生效，且取三者最小', () => {
+  const a = makeAdapter('http://127.0.0.1:1', null, null, {
+    contextOverrides: { m1: 500000 },
+    contextMaxTokens: 300000,
+  });
+  // 目录 1M、模型覆盖 500k、全局 300k → 300k
+  assert.equal(a.effectiveContext('m1', 1000000), 300000);
+  // 目录 200k 已经小于全局 → 保持 200k（不放大）
+  assert.equal(a.effectiveContext('m2', 200000), 200000);
+  // 全局为 0 = 不限制
+  const b = makeAdapter('http://127.0.0.1:1', null, null, { contextOverrides: {}, contextMaxTokens: 0 });
+  assert.equal(b.effectiveContext('m1', 1000000), 1000000);
+});
+
+test('促销徽章：只把"影响价格判断"的标进展示名', () => {
+  // 免费类与降价类要标 —— 用户据此知道这是时段价，不是常态价
+  for (const good of ['夜间免费', '限时免费', '夜间折扣', '错峰使用', 'Free now', '限时优惠']) {
+    assert.equal(isPriceBadge(good), true, `「${good}」应当标注`);
+  }
+  // 营销文案不标 —— 展示名已带模型名+倍率，再塞噪音就看不清价了
+  for (const noise of ['新上线', '推荐', '热门', '', '   ']) {
+    assert.equal(isPriceBadge(noise), false, `「${noise}」不该标注`);
+  }
+  assert.equal(isPriceBadge(null), false);
+  assert.equal(isPriceBadge(undefined), false);
+  assert.equal(isPriceBadge(123), false, '非字符串不该崩');
+});
+
+/**
+ * 回归：上游目录**漏报倍率**时要能手动补声明。
+ *
+ * 实测国际版目录里 `deepseek-v4.1-flash` 连 `credits` 都没有，但 32433 tokens
+ * 扣分恒为 0（真免费）。漏报导致展示名没有价 —— 用户既怕贵不敢用、
+ * 又不知道它免费。下面钉住覆盖语义与"只收非负数"的防呆。
+ */
+test('倍率覆盖：目录漏报时手动补声明，非法值不采信', () => {
+  const catalog = [
+    { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash' },         // 目录完全没给 credits
+    { id: 'glm-5.2', name: 'GLM-5.2', credits: 0.4, badge: '夜间折扣' }, // 目录有值
+  ];
+  const plain = toAdapterModels(catalog, { showCredits: true });
+  assert.equal(plain[0].name, 'DeepSeek-V4.1-Flash', '目录没给倍率就没有价可标');
+  const ov = toAdapterModels(catalog, { showCredits: true, creditOverrides: { 'deepseek-v4.1-flash': 0 } });
+  assert.equal(ov[0].name, 'DeepSeek-V4.1-Flash · 免费', '覆盖 0 应当显示免费');
+  const ov2 = toAdapterModels(catalog, { showCredits: true, creditOverrides: { 'deepseek-v4.1-flash': 0.11 } });
+  assert.equal(ov2[0].name, 'DeepSeek-V4.1-Flash · 0.11×');
+  const ov3 = toAdapterModels(catalog, { showCredits: true, creditOverrides: { 'glm-5.2': 0.2 } });
+  assert.equal(ov3[1].name, 'GLM-5.2 · 0.2×（夜间折扣）', '覆盖应优先于目录值');
+});
+
+test('effectiveCredits：只收非负数，负数与脏值一律忽略', () => {
+  const m = { id: 'x', credits: 0.5 };
+  assert.deepEqual(effectiveCredits(m, { x: 0 }), { credits: 0, free: true });
+  assert.deepEqual(effectiveCredits(m, { x: 1.2 }), { credits: 1.2, free: false });
+  assert.deepEqual(effectiveCredits(m, { x: '0.3' }), { credits: 0.3, free: false }, '数字字符串要认');
+  for (const bad of [-1, NaN, 'abc', null, undefined, '']) {
+    const got = effectiveCredits(m, { x: bad });
+    assert.equal(got.credits, 0.5, `${JSON.stringify(bad)} 应回落目录值`);
+  }
+  assert.deepEqual(effectiveCredits({ id: 'y', credits: 0, free: true }, {}), { credits: 0, free: true });
+});
+
+test('setCreditOverrides：面板 setter 同样只收非负数', () => {
+  const a = makeAdapter('http://127.0.0.1:1', null, null, {});
+  a.setCreditOverrides({ zero: 0, pos: 0.3, text: '0.5', neg: -1, bad: 'abc', empty: '', nil: null });
+  assert.deepEqual(a.creditOverrides, { zero: 0, pos: 0.3, text: 0.5 });
+  a.setCreditOverrides(null);
+  assert.deepEqual(a.creditOverrides, {});
+  a.setCreditOverrides([]);
+  assert.deepEqual(a.creditOverrides, {});
+});
+
+test('免费无促销来源时不编造说明（国际版 hy4-preview 的实际形状）', () => {
+  const catalog = [
+    // 上游只给 credits:0、无任何促销标注 —— 不能替它写成"限时免费"
+    { id: 'hy4-preview', name: 'Hy4 preview', credits: 0 },
+    { id: 'hy3', name: 'Hy3', credits: 0 },
+    // 有促销来源的才补说明
+    { id: 'hy4-preview-f', name: 'Hy4 preview', credits: 0, free: true, badge: '限时免费' },
+  ];
+  const out = toAdapterModels(catalog, { showCredits: true });
+  const byId = Object.fromEntries(out.map((m) => [m.id, m.name]));
+  assert.equal(byId['hy4-preview'], 'Hy4 preview · 免费', '无促销来源 → 只写免费，不编来源');
+  assert.equal(byId.hy3, 'Hy3 · 免费');
+  assert.equal(byId['hy4-preview-f'], 'Hy4 preview · 免费（限时免费）', '有来源才补说明');
+});
+
+test('展示名：倍率与促销徽章同时出现，且 id 不受影响', () => {
+  const catalog = [
+    // 夜间折扣：0.79 已乘 0.5 → 0.4，徽章说明"为什么便宜"
+    { id: 'glm-5.2', name: 'GLM-5.2', credits: 0.4, badge: '夜间折扣' },
+    { id: 'hy3', name: 'Hy3', credits: 0, free: true, badge: '限时免费' },
+    { id: 'plain', name: 'Plain', credits: 0.11 },
+    // 有徽章但没倍率：只标徽章（用户仍需知道它免费）
+    { id: 'promo-only', name: 'Promo Only', badge: '夜间免费' },
+    { id: 'noisy', name: 'Noisy', credits: 0.5, badge: '新上线' },
+  ];
+  const out = toAdapterModels(catalog, { showCredits: true });
+  const byId = Object.fromEntries(out.map((m) => [m.id, m.name]));
+  assert.equal(byId['glm-5.2'], 'GLM-5.2 · 0.4×（夜间折扣）');
+  assert.equal(byId.hy3, 'Hy3 · 免费（限时免费）');
+  assert.equal(byId.plain, 'Plain · 0.11×');
+  assert.equal(byId['promo-only'], 'Promo Only · 夜间免费');
+  assert.equal(byId.noisy, 'Noisy · 0.5×', '营销徽章不进展示名');
+  // id 永远是路由键，绝不改动
+  assert.deepEqual(out.map((m) => m.id), ['glm-5.2', 'hy3', 'plain', 'promo-only', 'noisy']);
+  // 关掉开关时不带任何标记
+  const off = toAdapterModels(catalog, { showCredits: false });
+  assert.equal(off[0].name, 'GLM-5.2');
+});
+
+test('促销徽章也能从 tags 里取（旧宿主没有字段级 badge）', () => {
+  const catalog = [{ id: 'm', name: 'M', credits: 0.3, tags: ['badge:夜间折扣:#1E90FF'] }];
+  const [m] = toAdapterModels(catalog, { showCredits: true });
+  assert.equal(m.name, 'M · 0.3×（夜间折扣）', '旧宿主把徽章塞在 tags 里，也要认');
+});
+
+test('setContextMaxTokens：面板档位用，非法值一律当成"不限"', () => {
+  const a = makeAdapter('http://127.0.0.1:1', null, null, {});
+  assert.equal(a.setContextMaxTokens(262144), 262144, '262k 档');
+  assert.equal(a.contextMaxTokens, 262144);
+  assert.equal(a.setContextMaxTokens(1000000), 1000000, '1M 档');
+  // 0 / 空 / 非法 → 不限（不是"设成 0 就把上下文禁掉"）
+  for (const bad of [0, -1, NaN, null, undefined, 'abc', 12.5, '']) {
+    assert.equal(a.setContextMaxTokens(bad), 0, `${JSON.stringify(bad)} 应回落到 0（不限）`);
+    assert.equal(a.contextMaxTokens, 0);
+  }
+  // 数字字符串要认（面板传过来可能是字符串）
+  assert.equal(a.setContextMaxTokens('262144'), 262144);
+});
+
+test('262k 档：只压 ≥262k 的模型，更小的原样保留', () => {
+  const a = makeAdapter('http://127.0.0.1:1', null, null, {});
+  a.setContextMaxTokens(262144);
+  assert.equal(a.effectiveContext('big', 1000000), 262144, '1M 压到 262k');
+  assert.equal(a.effectiveContext('mid', 400000), 262144, '400k 也压');
+  assert.equal(a.effectiveContext('small', 256000), 256000, '256k 保持（比档位小，不放大）');
+  assert.equal(a.effectiveContext('tiny', 96000), 96000, '96k 保持');
+  // 1M 档：上游最大就是 1M，等于不限制
+  a.setContextMaxTokens(1000000);
+  assert.equal(a.effectiveContext('big', 1000000), 1000000);
+});
+
+test('图片能力覆盖：目录漏报时可手动声明，且双向都生效', () => {
+  // 复刻真实情况：国际版账号下 deepseek-v4.1-flash 的 supports_images 为空
+  const catalog = [
+    { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash' },
+    { id: 'hy4-preview', name: 'Hy4 preview', supports_images: true },
+    { id: 'text-only', name: 'Text Only' },
+  ];
+  // 不覆盖：照目录走
+  const plain = toAdapterModels(catalog, {});
+  assert.deepEqual(plain[0].inputModalities, ['text'], '目录没声明就不该声称支持');
+  assert.deepEqual(plain[1].inputModalities, ['text', 'image']);
+  // 覆盖 true：目录漏报时补声明
+  const forced = toAdapterModels(catalog, { visionOverrides: { 'deepseek-v4.1-flash': true } });
+  assert.deepEqual(forced[0].inputModalities, ['text', 'image'], '覆盖 true 应声明支持');
+  // 覆盖 false：目录误报时也能压掉
+  const off = toAdapterModels(catalog, { visionOverrides: { 'hy4-preview': false } });
+  assert.deepEqual(off[1].inputModalities, ['text'], '覆盖 false 应压掉目录的声明');
+  assert.deepEqual(off[2].inputModalities, ['text'], '未列出的模型不受影响');
+});
+
+test('setVisionOverrides：只收布尔值，含糊的值一律丢弃', () => {
+  const a = makeAdapter('http://127.0.0.1:1', null, null, {});
+  a.setVisionOverrides({
+    yes: true,
+    no: false,
+    textTrue: 'true',   // 字符串不算：含糊值被当成"支持"会让用户贴图后被上游拒绝
+    one: 1,
+    zero: 0,
+    nullish: null,
+    '': true,
+  });
+  assert.deepEqual(a.visionOverrides, { yes: true, no: false });
+  // 非对象输入不炸
+  a.setVisionOverrides(null);
+  assert.deepEqual(a.visionOverrides, {});
+  a.setVisionOverrides([]);
+  assert.deepEqual(a.visionOverrides, {});
+});
+
+test('resolveModel 也应用图片覆盖（列表显示了，调用判定必须同口径）', async () => {
+  const stub = await startStub();
+  try {
+    // stub 的 stub-model 声明了 supports_images: true
+    const off = makeAdapter(stub.baseUrl, null, null, { visionOverrides: { 'stub-model': false } });
+    const r = await off.resolveModel('workbuddy', 'stub-model');
+    assert.deepEqual(r.inputModalities, ['text'], 'resolveModel 必须与 listModels 同口径');
+  } finally { await stub.close(); }
+});
+
+test('setContextOverrides：非法值一律丢弃（dsh 要求正整数）', () => {
+  const a = makeAdapter('http://127.0.0.1:1', null, null, {});
+  a.setContextOverrides({
+    ok: 128000,
+    // YAML / 表单里数字常写成字符串，这种要认（转得成正整数）
+    numericText: '64000',
+    zero: 0,
+    negative: -1,
+    decimal: 12.5,
+    notANumber: 'abc',
+    nan: NaN,
+    empty: '',
+    nullish: null,
+  });
+  assert.deepEqual(
+    a.contextOverrides,
+    { ok: 128000, numericText: 64000 },
+    '只保留正整数（含可转成正整数的数字字符串）',
+  );
+  // 非对象输入不炸，退化成空覆盖
+  a.setContextOverrides(null);
+  assert.deepEqual(a.contextOverrides, {});
+  a.setContextOverrides('nope');
+  assert.deepEqual(a.contextOverrides, {});
+  a.setContextOverrides([]);
+  assert.deepEqual(a.contextOverrides, {});
+});
+
+test('resolveModel 应用上下文上限：压小生效，放大无效', async () => {
+  const stub = await startStub();
+  try {
+    // stub 里 stub-model 的 context_window = 128000
+    const shrink = makeAdapter(stub.baseUrl, null, null, { contextOverrides: { 'stub-model': 64000 } });
+    assert.equal((await shrink.resolveModel('workbuddy', 'stub-model')).context.contextWindow, 64000);
+
+    const enlarge = makeAdapter(stub.baseUrl, null, null, { contextOverrides: { 'stub-model': 9000000 } });
+    assert.equal((await enlarge.resolveModel('workbuddy', 'stub-model')).context.contextWindow, 128000,
+      '覆盖值大于目录值时必须保持目录值（不能放大）');
+
+    // 非法覆盖值被忽略，回落到目录值
+    const bogus = makeAdapter(stub.baseUrl, null, null, { contextOverrides: { 'stub-model': -5 } });
+    assert.equal((await bogus.resolveModel('workbuddy', 'stub-model')).context.contextWindow, 128000);
+  } finally { await stub.close(); }
+});
+
+test('倍率标记：只标已知数值，不猜、不编造', () => {
+  // 正常倍率：去掉多余小数尾
+  assert.equal(creditTag(0.5), '0.5×');
+  assert.equal(creditTag(0.11), '0.11×');
+  assert.equal(creditTag(2.2), '2.2×');
+  assert.equal(creditTag(1), '1×');
+  assert.equal(creditTag(0.79), '0.79×');
+  // 免费：credits === 0 或显式 free:true
+  assert.equal(creditTag(0), '免费');
+  assert.equal(creditTag(0.5, true), '免费');
+  // 未知 / 非法：不产出标记（宁可没有，也不能标错价）
+  assert.equal(creditTag(undefined), '');
+  assert.equal(creditTag(null), '');
+  assert.equal(creditTag(''), '');
+  assert.equal(creditTag('abc'), '');
+  assert.equal(creditTag(-1), '');
+  assert.equal(creditTag(NaN), '');
+  // 拼装：没有标记时不留下孤零零的分隔符
+  assert.equal(withCreditTag('GLM-5.3', 0.79), 'GLM-5.3 · 0.79×');
+  assert.equal(withCreditTag('GLM-5.3', undefined), 'GLM-5.3');
+});
+
+test('倍率开关：showCredits=false 时名称保持干净，且 id 永不受影响', () => {
+  const catalog = [
+    { id: 'm1', name: 'Model One', credits: 0.25, supports_images: true },
+    { id: 'm2', name: 'Model Two', credits: 0, free: true },
+  ];
+  const on = toAdapterModels(catalog, { showCredits: true });
+  assert.deepEqual(on.map((m) => m.name), ['Model One · 0.25×', 'Model Two · 免费']);
+  const off = toAdapterModels(catalog, { showCredits: false });
+  assert.deepEqual(off.map((m) => m.name), ['Model One', 'Model Two']);
+  // 无论开关如何，id 都是路由键，必须原样
+  assert.deepEqual(on.map((m) => m.id), ['m1', 'm2']);
+  assert.deepEqual(off.map((m) => m.id), ['m1', 'm2']);
+  // 上下文 / 多模态等元数据不受标记影响
+  assert.equal(on[0].contextWindow, undefined);
+  assert.deepEqual(on[0].inputModalities, ['text', 'image']);
+});
 
 test('listModels / resolveModel 使用桥目录的元数据', async () => {
   const stub = await startStub();
@@ -89,10 +430,15 @@ test('listModels / resolveModel 使用桥目录的元数据', async () => {
     const adapter = makeAdapter(stub.baseUrl);
     const models = await adapter.listModels();
     assert.equal(models.length, 2);
-    assert.deepEqual(models[0], { provider: 'workbuddy', id: 'stub-model', name: 'Stub Model', inputModalities: ['text', 'image'] });
+    // 展示名带消耗倍率标记：选择器只渲染 name，倍率看不见就等于盲选。
+    // id 必须保持裸 id（路由键），只有 name 变。
+    assert.deepEqual(models[0], { provider: 'workbuddy', id: 'stub-model', name: 'Stub Model · 0.5×', inputModalities: ['text', 'image'] });
+    assert.deepEqual(models[1], { provider: 'workbuddy', id: 'stub-free', name: 'Stub Free · 免费', inputModalities: ['text'] });
     const resolved = await adapter.resolveModel('workbuddy', 'stub-model');
     assert.equal(resolved.context.contextWindow, 128000);
     assert.equal(resolved.defaultMaxTokens, 8192);
+    // 触发标签（会话标题等处）用干净的名字，不重复倍率后缀
+    assert.equal(resolved.name, 'Stub Model');
     assert.equal(adapter.providerInfo('workbuddy').id, 'workbuddy');
     assert.equal(adapter.providerRetryPolicy().mode, 'normal');
   } finally { await stub.close(); }
@@ -254,6 +600,160 @@ test('wire 请求：developer→system、工具表、图片、max_tokens', async
     assert.equal(body.messages[4].tool_call_id, 'c1');
     assert.equal(body.messages[4].content, 'file body');
     assert.deepEqual(body.tools.map((t) => t.function.name), ['read', 'grep'], 'toolHistory 的动态新增必须一起带上');
+  } finally { await stub.close(); }
+});
+
+test('tool 结果里的图片必须转成 image_url 数组段（read_image 可见性回归）', async () => {
+  const capture = {};
+  const stub = await startStub({
+    sseFrames: [delta({ content: 'ok' }), { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }],
+    capture,
+  });
+  try {
+    const adapter = makeAdapter(stub.baseUrl);
+    for await (const _ of adapter.stream({
+      provider: 'workbuddy',
+      model: 'stub-model',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: '看看这张图' }] },
+        { role: 'assistant', content: [{ type: 'tool-call', id: 'c1', name: 'read_image', arguments: '{"path":"a.png"}' }] },
+        {
+          role: 'tool',
+          toolCallId: 'c1',
+          content: [
+            { type: 'text', text: 'image/png image, 320x200 px' },
+            { type: 'image', attachment: { attachmentId: 'a1', mediaType: 'image/png' } },
+          ],
+        },
+      ],
+    })) { /* drain */ }
+
+    const toolMessage = capture.body.messages.find((m) => m.role === 'tool');
+    assert.ok(toolMessage, 'tool 消息必须存在');
+    assert.ok(Array.isArray(toolMessage.content), '带图的 tool 结果必须是多段数组，否则图片会被整段丢弃');
+    assert.equal(toolMessage.content[0].type, 'text');
+    assert.equal(toolMessage.content[1].type, 'image_url');
+    assert.match(toolMessage.content[1].image_url.url, /^data:image\/png;base64,/);
+  } finally { await stub.close(); }
+});
+
+/**
+ * 回归：resolveImage 必须把**整份** durable 引用交给附件存储。
+ *
+ * 现场症状：用户贴图后，模型只收到 "[图片：无法读取该附件]"，看一眼图都做不到。
+ * 根因：宿主把 { attachmentId, mediaType } 这个**残缺**引用传给
+ * attachments.readImage()，而它会拿引用里的 width/height/bytes 与落盘对象的
+ * 真实元数据逐项核对，对不上就抛 ATTACHMENT_CORRUPT；adapter 侧
+ * `.catch(() => null)` 把异常吞成 null，于是每一张图都退化成文字占位。
+ *
+ * 这里用 makeStrictImageStore 复刻那套核对（偏宽松的桩会让 bug 溜过去），
+ * 断言的是**真的那份 resolveImage 实现**。
+ */
+test('图片回归：残缺引用会被判 ATTACHMENT_CORRUPT，完整引用才能出图', async () => {
+  const attachment = {
+    attachmentId: `sha256:${'a'.repeat(64)}`,
+    mediaType: 'image/png',
+    width: 322,
+    height: 631,
+    bytes: 312562,
+  };
+  const bytes = pngBytes(attachment.width, attachment.height);
+  const store = makeStrictImageStore(attachment, bytes);
+
+  // 1) 残缺引用（旧实现就是这么传的）——必须失败，证明这个桩真的会拦。
+  await assert.rejects(
+    () => store.readImage({ attachmentId: attachment.attachmentId, mediaType: attachment.mediaType }),
+    /metadata does not match/,
+    '桩必须复刻真实存储的元数据核对，否则测不出这个 bug',
+  );
+
+  // 2) 走真的 resolveImage：它必须原样透传整份引用，并产出可用的 data URL。
+  const resolveImage = makeResolveImage((name) => (name === 'attachments' ? store : undefined));
+  const url = await resolveImage(attachment);
+  assert.equal(store.calls.at(-1), attachment,
+    'resolveImage 必须把整份引用（含 width/height/bytes）交给 readImage');
+  assert.match(url, /^data:image\/png;base64,/);
+
+  // 3) 单张图成功，端到端就不再出现占位文字。
+  const capture = {};
+  const stub = await startStub({
+    sseFrames: [delta({ content: 'ok' }), { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }],
+    capture,
+  });
+  try {
+    const adapter = makeAdapter(stub.baseUrl, capture, resolveImage);
+    for await (const _ of adapter.stream({
+      provider: 'workbuddy',
+      model: 'stub-model',
+      messages: [{ role: 'user', content: [{ type: 'text', text: '看图' }, { type: 'image', attachment }] }],
+    })) { /* drain */ }
+
+    const userMessage = capture.body.messages.find((m) => m.role === 'user');
+    const imgPart = userMessage.content.find((p) => p.type === 'image_url');
+    assert.ok(imgPart, '图片必须以 image_url 段下发');
+    assert.doesNotMatch(JSON.stringify(userMessage.content), /无法读取该附件/,
+      '读图成功时绝不能出现"[图片：无法读取该附件]"占位');
+  } finally { await stub.close(); }
+});
+
+/**
+ * 回归：图片读取失败**必须留下原因**，不能静默吞成 null。
+ *
+ * 这是实测故障的根因面：`resolveImage` 把异常吞掉，用户只看到
+ * 「[图片：无法读取该附件]」，完全不知道断在哪一步。加 onError 上报后，
+ * 至少能在日志里看到「attachments 服务不可用」这类可行动的线索。
+ */
+test('makeResolveImage：失败经 onError 上报原因，不静默吞掉', async () => {
+  const seen = [];
+  const onError = (reason) => seen.push(reason);
+
+  // 1) 服务不可用
+  const noService = makeResolveImage(() => undefined, onError);
+  assert.equal(await noService({ attachmentId: 'x', mediaType: 'image/png' }), null);
+  assert.match(seen.at(-1), /attachments 服务不可用/);
+
+  // 2) 引用残缺
+  const noId = makeResolveImage(() => ({}), onError);
+  assert.equal(await noId({ mediaType: 'image/png' }), null);
+  assert.match(seen.at(-1), /缺少 attachmentId/);
+
+  // 3) readImage 抛错（真实场景：元数据核对失败 → ATTACHMENT_CORRUPT）
+  const throwing = makeResolveImage(() => ({
+    async readImage() { const e = new Error('metadata does not match'); e.code = 'ATTACHMENT_CORRUPT'; throw e; },
+  }), onError);
+  assert.equal(await throwing({ attachmentId: 'y', mediaType: 'image/png' }), null);
+  assert.match(seen.at(-1), /readImage 抛错/);
+  assert.match(seen.at(-1), /metadata does not match/);
+
+  // 4) 返回对象里没有字节
+  const noBytes = makeResolveImage(() => ({ async readImage() { return { ref: {} }; } }), onError);
+  assert.equal(await noBytes({ attachmentId: 'z', mediaType: 'image/png' }), null);
+  assert.match(seen.at(-1), /未返回字节/);
+
+  // 上报回调本身抛错也不能影响降级（否则会把宿主拖挂）
+  const badReporter = makeResolveImage(() => undefined, () => { throw new Error('reporter boom'); });
+  assert.equal(await badReporter({ attachmentId: 'q', mediaType: 'image/png' }), null);
+});
+
+test('纯文本 tool 结果仍保持字符串形态（不因上面的修复而改变）', async () => {
+  const capture = {};
+  const stub = await startStub({
+    sseFrames: [delta({ content: 'ok' }), { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }],
+    capture,
+  });
+  try {
+    const adapter = makeAdapter(stub.baseUrl);
+    for await (const _ of adapter.stream({
+      provider: 'workbuddy',
+      model: 'stub-model',
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool-call', id: 'c2', name: 'read', arguments: '{}' }] },
+        { role: 'tool', toolCallId: 'c2', content: [{ type: 'text', text: 'file body' }] },
+      ],
+    })) { /* drain */ }
+
+    const toolMessage = capture.body.messages.find((m) => m.role === 'tool');
+    assert.equal(toolMessage.content, 'file body');
   } finally { await stub.close(); }
 });
 

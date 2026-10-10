@@ -11,22 +11,89 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { locateProviderBlock, stripProviderBlock, cleanFile, detectInFile } from '../lib/legacy.mjs';
-import { resolveConfig, detectProjectRoot, apply, readProjectEnv, DEFAULTS } from '../lib/index.js';
+import { resolveConfig, detectProjectRoot, apply, readProjectEnv, DEFAULTS, asAccounts } from '../lib/index.js';
 import { BridgeSupervisor } from '../lib/bridge.mjs';
 
 /** 真实插件目录（测试里要用它当"源"来造分发布的副本）。 */
 const PLUGIN_ROOT = fileURLToPath(new URL('..', import.meta.url));
 
+/**
+ * 多账号分组：让同一个插件同时暴露多个账号（各自一组 provider）。
+ *
+ * 这里是纯配置解析的用例 —— 起桥与注册路由由 apply() 的冒烟测试覆盖。
+ * 三条防呆必须成立，否则会出现"看起来分组了、实际模型调不通"的静默故障：
+ *   1. id 去重（重名会让后一个静默覆盖前一个的路由）
+ *   2. 端口去重（两个分组抢同一端口 = 必有一个起不来）
+ *   3. provider 名可路由（只留字母数字-_，其余替换）
+ */
+test('asAccounts：解析分组并生成可路由的 provider 名', () => {
+  const list = asAccounts([
+    { id: '1', displayName: 'WorkBuddy 国际版', authFile: 'C:/a/ai.info' },
+    { id: '2', displayName: 'WorkBuddy 国内版', authFile: 'C:/a/cn.info' },
+  ], 'workbuddy', 8790);
+  assert.equal(list.length, 2);
+  assert.equal(list[0].provider, 'workbuddy1');
+  assert.equal(list[1].provider, 'workbuddy2');
+  assert.equal(list[0].displayName, 'WorkBuddy 国际版');
+  assert.equal(list[0].authFile, 'C:/a/ai.info');
+  // 端口自动错开，且都不与主桥冲突
+  assert.notEqual(list[0].port, 8790);
+  assert.notEqual(list[1].port, 8790);
+  assert.notEqual(list[0].port, list[1].port);
+});
+
+test('asAccounts：id 与端口都去重，脏输入不产生半残分组', () => {
+  const list = asAccounts([
+    { id: '1' }, { id: '1' },                        // 重名：第二个丢弃
+    { id: '  ' },                                     // 空 id：丢弃
+    null, 'text', 42,                                 // 非对象：丢弃
+    { id: 'a b/c!' },                                 // 特殊字符 → 规范化
+    { id: 'x', port: 9999 }, { id: 'y', port: 9999 },  // 抢同一端口：第二个丢弃
+    { id: 'z', port: 70000 },                          // 端口越界 → 自动分配
+  ], 'workbuddy', 8790);
+  const ids = list.map((x) => x.id);
+  assert.equal(new Set(ids).size, ids.length, 'id 必须唯一');
+  assert.equal(new Set(list.map((x) => x.port)).size, list.length, '端口必须唯一');
+  assert.ok(!ids.includes(''), '空 id 不该出现');
+  assert.ok(list.every((x) => /^workbuddy[A-Za-z0-9_-]+$/.test(x.provider)), 'provider 名必须可路由');
+  assert.ok(list.every((x) => x.port >= 1024 && x.port <= 65535), '端口必须在合法范围');
+  assert.ok(ids.includes('a-b-c'), `规范化后的 id 应存在，实际：${ids.join(',')}`);
+});
+
+test('asAccounts：空/非法输入 = 空数组（保持单账号行为不变）', () => {
+  for (const bad of [undefined, null, [], 'x', 0]) {
+    assert.deepEqual(asAccounts(bad), [], `${JSON.stringify(bad)} 应解析为空数组`);
+  }
+  // 默认空数组 —— 不配置时行为与升级前完全一致
+  assert.deepEqual(DEFAULTS.accounts, []);
+});
+
+test('resolveConfig：accounts 会被解析进配置，前缀可自定义', () => {
+  const cfg = resolveConfig({ accounts: [{ id: '1' }, { id: '2' }] });
+  assert.equal(cfg.accounts.length, 2);
+  assert.deepEqual(resolveConfig({}).accounts, []);
+});
+
 test('数据面的方法 / 权限矩阵：只读路由拒绝写方法，写路由要求面板头', async () => {
   const { createRouteTable } = await import('../lib/routes.mjs');
+  const stubAdapter = { catalogCache: { at: Date.now(), models: [] }, catalogError: '', catalog: async () => [], invalidate() {}, setFilter() {} };
   const routes = createRouteTable({
     snapshot: async () => ({ bridge: { state: 'running' } }),
     supervisor: { readLog: () => ({ lines: [] }), probe: async () => ({ state: 'running' }), ensure: async () => ({ ok: true }), stop: async () => ({ ok: true }) },
     consoleSupervisor: { probe: async () => ({ state: 'running' }), ensure: async () => ({ ok: true }), stop: async () => ({ ok: true }), url: 'http://127.0.0.1:8792', spawnedPid: null },
     client: { checkin: async () => ({ status: {} }), clearUsage: async () => ({ ok: true }), usage: async () => ({}), requests: async () => ({}), quota: async () => ({}) },
-    adapter: { catalogCache: { at: Date.now(), models: [] }, catalogError: '', catalog: async () => [], invalidate() {} },
+    adapter: stubAdapter,
     paths: { settingsPath: 'x', patchPath: 'y' },
     provider: 'workbuddy',
+    // 多账号：按 provider 解析目标（缺省 = 主 provider）。真实实现只认已注册的。
+    resolveProvider: (name) => {
+      const wanted = String(name || '').trim();
+      if (!wanted || wanted === 'workbuddy') return { id: 'workbuddy', adapter: stubAdapter, isPrimary: true };
+      if (wanted === 'workbuddy-ai') return { id: 'workbuddy-ai', adapter: stubAdapter, isPrimary: false };
+      return null;
+    },
+    readPrefs: () => null,
+    onWritePrefs: () => true,
     log: () => {},
   });
   const byPath = (p) => routes.find((r) => r.path === p);
@@ -50,7 +117,7 @@ test('数据面的方法 / 权限矩阵：只读路由拒绝写方法，写路�
   };
 
   // 只读路由：GET 正常，PUT/PATCH/DELETE 一律 405
-  for (const path of ['/workbuddy/status', '/workbuddy/models', '/workbuddy/requests', '/workbuddy/migrate', '/workbuddy/console', '/workbuddy/quota']) {
+  for (const path of ['/workbuddy/status', '/workbuddy/models', '/workbuddy/requests', '/workbuddy/migrate', '/workbuddy/console', '/workbuddy/quota', '/workbuddy/context-overrides', '/workbuddy/vision-overrides', '/workbuddy/credit-overrides']) {
     const get = await run(path, 'GET');
     assert.equal(get.status, 200, `${path} GET 应当 200`);
     for (const method of ['PUT', 'PATCH', 'DELETE']) {
@@ -58,6 +125,21 @@ test('数据面的方法 / 权限矩阵：只读路由拒绝写方法，写路�
       assert.equal(res.status, 405, `${path} ${method} 应当是 405（只读路由不接受写方法）`);
     }
   }
+
+  // 多账号：未知 provider 必须**明确 400**，不能静默落到主 provider ——
+  // 那会让人以为在改 A 组，实际改到了 B 组。
+  for (const path of ['/workbuddy/models', '/workbuddy/model-visibility']) {
+    const bad = await run(`${path}?provider=nope`, 'GET');
+    assert.equal(bad.status, 400, `${path} 未知 provider 应当 400`);
+    assert.match(String(bad.body?.error || ''), /未知 provider/);
+  }
+  // 已知分组：正常 200，并回显是哪一组
+  const ai = await run('/workbuddy/models?provider=workbuddy-ai', 'GET');
+  assert.equal(ai.status, 200);
+  assert.equal(ai.body?.provider, 'workbuddy-ai');
+  // 缺省 = 主 provider（回显**实际名**，前端靠它做分组对账 —— 见下一条用例）
+  assert.equal((await run('/workbuddy/models', 'GET')).body?.provider, 'workbuddy');
+  assert.equal((await run('/workbuddy/model-visibility', 'GET')).body?.provider, 'workbuddy');
 
   // 写路由：没有面板头一律 403；带上正确头才放行
   const writes = [
@@ -67,6 +149,9 @@ test('数据面的方法 / 权限矩阵：只读路由拒绝写方法，写路�
     ['/workbuddy/quota', 'POST'],
     ['/workbuddy/usage', 'DELETE'],
     ['/workbuddy/log', 'DELETE'],
+    ['/workbuddy/context-overrides', 'POST'],
+    ['/workbuddy/vision-overrides', 'POST'],
+    ['/workbuddy/credit-overrides', 'POST'],
   ];
   for (const [path, method] of writes) {
     const blocked = await run(path, method);
@@ -328,10 +413,11 @@ test('apply() 装配：注册 llm 路由、5 个工具、命令、HTTP 路由', 
     }
     assert.equal(calls.commands.length, 1);
     assert.equal(calls.commands[0].name, 'workbuddy');
-    assert.equal(calls.routes.length, 12, 'HTTP 数据面应有 12 条路由（11 条 exact + 1 条 console-api 前缀）');
+    assert.equal(calls.routes.length, 15, 'HTTP 数据面应有 15 条路由（14 条 exact + 1 条 console-api 前缀）');
     assert.deepEqual(calls.routes.map((r) => r.path).sort(), [
-      '/workbuddy/bridge', '/workbuddy/checkin', '/workbuddy/console', '/workbuddy/console-api', '/workbuddy/log',
-      '/workbuddy/migrate', '/workbuddy/model-visibility', '/workbuddy/models', '/workbuddy/quota', '/workbuddy/requests', '/workbuddy/status', '/workbuddy/usage',
+      '/workbuddy/bridge', '/workbuddy/checkin', '/workbuddy/console', '/workbuddy/console-api', '/workbuddy/context-overrides',
+      '/workbuddy/credit-overrides', '/workbuddy/log', '/workbuddy/migrate', '/workbuddy/model-visibility', '/workbuddy/models',
+      '/workbuddy/quota', '/workbuddy/requests', '/workbuddy/status', '/workbuddy/usage', '/workbuddy/vision-overrides',
     ]);
     const prefix = calls.routes.find((r) => r.path === '/workbuddy/console-api');
     assert.equal(prefix.kind, 'prefix', 'console-api 必须挂成前缀路由');
@@ -500,19 +586,21 @@ test('分发形态：仓库在旁边时优先用仓库（不会被 vendor 快照
 
 test('面板 /workbuddy/models 返回归一化目录（不是上游原始字段名）', async () => {
   const { createRouteTable } = await import('../lib/routes.mjs');
+  const stubAdapter = {
+    catalogCache: { at: Date.now(), models: [] },
+    catalogError: '',
+    async catalog() {
+      return [
+        { id: 'm1', name: 'M One', context_window: 128000, max_output_tokens: 8192, credits: 0.5, supports_images: true, free: false },
+      ];
+    },
+  };
   const route = createRouteTable({
     snapshot: async () => ({}),
     supervisor: { readLog: () => ({ lines: [] }) },
     client: {},
-    adapter: {
-      catalogCache: { at: Date.now(), models: [] },
-      catalogError: '',
-      async catalog() {
-        return [
-          { id: 'm1', name: 'M One', context_window: 128000, max_output_tokens: 8192, credits: 0.5, supports_images: true, free: false },
-        ];
-      },
-    },
+    adapter: stubAdapter,
+    resolveProvider: (name) => (!name || name === 'workbuddy' ? { id: 'workbuddy', adapter: stubAdapter } : null),
     paths: { settingsPath: 'x', patchPath: 'y' },
     provider: 'workbuddy',
     log: () => {},
@@ -802,5 +890,41 @@ test('apply() 的 migrateLegacy 默认会清理指向的文件（用临时目录
     if (previous.dir === undefined) delete process.env.DSH_PROFILE_DIR; else process.env.DSH_PROFILE_DIR = previous.dir;
     if (previous.profile === undefined) delete process.env.DSH_PROFILE; else process.env.DSH_PROFILE = previous.profile;
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * 回归：**主分组的回显必须是实际 provider 名，不能是空串。**
+ *
+ * 面板上的"当前分组"用空串代表主分组，而这两个接口回显的是 "workbuddy"。
+ * 前端若直接拿 `viewProvider`（空串）去比回显值就永远对不上 —— 主分组的
+ * 目录和白名单都加载不出来，表现为"模型没有了"。这里钉住这个契约。
+ */
+test('不传 provider 时回显实际 provider 名（前端靠它做分组对账）', async () => {
+  const { createRouteTable } = await import('../lib/routes.mjs');
+  const stubAdapter = { catalogCache: { at: Date.now(), models: [] }, catalogError: '', catalog: async () => [], invalidate() {}, setFilter() {} };
+  const routes = createRouteTable({
+    snapshot: async () => ({}),
+    supervisor: { readLog: () => ({ lines: [] }) },
+    client: {},
+    adapter: stubAdapter,
+    resolveProvider: (n) => (!n || n === 'workbuddy' ? { id: 'workbuddy', adapter: stubAdapter } : null),
+    readPrefs: () => [],
+    onWritePrefs: () => true,
+    paths: { settingsPath: 'x', patchPath: 'y' },
+    provider: 'workbuddy',
+    log: () => {},
+  });
+  const runOne = async (url) => {
+    const route = routes.find((r) => r.path === url.split('?')[0]);
+    let payload;
+    const res = { writeHead() {}, end(b) { payload = JSON.parse(b); }, on() {}, off() {} };
+    await route.handler({ url, method: 'GET', headers: {} }, res);
+    return payload;
+  };
+  for (const path of ['/workbuddy/models', '/workbuddy/model-visibility']) {
+    const p = await runOne(path);
+    assert.equal(p.ok, true, path + ' 应当 ok');
+    assert.equal(p.provider, 'workbuddy', `${path} 缺省时必须回显实际 provider 名，不能是空串`);
   }
 });

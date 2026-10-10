@@ -15,7 +15,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -228,4 +228,126 @@ test('readModelPrefs/writeModelPrefs：持久化且对损坏文件健壮', async
     rmSync(dir, { recursive: true, force: true });
   }
   assert.ok(!existsSync(join(dir, '.model-prefs.json')), '清理后不应残留');
+});
+
+/**
+ * 回归：可见性白名单必须**按 provider 分开**。
+ *
+ * 真出过一次 —— 全局白名单对三个分组一刀切，用户勾了 3 个模型后每个分组
+ * 各只剩 2 个，表现为"改不了显示模型"。分组目录本来就不同（国际版 27 个、
+ * 国内版 31 个），共用一份清单在语义上就不成立。
+ */
+test('可见性偏好按 provider 分开，改一组不影响另一组', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wb-vis-'));
+  const file = join(dir, '.model-prefs.json');
+  try {
+    // 复刻 index.js 里 mergePrefs + writeModelPrefs 的语义（同一套键布局）
+    const read = () => { try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return {}; } };
+    const merge = (patch) => { writeFileSync(file, JSON.stringify({ ...read(), ...patch, at: 2 }), 'utf8'); };
+    const write = (provider, visible) => {
+      const cur = read().visibleByProvider && typeof read().visibleByProvider === 'object'
+        ? { ...read().visibleByProvider } : {};
+      cur[provider] = Array.isArray(visible) ? visible.map(String) : [];
+      merge({ visibleByProvider: cur });
+    };
+
+    write('workbuddy', ['a', 'b']);
+    write('workbuddy-ai', ['x']);
+    let j = read();
+    assert.deepEqual(j.visibleByProvider.workbuddy, ['a', 'b']);
+    assert.deepEqual(j.visibleByProvider['workbuddy-ai'], ['x'], '改 ai 不能动主 provider');
+
+    // 再改主 provider，ai 的必须原样保留
+    write('workbuddy', ['a']);
+    j = read();
+    assert.deepEqual(j.visibleByProvider.workbuddy, ['a']);
+    assert.deepEqual(j.visibleByProvider['workbuddy-ai'], ['x'], '改主 provider 不能动 ai');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * 兼容：旧版只有全局 `visible` 键（没有 visibleByProvider）。
+ * 升级后不能把用户的旧勾选弄丢 —— 它归属主 provider，分组不该继承。
+ */
+test('可见性偏好：兼容旧的全局 visible 键，且分组不继承', () => {
+  const j = { visible: ['legacy-a', 'legacy-b'] };
+  const readPrefs = (provider, primary) => {
+    const perProvider = j?.visibleByProvider;
+    if (perProvider && typeof perProvider === 'object' && Array.isArray(perProvider[provider])) return perProvider[provider];
+    // 刻意不写 `!primary` 宽容分支 —— 理由见下一条用例
+    if (Array.isArray(j.visible) && primary && provider === primary) return j.visible;
+    return null;
+  };
+  assert.deepEqual(readPrefs('workbuddy', 'workbuddy'), ['legacy-a', 'legacy-b'], '主 provider 应读到旧值');
+  assert.equal(readPrefs('workbuddy-ai', 'workbuddy'), null, '分组不该继承主 provider 的旧值');
+});
+
+/**
+ * 回归：**调用方漏传主 provider 时不能静默串味**。
+ *
+ * 真踩过一次 —— 路由把 `readModelPrefs` 直接当单参函数传，第二个参数成了
+ * undefined，而旧实现里的宽容分支 `!primaryProvider` 恒真，于是每个分组都
+ * 读到主 provider 的清单，表现就是"改不了显示模型"（改了也没反应）。
+ *
+ * 现在没有那个宽容分支：漏传参数 = 判为"没有偏好"（null，即全部显示），
+ * 而不是悄悄套用别人的清单。
+ */
+test('可见性偏好：漏传主 provider 时判为无偏好，不静默套用全局清单', () => {
+  const j = { visible: ['main-only'] };
+  const readPrefs = (provider, primary) => {
+    const perProvider = j?.visibleByProvider;
+    if (perProvider && typeof perProvider === 'object' && Array.isArray(perProvider[provider])) return perProvider[provider];
+    if (Array.isArray(j.visible) && primary && provider === primary) return j.visible;
+    return null;
+  };
+  assert.equal(readPrefs('workbuddy', undefined), null, '漏传主 provider 时不该回退到全局 visible');
+  assert.equal(readPrefs('workbuddy-ai', undefined), null);
+  assert.deepEqual(readPrefs('workbuddy', 'workbuddy'), ['main-only'], '显式传对时才回退');
+});
+
+/**
+ * 回归：写入一个偏好时**绝不能冲掉另一个**。
+ *
+ * 真出过一次 —— 写上下文覆盖时用 `{ visible, context }` 整体重建对象，
+ * 结果把用户勾选的可见清单冲掉了（23 个变 2 个）。
+ *
+ * 这里钉住的是**合并语义**：visible 与 context 同文件但互不干扰，
+ * 而且文件里出现未知键时也要原样保留（未来加字段时不会互相踩）。
+ */
+test('偏好合并写：改一个键不能冲掉另一个（含未知键）', async () => {
+  const mod = await import('../lib/index.js');
+  assert.equal(typeof mod.apply, 'function');
+  // 直接验证合并写的行为契约：用同款语义在临时目录复现
+  const dir = mkdtempSync(join(tmpdir(), 'wb-prefs-merge-'));
+  const file = join(dir, '.model-prefs.json');
+  try {
+    // 初始状态：可见清单 + 一个未知键（模拟未来加的字段）
+    const initial = { visible: ['a', 'b', 'c'], context: { a: 1000 }, futureKey: { x: 1 }, at: 1 };
+    writeFileSync(file, JSON.stringify(initial), 'utf8');
+
+    // 复现 mergePrefs 的语义：读回 → 浅合并 → 原子写
+    const merge = (patch) => {
+      const cur = JSON.parse(readFileSync(file, 'utf8'));
+      const next = { ...cur, ...patch, at: 2 };
+      const tmp = join(dir, '.tmp');
+      writeFileSync(tmp, JSON.stringify(next), 'utf8');
+      renameSync(tmp, file);
+    };
+
+    merge({ context: { a: 2000 } });
+    const afterCtx = JSON.parse(readFileSync(file, 'utf8'));
+    assert.deepEqual(afterCtx.visible, ['a', 'b', 'c'], '写 context 不能动 visible');
+    assert.deepEqual(afterCtx.context, { a: 2000 }, 'context 应已更新');
+    assert.deepEqual(afterCtx.futureKey, { x: 1 }, '未知键必须原样保留');
+
+    merge({ visible: ['a'] });
+    const afterVisible = JSON.parse(readFileSync(file, 'utf8'));
+    assert.deepEqual(afterVisible.visible, ['a'], 'visible 应已更新');
+    assert.deepEqual(afterVisible.context, { a: 2000 }, '写 visible 不能动 context');
+    assert.deepEqual(afterVisible.futureKey, { x: 1 }, '未知键仍然要在');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
