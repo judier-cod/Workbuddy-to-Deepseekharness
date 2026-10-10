@@ -25,7 +25,7 @@
  * （只调用 providerInfo / providerRetryPolicy，没有 instanceof 检查）。
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -58,17 +58,249 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  */
 const MODEL_PREFS_PATH = join(PLUGIN_DIR, '.model-prefs.json');
 
-function readModelPrefs() {
+/**
+ * 读某个 provider 的模型可见性白名单。
+ *
+ * **多账号下必须按 provider 分开存**：各分组的目录不同（国际版 27 个、
+ * 国内版 31 个），用一份全局白名单会一刀切 —— 之前就是这样，勾了 3 个模型后
+ * 三个分组各只剩 2 个，用户"改不了显示模型"。
+ *
+ * 兼容旧的全局 `visible` 键：它只用于主 provider，读不到分组键时回退到它。
+ *
+ * @param {string} provider provider 名（如 workbuddy / workbuddy-ai）
+ * @param {string} [primaryProvider] 主 provider（旧 visible 键归属它）
+ */
+function readModelPrefs(provider, primaryProvider) {
   try {
     const j = JSON.parse(readFileSync(MODEL_PREFS_PATH, 'utf8'));
-    return Array.isArray(j.visible) ? j.visible.map(String) : null;
+    // 分组键优先
+    const perProvider = j?.visibleByProvider;
+    if (perProvider && typeof perProvider === 'object' && Array.isArray(perProvider[provider])) {
+      return perProvider[provider].map(String);
+    }
+    /**
+     * 回退到旧版全局 `visible`：**只对主 provider 生效**。
+     *
+     * 注意这里刻意**不写** `!primaryProvider` 那种宽容分支 —— 那会让"调用方
+     * 忘了传主 provider"变成静默回退到全局清单，所有分组都读到主 provider 的
+     * 旧值。真踩过一次：路由直接传函数引用，第二个参数是 undefined，于是
+     * 三个分组都显示同一份清单。宁可这里判为"没有偏好"，也不要静默串味。
+     */
+    if (Array.isArray(j.visible) && primaryProvider && provider === primaryProvider) {
+      return j.visible.map(String);
+    }
+    return null;
   } catch { return null; }
 }
 
-function writeModelPrefs(visible) {
+/**
+ * 读整个 prefs 对象（含未知键）。
+ *
+ * 为什么不能直接 `JSON.parse` 后只挑 visible/context 再写回：那样会**丢掉
+ * 文件里其它一切键**。真出过一次 —— 写上下文覆盖时把用户勾选的可见清单
+ * 冲掉了（23 个变 2 个）。所以写入一律走 {@link mergePrefs}，它保留未知键。
+ */
+function readPrefsFile() {
   try {
-    writeFileSync(MODEL_PREFS_PATH, `${JSON.stringify({ visible, at: Date.now() }, null, 2)}\n`, 'utf8');
-  } catch { /* 只读介质：本次运行生效，不持久化 */ }
+    const j = JSON.parse(readFileSync(MODEL_PREFS_PATH, 'utf8'));
+    return j && typeof j === 'object' && !Array.isArray(j) ? j : {};
+  } catch { return {}; }
+}
+
+/**
+ * 合并写 prefs：在**原文件基础上**改一个键，保留其余全部键（含未知键），
+ * 再原子替换。
+ *
+ * 原子替换（写临时文件 + rename）是为了避免写一半崩溃留下截断的 JSON ——
+ * 那份文件一坏，可见清单与上下文设置就全没了，且没有别的副本。
+ */
+function mergePrefs(patch) {
+  try {
+    const current = readPrefsFile();
+    const next = { ...current, ...patch, at: Date.now() };
+    const dir = dirname(MODEL_PREFS_PATH);
+    const tmp = join(dir, `.model-prefs.json.tmp-${process.pid}`);
+    writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+    renameSync(tmp, MODEL_PREFS_PATH);
+    return true;
+  } catch {
+    /* 只读介质：本次运行生效，不持久化 */
+    return false;
+  }
+}
+
+/**
+ * 写某个 provider 的可见性白名单。
+ *
+ * 写进 `visibleByProvider[provider]`，**不动**其它 provider 的键 ——
+ * 这正是"给 A 组勾选不会影响 B 组"的关键。
+ */
+function writeModelPrefs(provider, visible) {
+  const current = readPrefsFile();
+  const map = (current.visibleByProvider && typeof current.visibleByProvider === 'object')
+    ? { ...current.visibleByProvider }
+    : {};
+  map[provider] = Array.isArray(visible) ? visible.map(String) : [];
+  // 注意保留旧的 visible 键（旧版兼容），只加 visibleByProvider
+  return mergePrefs({ visibleByProvider: map });
+}
+
+/** 读持久化的上下文设置（逐模型覆盖 + 全局档位）。 */
+function readContextPrefs() {
+  try {
+    const j = JSON.parse(readFileSync(MODEL_PREFS_PATH, 'utf8'));
+    return {
+      overrides: asContextOverrides(j?.context),
+      maxTokens: Math.max(0, Math.floor(Number(j?.contextMaxTokens) || 0)),
+    };
+  } catch { return null; }
+}
+
+/**
+ * 写上下文设置。
+ *
+ * 两个参数都可选：只传一个时**另一个保持原值**（走 mergePrefs 的合并写）——
+ * 切档位不该抹掉逐模型覆盖，改单个模型也不该把档位复位。
+ */
+function writeContextPrefs(overrides, maxTokens) {
+  const patch = {};
+  if (overrides !== undefined) patch.context = asContextOverrides(overrides);
+  if (maxTokens !== undefined) {
+    const n = Math.floor(Number(maxTokens) || 0);
+    patch.contextMaxTokens = n > 0 ? n : 0;
+  }
+  return mergePrefs(patch);
+}
+
+/**
+ * 解析「模型 id → 是否支持图片」的映射。
+ *
+ * **只收布尔值**：`true`/`false` 才算数，字符串 "true" 一律丢弃 ——
+ * 含糊的值被当成"支持"，会让用户贴了图却在调用时被上游拒绝。
+ */
+function asVisionOverrides(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const out = {};
+  for (const [key, raw] of Object.entries(value)) {
+    const id = String(key || '').trim();
+    if (!id) continue;
+    if (raw === true) out[id] = true;
+    else if (raw === false) out[id] = false;
+  }
+  return out;
+}
+
+/** 读持久化的图片能力覆盖（与可见清单、上下文同文件，互不覆盖）。 */
+function readVisionPrefs() {
+  try {
+    const j = JSON.parse(readFileSync(MODEL_PREFS_PATH, 'utf8'));
+    return asVisionOverrides(j?.vision);
+  } catch { return null; }
+}
+
+/**
+ * 解析「模型 id → 倍率」的映射（0 = 免费）。
+ *
+ * 只收**非负有限数**；数字字符串要认（表单与 YAML 常写成字符串）。
+ * 负数 / NaN / 非数字一律丢弃 —— 宁可不标，也不能标个负数。
+ */
+function asCreditOverrides(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const out = {};
+  for (const [key, raw] of Object.entries(value)) {
+    const id = String(key || '').trim();
+    if (!id) continue;
+    // 空白先排除再谈数值：Number('') === 0 会把"没填"误当成"免费"（标错价）
+    if (raw === null || raw === undefined) continue;
+    if (typeof raw === 'string' && raw.trim() === '') continue;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) continue;
+    out[id] = n;
+  }
+  return out;
+}
+
+/**
+ * 读持久化的倍率覆盖，**按 provider 分开**。
+ *
+ * 为什么必须按 provider：倍率是**账号维度**的属性。实测 `deepseek-v4.1-flash`
+ * 在国际版免费、国内版 0.11× —— 用一份全局覆盖会把国内版也标成免费。
+ * 与可见性偏好同一套结构（`creditsByProvider`）。
+ *
+ * 兼容旧的全局 `credits` 键：只对主 provider 生效（不写 `!primaryProvider`
+ * 那种宽容分支 —— 那会让漏传参数变成静默串味）。
+ */
+function readCreditPrefs(provider, primaryProvider) {
+  try {
+    const j = JSON.parse(readFileSync(MODEL_PREFS_PATH, 'utf8'));
+    const perProvider = j?.creditsByProvider;
+    if (perProvider && typeof perProvider === 'object' && perProvider[provider] !== undefined) {
+      return asCreditOverrides(perProvider[provider]);
+    }
+    if (j?.credits !== undefined && primaryProvider && provider === primaryProvider) {
+      return asCreditOverrides(j.credits);
+    }
+    return null;
+  } catch { return null; }
+}
+
+/** 写某个 provider 的倍率覆盖（不动其它 provider 的键）。 */
+function writeCreditPrefs(provider, overrides) {
+  const current = readPrefsFile();
+  const map = (current.creditsByProvider && typeof current.creditsByProvider === 'object')
+    ? { ...current.creditsByProvider }
+    : {};
+  map[provider] = asCreditOverrides(overrides);
+  return mergePrefs({ creditsByProvider: map });
+}
+
+/** 写图片能力覆盖（只改 vision 一个键，其余原样保留）。 */
+function writeVisionPrefs(overrides) {
+  return mergePrefs({ vision: asVisionOverrides(overrides) });
+}
+
+/**
+ * 解析多账号分组配置。
+ *
+ * 只接受**有 id 的条目**；id 会被规范化成 provider 名可用的字符
+ * （字母数字，其余换成 `-`），因为 provider 名要进 dsh 的路由键。
+ * 另做三项防呆：
+ *   - id 去重（重名会让后一个静默覆盖前一个的路由）
+ *   - 端口去重（两个分组抢同一个端口 = 必有一个起不来）
+ *   - 端口必须落在合法范围，否则丢弃该条（宁可少一个分组，也不要一个起不来的）
+ *
+ * @param {unknown} value 原始配置
+ * @param {string} prefix provider 名前缀（config.accountProviderPrefix）
+ * @param {number} basePort 主桥端口（未指定 port 时按序 +1 +2 …）
+ */
+export function asAccounts(value, prefix = 'workbuddy', basePort = 8790) {
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  const seenId = new Set();
+  const seenPort = new Set([basePort]);
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const id = String(raw.id ?? '').trim().replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+    if (!id || seenId.has(id)) continue;
+    let port = Number(raw.port);
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+      // 未给或非法：从小到大的空闲序号里挑一个
+      port = basePort + out.length + 1;
+      while (seenPort.has(port) && port < 65535) port += 1;
+    }
+    if (seenPort.has(port)) continue;
+    seenId.add(id);
+    seenPort.add(port);
+    out.push({
+      id,
+      provider: `${prefix}${id}`,
+      displayName: String(raw.displayName || `WorkBuddy ${id}`),
+      authFile: String(raw.authFile || ''),
+      port,
+      token: raw.token === undefined ? '' : String(raw.token),
+    });
+  }
+  return out;
 }
 
 /** 默认值集中在一处，README 与面板都读它。 */
@@ -96,6 +328,61 @@ export const DEFAULTS = {
   bridgeAliveTtlMs: 5_000,
   modelAllow: [],
   modelDeny: [],
+  /**
+   * 模型选择器里给每个模型标出消耗倍率（如「DeepSeek-V4.1-Flash · 0.11×」）。
+   * 选择器只渲染 `name`，所以标记编在展示名里；`id` 是路由键，不受影响。
+   */
+  showCredits: true,
+  /**
+   * 上下文上限覆盖：`{ '<modelId>': <tokens> }`。
+   *
+   * dsh 的「设置 → 模型」只能编辑**配置层声明**的模型；插件是运行时注册的
+   * provider（没有 settingsNs），所以那页里的上下文输入框对它不可用。
+   * 这里补一个插件自己的覆盖：既能写在 cordis.patch.yml 里，也能在 WorkBuddy
+   * 面板里改并持久化。
+   *
+   * 语义是**上限**（cap），不是"声称的窗口"：
+   *   - 目录下限 > 覆盖值 → 用覆盖值（这才是用户想压小的场景）
+   *   - 目录下限 <= 覆盖值 → 保持原值（不能把 96k 的模型吹成 1M，
+   *     那只会让 dsh 以为能塞更多、然后在上游拿到 context 错误）
+   */
+  contextOverrides: {},
+  /** 全局上下文上限（token）。0 = 不限制（用目录里的真实值）。 */
+  contextMaxTokens: 0,
+  /**
+   * 图片能力覆盖：`{ '<modelId>': true | false }`。
+   *
+   * 上游目录会漏报多模态能力 —— 实测国际版账号下 `deepseek-v4.1-flash` 的
+   * `supports_images` 为空（国内版为 true），而该模型在国际版客户端里确实能看图。
+   * 照搬目录字段会让用户在 DSH 里贴不了图，所以留一个手动声明的口子。
+   * `true` = 强制声明支持；`false` = 强制声明不支持；未列出 = 按目录走。
+   */
+  visionOverrides: {},
+  /**
+   * 倍率覆盖：`{ '<modelId>': number }`（0 = 免费）。
+   *
+   * 上游目录会**漏报倍率**：实测国际版目录里 `deepseek-v4.1-flash` 连
+   * `credits` 字段都没有，但实测 32433 tokens 扣分恒为 0（真免费）。
+   * 漏报会让展示名没有价 —— 用户既怕贵不敢用、又不知道它免费。
+   * 这里允许手动声明；只收非负数，其余忽略（按目录走）。
+   */
+  creditOverrides: {},
+  /**
+   * 多账号分组：让**同一个插件同时暴露多个账号**，各自一组 provider。
+   *
+   * 形状：`[{ id, displayName?, authFile?, port?, token? }, ...]`
+   *   - `id`         分组后缀，provider 名 = `<provider><id>`（如 workbuddy1）
+   *   - `displayName` 模型选择器里的分组名（默认 `WorkBuddy <id>`）
+   *   - `authFile`   该账号的登录文件（留空 = 用主账号那份）
+   *   - `port`       该分组自己的桥端口（留空 = bridgePort + 序号）
+   *
+   * **与"账号池化"不同**：每个分组驱动**一个**账号、各自独立的桥与端口，
+   * 不做轮询、不做负载均衡 —— 用户只是不想来回点"切换"，想同时用两个账号。
+   * 默认空数组 = 保持原有的单账号行为，一个字节都不变。
+   */
+  accounts: [],
+  /** 多账号分组的命名前缀；provider 名 = `<前缀><分组 id>`。 */
+  accountProviderPrefix: 'workbuddy',
   /**
    * 给 agent 实际调用模型时的默认参数（对话测试面板另有独立的即时控制）。
    * undefined = 不下发该字段，交给上游默认 —— 刻意不猜：不同模型对
@@ -127,6 +414,25 @@ function asStringArray(value) {
   return String(value).split(',').map((v) => v.trim()).filter(Boolean);
 }
 
+/**
+ * 解析「模型 id → 上下文上限」的映射。
+ *
+ * 只接受**正整数的 token 数**。非法值（负数、小数、字符串、0）一律丢弃 ——
+ * 宁可少一条覆盖，也不能塞一个 dsh 会拒绝的值（`INVALID_MODEL_CONTEXT`
+ * 要求正整数，传错会让整个 resolveModel 抛错，模型直接不可用）。
+ */
+function asContextOverrides(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const out = {};
+  for (const [key, raw] of Object.entries(value)) {
+    const id = String(key || '').trim();
+    const n = Number(raw);
+    if (!id || !Number.isFinite(n) || !Number.isInteger(n) || n <= 0) continue;
+    out[id] = n;
+  }
+  return out;
+}
+
 /** 合并 patch 里给的 config 与默认值。 */
 export function resolveConfig(raw = {}) {
   const cfg = { ...DEFAULTS, ...(raw && typeof raw === 'object' ? raw : {}) };
@@ -153,6 +459,14 @@ export function resolveConfig(raw = {}) {
     bridgeAliveTtlMs: Number(cfg.bridgeAliveTtlMs) || DEFAULTS.bridgeAliveTtlMs,
     modelAllow: asStringArray(cfg.modelAllow),
     modelDeny: asStringArray(cfg.modelDeny),
+    showCredits: asBool(cfg.showCredits, DEFAULTS.showCredits),
+    contextOverrides: asContextOverrides(cfg.contextOverrides),
+    contextMaxTokens: Math.max(0, Math.floor(Number(cfg.contextMaxTokens) || 0)),
+    visionOverrides: asVisionOverrides(cfg.visionOverrides),
+    creditOverrides: asCreditOverrides(cfg.creditOverrides),
+    accountProviderPrefix: String(cfg.accountProviderPrefix || DEFAULTS.accountProviderPrefix)
+      .replace(/[^A-Za-z0-9_-]+/g, '') || DEFAULTS.accountProviderPrefix,
+    accounts: asAccounts(cfg.accounts, String(cfg.accountProviderPrefix || DEFAULTS.accountProviderPrefix), Number(cfg.bridgePort) || DEFAULTS.bridgePort),
     defaultMaxTokens: cfg.defaultMaxTokens === undefined || cfg.defaultMaxTokens === null || cfg.defaultMaxTokens === ''
       ? undefined
       : (Number(cfg.defaultMaxTokens) > 0 ? Number(cfg.defaultMaxTokens) : undefined),
@@ -279,6 +593,49 @@ export function clientGraphSummary(clientModules, packageName = 'dsh-plugin-work
 }
 
 /**
+ * 图片附件 → data URL（多模态消息用；失败就退化成文字占位）。
+ *
+ * 抽成导出的工厂函数是为了可测：这块逻辑出过一次线上问题 —— 只传
+ * `{ attachmentId, mediaType }` 这个**残缺**引用给 `attachments.readImage()`，
+ * 而真实实现（dsh-attachment-local）会拿引用里的 width/height/bytes 与落盘
+ * 对象的元数据逐项核对，对不上就抛 ATTACHMENT_CORRUPT。调用方
+ * `.catch(() => null)` 把异常吞成 null，表现就是**每一张图**都退化成
+ * "[图片：无法读取该附件]" —— 模型于是完全看不到图。
+ *
+ * **不要把失败原因静默吞掉**：上面那个问题花了很久才定位，就是因为异常
+ * 被吞成了 null。这里经 `onError` 上报一行原因（不含图片内容），日志里能直接看到。
+ *
+ * @param {(name: string) => any} get 取宿主服务（测试里可以塞桩）
+ * @param {(reason: string, detail?: unknown) => void} [onError] 失败上报（诊断用）
+ * @returns {(ref: object) => Promise<string|null>}
+ */
+export function makeResolveImage(get, onError) {
+  const fail = (reason, detail) => {
+    try { onError?.(reason, detail); } catch { /* 上报失败不影响降级 */ }
+    return null;
+  };
+  return async (ref) => {
+    if (!ref?.attachmentId) return fail('ref 缺少 attachmentId');
+    const attachments = get('attachments');
+    if (!attachments) return fail('attachments 服务不可用（可能尚未挂载）');
+    // 整份引用原样透传：少任何一个字段都会被元数据核对判为 CORRUPT。
+    let stored;
+    try {
+      stored = await attachments.readImage(ref);
+    } catch (error) {
+      // 这里最值得记：ATTACHMENT_CORRUPT / 文件不存在等都从这条路径漏出去
+      return fail('readImage 抛错：' + String(error?.message || error), error);
+    }
+    const bytes = stored?.data ?? stored?.bytes ?? stored?.buffer;
+    if (!bytes) return fail('readImage 未返回字节（键：' + Object.keys(stored || {}).join(',') + '）');
+    // 以落盘对象自称的 mediaType 为准（data URL 的头必须和字节一致）。
+    const mediaType = stored?.ref?.mediaType || stored?.mediaType || ref.mediaType || 'image/png';
+    const base64 = Buffer.from(bytes).toString('base64');
+    return `data:${mediaType};base64,${base64}`;
+  };
+}
+
+/**
  * cordis 插件入口。
  * @param {any} ctx
  * @param {object} rawConfig patch 里给的 config
@@ -372,18 +729,35 @@ export function apply(ctx, rawConfig = {}) {
     if (service) fn(service, ctx);
   };
 
-  /** 图片附件 → data URL（多模态消息用；失败就退化成文字占位）。 */
-  const resolveImage = async (ref) => {
-    if (!ref?.attachmentId) return null;
-    const attachments = ctx.get('attachments');
-    if (!attachments) return null;
-    const stored = await attachments.readImage({ attachmentId: ref.attachmentId, mediaType: ref.mediaType });
-    const bytes = stored?.data ?? stored?.bytes ?? stored?.buffer;
-    if (!bytes) return null;
-    const mediaType = stored?.mediaType || ref.mediaType || 'image/png';
-    const base64 = Buffer.from(bytes).toString('base64');
-    return `data:${mediaType};base64,${base64}`;
+  /**
+   * 图片附件 → data URL（多模态消息用；失败就退化成文字占位）。
+   *
+   * **必须延迟取 `attachments` 服务**，不能 `ctx.get('attachments')` 同步拿：
+   * 服务由别的插件提供，挂载顺序不保证 —— 插件加载那一刻它可能还没就绪，
+   * 同步 get 会返回 undefined，于是**每一张图**都退化成
+   * "[图片：无法读取该附件]"，模型完全看不到图。这正是实测到的故障。
+   *
+   * 做法：把服务句柄缓存起来，首次取不到时用 `ctx.inject` 等它就绪；
+   * 后续调用直接用缓存。`get` 每次现取也行，但缓存能避开重复的 inject 注册。
+   */
+  let attachmentsService = null;
+  const getAttachments = () => {
+    if (attachmentsService) return attachmentsService;
+    const direct = ctx.get?.('attachments');
+    if (direct) {
+      attachmentsService = direct;
+      return direct;
+    }
+    // 还没挂载：注册一次等待，拿到后缓存；本次调用先返回 null（由调用方降级）
+    useService('attachments', (service) => { attachmentsService = service; });
+    return null;
   };
+  const resolveImage = makeResolveImage(getAttachments, (reason, detail) => {
+    // 图片读取失败必须留痕：它被吞成 null 后用户只看到"[图片：无法读取该附件]"，
+    // 完全不知道是哪一步断了。这里记一行原因（不含图片内容）。
+    log('图片附件读取失败：' + reason, detail ? String(detail?.code || detail?.name || '') : '');
+    state.lastImageError = { at: Date.now(), reason, code: String(detail?.code || '') };
+  });
 
   const adapter = new WorkBuddyAdapter({
     provider: config.provider,
@@ -395,6 +769,11 @@ export function apply(ctx, rawConfig = {}) {
     // 下一次对话重新探测/拉起，而不是在 5 秒 TTL 内对着死桥空转。
     onTransportFailure: () => { state.bridgeAliveAt = 0; },
     filter: { allow: config.modelAllow, deny: config.modelDeny },
+    showCredits: config.showCredits,
+    contextOverrides: config.contextOverrides,
+    contextMaxTokens: config.contextMaxTokens,
+    visionOverrides: config.visionOverrides,
+    creditOverrides: config.creditOverrides,
     defaults: {
       maxTokens: config.defaultMaxTokens,
       temperature: config.defaultTemperature,
@@ -426,14 +805,50 @@ export function apply(ctx, rawConfig = {}) {
   });
 
   // ── 0. 应用面板勾选的模型显示偏好 ─────────────────────────────────────
-  // 用户在模型面板勾选"在 dsh 中显示"的清单持久化在 .model-prefs.json；
-  // 启动时读回并应用到 adapter（与配置文件的 modelAllow 叠加：勾选清单优先 ——
-  // 它是用户在界面上表达的最新意图）。
-  const savedPrefs = readModelPrefs();
+  // 用户勾选的"在 dsh 中显示"清单持久化在 .model-prefs.json。
+  // **按 provider 分开存**（visibleByProvider）：多账号下各分组目录不同，
+  // 一份全局清单会一刀切，把非主分组的模型几乎全滤掉。
+  const savedPrefs = readModelPrefs(config.provider, config.provider);
   if (savedPrefs) {
     adapter.setFilter({ allow: savedPrefs });
     state.modelVisibility = { source: 'prefs', allow: savedPrefs };
-    log(`已应用模型显示偏好：${savedPrefs.length} 个模型`);
+    log(`已应用模型显示偏好：${savedPrefs.length} 个模型（provider=${config.provider}）`);
+  }
+
+  // ── 0b. 应用面板里保存的上下文上限覆盖 ─────────────────────────────────
+  // 与可见清单同文件（.model-prefs.json）但不同键；面板改完持久化到这里，
+  // 重启后依然生效。配置文件的 contextOverrides 与它合并，面板的优先
+  // （同样是"用户在界面上表达的最新意图优先"）。
+  const savedContext = readContextPrefs();
+  if (savedContext) {
+    // 逐模型覆盖：配置文件的与面板保存的合并，面板的优先（用户最新意图）
+    if (savedContext.overrides && Object.keys(savedContext.overrides).length) {
+      adapter.setContextOverrides({ ...config.contextOverrides, ...savedContext.overrides });
+      log(`已应用上下文上限覆盖：${Object.keys(savedContext.overrides).length} 个模型`);
+    }
+    // 全局档位：面板存过就用它，否则用配置里的
+    if (savedContext.maxTokens > 0) {
+      adapter.setContextMaxTokens(savedContext.maxTokens);
+      log(`已应用全局上下文上限：${savedContext.maxTokens} tokens`);
+    }
+  }
+
+  // ── 0c. 应用面板里保存的图片能力覆盖 ───────────────────────────────────
+  // 与可见清单、上下文同文件（.model-prefs.json）但不同键。
+  // 用途：上游目录漏报多模态能力时手动补声明（如国际版的 deepseek-v4.1-flash）。
+  const savedVision = readVisionPrefs();
+  if (savedVision && Object.keys(savedVision).length) {
+    adapter.setVisionOverrides({ ...config.visionOverrides, ...savedVision });
+    log(`已应用图片能力覆盖：${Object.keys(savedVision).length} 个模型`);
+  }
+
+  // ── 0d. 应用面板里保存的倍率覆盖（按 provider 分开）──────────────────────
+  // 用途：上游目录漏报倍率时手动补声明（如国际版的 deepseek-v4.1-flash 实测免费）。
+  // **必须按 provider 读**：倍率是账号维度属性，全局一份会把国内版也标成免费。
+  const savedCredits = readCreditPrefs(config.provider, config.provider);
+  if (savedCredits && Object.keys(savedCredits).length) {
+    adapter.setCreditOverrides({ ...config.creditOverrides, ...savedCredits });
+    log(`已应用倍率覆盖：${Object.keys(savedCredits).length} 个模型（provider=${config.provider}）`);
   }
 
   // ── 1. 旧路由清理（必须在注册自己的路由之前） ──────────────────────────
@@ -533,6 +948,115 @@ export function apply(ctx, rawConfig = {}) {
         log(state.route.error);
       }
     })();
+  }
+
+  // ── 2b. 多账号分组：每个分组 = 独立桥 + 独立 provider ───────────────────
+  /**
+   * 让同一个插件同时暴露多个账号，各自一组 provider（`workbuddy1`/`workbuddy2`…）。
+   *
+   * 与"账号池化"的区别：**每个分组驱动一个账号、各有独立的桥与端口**，
+   * 不轮询、不负载均衡。用户只是不想来回点"切换"，想同时用两个账号。
+   *
+   * 失败隔离：某个分组起不来**不影响其它分组**，也不影响主账号 —— 它只在
+   * `state.accountGroups` 里留下 error，面板与工具如实显示。
+   */
+  const accountGroups = [];
+  state.accountGroups = accountGroups;
+
+  for (const account of config.accounts) {
+    const group = {
+      id: account.id,
+      provider: account.provider,
+      displayName: account.displayName,
+      authFile: account.authFile,
+      port: account.port,
+      registered: false,
+      error: '',
+      supervisor: null,
+      adapter: null,
+    };
+    accountGroups.push(group);
+
+    try {
+      // 每个分组一条独立桥：端口与登录文件都与主账号隔离。
+      const groupSupervisor = new BridgeSupervisor({
+        projectRoot: projectRoot || process.cwd(),
+        host: config.bridgeHost,
+        port: account.port,
+        token: account.token || config.localToken,
+        authFile: account.authFile || '',
+        // 独立日志：所有分组共用 bridge.log 会互相覆盖，排障时看不到各自的原因
+        logPath: join(projectRoot || process.cwd(), 'bridge', `bridge-${account.id}.log`),
+        autoCheckin: config.autoCheckin,
+        autoStart: config.autoStart,
+        nodePath: config.nodePath || undefined,
+        timeoutMs: 8000,
+        onLog: (line) => log(`[${account.id}]`, line),
+      });
+      const groupClient = new BridgeClient({
+        baseUrl: groupSupervisor.baseUrl,
+        token: account.token || config.localToken,
+        timeoutMs: 8000,
+      });
+      const groupAdapter = new WorkBuddyAdapter({
+        provider: account.provider,
+        displayName: account.displayName,
+        client: groupClient,
+        resolveImage,
+        log: (message, detail) => log(`[${account.id}]`, message, detail),
+        onTransportFailure: () => { group.aliveAt = 0; },
+        filter: { allow: config.modelAllow, deny: config.modelDeny },
+        showCredits: config.showCredits,
+        contextOverrides: config.contextOverrides,
+        contextMaxTokens: config.contextMaxTokens,
+        visionOverrides: config.visionOverrides,
+    creditOverrides: config.creditOverrides,
+        defaults: {
+          maxTokens: config.defaultMaxTokens,
+          temperature: config.defaultTemperature,
+          reasoningEffort: config.defaultReasoningEffort,
+        },
+        catalogTtlMs: config.catalogTtlMs,
+        ensureReady: async () => {
+          if (!config.autoStart) return groupClient;
+          const probe = await groupSupervisor.probe();
+          if (probe.state === 'running') return groupClient;
+          const result = await groupSupervisor.ensure({ readyTimeoutMs: config.autoStartTimeoutMs });
+          if (!result.ok) throw new Error(result.error || '桥不可用');
+          groupAdapter.invalidate();
+          return groupClient;
+        },
+      });
+      group.supervisor = groupSupervisor;
+      group.adapter = groupAdapter;
+      /** 分组自己的桥客户端：查该账号的积分/健康用（与主账号互不干扰）。 */
+      group.client = groupClient;
+      group.quotaCache = { at: 0, value: null, error: '' };
+      /** 该分组的账号（桥起来后探测填入；仅用于展示）。 */
+      group.account = null;
+      // 分组自己的可见性白名单（与主 provider 的互不影响）——
+      // 不应用的话，主 provider 的白名单语义不会串到分组（每个 adapter 有独立 filter），
+      // 但用户之前为分组勾过的清单要能恢复。
+      const groupPrefs = readModelPrefs(account.provider, config.provider);
+      if (groupPrefs) {
+        groupAdapter.setFilter({ allow: groupPrefs });
+        log(`分组「${account.displayName}」应用显示偏好：${groupPrefs.length} 个模型`);
+      }
+      // 分组自己的倍率覆盖（同样按 provider 分开）——
+      // 实测国际版 deepseek-v4.1-flash 免费、国内版 0.11×，一码归一码。
+      const groupCredits = readCreditPrefs(account.provider, config.provider);
+      if (groupCredits && Object.keys(groupCredits).length) {
+        groupAdapter.setCreditOverrides({ ...config.creditOverrides, ...groupCredits });
+        log(`分组「${account.displayName}」应用倍率覆盖：${Object.keys(groupCredits).length} 个模型`);
+      }
+      // 每个分组一条独立路由：模型选择器里就是独立的一组
+      llm.registerAdapter([account.provider], groupAdapter);
+      group.registered = true;
+      log(`已注册分组路由：provider=${account.provider}（${account.displayName}，端口 ${account.port}）`);
+    } catch (error) {
+      group.error = String(error?.message || error);
+      log(`分组 "${account.id}" 注册失败（不影响其它分组）：`, group.error);
+    }
   }
 
   // ── 3. 运行态快照（入口页 / 工具共用） ─────────────────────────────────
@@ -637,6 +1161,31 @@ export function apply(ctx, rawConfig = {}) {
         }
       }
     }
+    /**
+     * 各分组的积分（多账号时每个账号一份）。
+     *
+     * **必须带 TTL 缓存且不阻塞 status**：这个接口打到上游计费端点，而
+     * /workbuddy/status 每 8 秒应答一次。用与主 quota 同一套策略：过期才在
+     * 后台重取，快照返回当前缓存值（下一次快照自然拿到新值）。
+     *
+     * 失败只记 per-group 的 error，**不影响其它分组与主账号** —— 一个账号
+     * 欠费（429）不该让整页显示不出来。
+     */
+    for (const g of accountGroups) {
+      if (!g.registered || !g.client) continue;
+      const stale = !g.quotaCache.value || Date.now() - g.quotaCache.at > QUOTA_TTL_MS;
+      if (!stale) continue;
+      // 只在桥活着时查；失败静默记在 cache 里（不抛、不 await 阻塞主流程）
+      void (async () => {
+        try {
+          const value = await g.client.quota();
+          g.quotaCache = { at: Date.now(), value, error: '' };
+        } catch (error) {
+          g.quotaCache = { ...g.quotaCache, at: Date.now(), error: String(error?.message || error) };
+        }
+      })();
+    }
+
     // 签到状态：TTL 30 分钟，而且**绝不阻塞** status。
     //
     // 这个接口会打到上游计费端点，而 /workbuddy/status 每 8 秒就要应答一次；
@@ -683,7 +1232,24 @@ export function apply(ctx, rawConfig = {}) {
         scriptPath: supervisor.scriptPath,
         modelAllow: config.modelAllow,
         modelDeny: config.modelDeny,
+        showCredits: adapter.showCredits,
+        // 生效的上下文上限覆盖（面板据此显示"已改"；不含任何凭据）
+        contextOverrides: adapter.contextOverrides || {},
+        contextMaxTokens: adapter.contextMaxTokens || 0,
       },
+      /**
+       * 多账号分组的状态（面板与工具据此显示"哪几组可用"）。
+       * 只回传**身份与端口**，不含任何凭据；authFile 只给文件名，不给完整路径。
+       */
+      accountGroups: accountGroups.map((g) => ({
+        id: g.id,
+        provider: g.provider,
+        displayName: g.displayName,
+        port: g.port,
+        authFile: g.authFile ? g.authFile.split(/[\\/]/).pop() : '',
+        registered: g.registered,
+        error: g.error,
+      })),
       route: { ...state.route },
       directory: toDirectory(catalog),
       catalogAt: adapter.catalogCache.at ? new Date(adapter.catalogCache.at).toISOString() : null,
@@ -697,6 +1263,22 @@ export function apply(ctx, rawConfig = {}) {
       quotaAccount: state.quotaCache.account,
       /** 桥当前登录的账号（本快照探测到的）——重启 dsh 后可在面板核对它与 quotaAccount 一致 */
       bridgeAccount: state.bridgeAccount,
+      /**
+       * 各分组的积分（多账号概览用）：每个账号一份，互不影响。
+       * 只回传展示所需字段，不含任何凭据。
+       */
+      groupQuotas: accountGroups.filter((g) => g.registered).map((g) => {
+        const q = g.quotaCache.value;
+        return {
+          provider: g.provider,
+          displayName: g.displayName,
+          account: g.account || null,
+          total: typeof q?.total === 'number' ? q.total : null,
+          packages: Array.isArray(q?.packages) ? q.packages : [],
+          error: g.quotaCache.error || '',
+          at: g.quotaCache.at ? new Date(g.quotaCache.at).toISOString() : null,
+        };
+      }),
       checkin: state.checkinCache.value,
       checkinError: state.checkinCache.error || '',
       checkinAccount: state.checkinCache.account,
@@ -812,6 +1394,20 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   // ── 6. HTTP 数据面（入口页用） ─────────────────────────────────────────
+  /**
+   * provider 名 → { id, adapter }。面板的所有"按 provider"操作都经它解析，
+   * 只认**已注册**的 provider —— 否则会写进一个永远读不到的键。
+   * 缺省（空串）解析到主 provider。
+   */
+  const resolveProvider = (name) => {
+    const wanted = String(name || '').trim();
+    if (!wanted || wanted === config.provider) {
+      return { id: config.provider, adapter, isPrimary: true };
+    }
+    const g = accountGroups.find((x) => x.provider === wanted && x.registered && x.adapter);
+    return g ? { id: g.provider, adapter: g.adapter, isPrimary: false, group: g } : null;
+  };
+
   if (config.routes) {
     useService('webServer', (webServer) => {
       const routes = createRouteTable({
@@ -822,10 +1418,20 @@ export function apply(ctx, rawConfig = {}) {
         adapter,
         paths: dshPaths,
         provider: config.provider,
+        resolveProvider,
         log,
         onUpstreamMutation: invalidateUpstreamCaches,
-        readPrefs: readModelPrefs,
+        // readPrefs 由路由以 `readPrefs(providerId)` 单参调用 —— 这里**必须**
+        // 把主 provider 绑进去。直接传函数引用会让 primaryProvider 变成 undefined，
+        // 于是回退分支 `!primaryProvider` 恒真 → 每个分组都读到主 provider 的旧清单，
+        // 表现就是"改不了显示模型"。
+        readPrefs: (providerId) => readModelPrefs(providerId, config.provider),
         onWritePrefs: writeModelPrefs,
+        writeContextPrefs,
+        writeVisionPrefs,
+        readVisionPrefs,
+        writeCreditPrefs,
+        readCreditPrefs,
         notifyAdaptersUpdated,
       });
       const disposeRoutes = mountRoutes(webServer, routes, log);
@@ -862,6 +1468,29 @@ export function apply(ctx, rawConfig = {}) {
         log('自动启动控制台失败', error);
       }
     })();
+  }
+
+  // ── 7b. 多账号分组的桥：各自独立拉起（互不阻塞、互不影响） ──────────────
+  if (config.autoStart) {
+    for (const group of accountGroups) {
+      if (!group.registered || !group.supervisor) continue;
+      void (async () => {
+        try {
+          const result = await group.supervisor.ensure({ readyTimeoutMs: config.autoStartTimeoutMs });
+          group.lastEnsure = { at: Date.now(), ...result };
+          if (result.ok) {
+            group.adapter?.invalidate();
+            // 记下该分组服务的账号（仅用于展示 "哪个分组是哪个账号"）
+            group.account = result.health?.auth?.userId || null;
+            log(`分组「${group.displayName}」桥已就绪：${group.supervisor.baseUrl}/v1（端口 ${group.port}，账号 ${String(group.account || '?').slice(0, 8)}…）`);
+          } else {
+            log(`分组「${group.displayName}」桥未能就绪：${result.error}`);
+          }
+        } catch (error) {
+          log(`分组「${group.displayName}」自动启动桥失败`, error);
+        }
+      })();
+    }
   }
 
   log(`插件已加载：projectRoot=${projectRoot || '(未找到)'} bridge=${supervisor.baseUrl} console=${consoleSupervisor.url} provider=${state.route.provider}`);

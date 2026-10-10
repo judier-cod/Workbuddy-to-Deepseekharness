@@ -101,6 +101,11 @@ export function createRouteTable(deps) {
       },
     },
     {
+      /**
+       * 模型目录。多账号下用 `?provider=<name>` 查**某个分组**的目录 ——
+       * 各分组是独立的桥与账号，目录内容也不同（国际版 27 个 / 国内版 31 个）。
+       * 缺省 = 主 provider。
+       */
       kind: 'exact',
       path: '/workbuddy/models',
       async handler(req, res) {
@@ -108,43 +113,198 @@ export function createRouteTable(deps) {
         try {
           const url = new URL(req.url, 'http://127.0.0.1');
           const refresh = url.searchParams.get('refresh') === '1';
-          const catalog = await adapter.catalog({ refresh });
+          const asked = String(url.searchParams.get('provider') || '').trim();
+          const target = deps.resolveProvider ? deps.resolveProvider(asked) : null;
+          if (!target) {
+            return sendJson(res, 400, { ok: false, models: [], error: `未知 provider：${asked || '(空)'}` });
+          }
+          const catalog = await target.adapter.catalog({ refresh });
           // 返回**归一化后**的目录（contextWindow/maxTokens/images/free…），
           // 不退上游原始字段名（context_window/max_output_tokens）：
           // 面板与其它消费者只认一种形状，免得两处各说一套。
-          sendJson(res, 200, { ok: true, models: toDirectory(catalog), at: adapter.catalogCache.at, error: adapter.catalogError || '' });
+          sendJson(res, 200, {
+            ok: true,
+            provider: target.id,
+            models: toDirectory(catalog),
+            at: target.adapter.catalogCache.at,
+            error: target.adapter.catalogError || '',
+          });
         } catch (error) {
           sendJson(res, 200, { ok: false, models: [], error: String(error?.message || error) });
         }
       },
     },
     {
-      // 模型显示偏好：GET 读当前生效清单，POST 写并即时生效（无需重启）。
-      // 读：任何 GET 都行（非敏感）；写：要面板头（挡跨站，与其它写路由一致）。
-      // 注意这里**没有**碰 .state.json —— 那份文件是控制台的单写者领地，
-      // 偏好存在插件自己的 .model-prefs.json（见 index.js 里的说明）。
+      /**
+       * 模型显示偏好：GET 读当前生效清单，POST 写并即时生效（无需重启）。
+       *
+       * **按 provider 分开**：多账号下各分组目录不同（国际版 27 个 / 国内版 31 个），
+       * 一份全局清单会一刀切，把非主分组的模型几乎全滤掉 —— 那正是"改不了显示
+       * 模型"的原因。provider 走查询串（`?provider=workbuddy-ai`），缺省为主 provider。
+       *
+       * 读：任何 GET 都行（非敏感）；写：要面板头（挡跨站，与其它写路由一致）。
+       * 注意这里**没有**碰 .state.json —— 那份文件是控制台的单写者领地，
+       * 偏好存在插件自己的 .model-prefs.json（见 index.js 里的说明）。
+       */
       kind: 'exact',
       path: '/workbuddy/model-visibility',
       async handler(req, res) {
         try {
+          const url = new URL(req.url, 'http://127.0.0.1');
+          const asked = String(url.searchParams.get('provider') || '').trim();
+          // 只认已注册的 provider：不认的话写操作会写进一个永远读不到的键
+          const target = deps.resolveProvider ? deps.resolveProvider(asked) : null;
+          if (!target) {
+            return sendJson(res, 400, { ok: false, error: `未知 provider：${asked || '(空)'}` });
+          }
           if (req.method === 'POST') {
             if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-workbuddy-panel header' });
             const body = await readJsonBody(req);
             const visible = Array.isArray(body?.visible) ? body.visible.map(String).filter(Boolean) : [];
             // 目录里不存在的 id 也照存：上游目录可能暂时没抓到，用户勾选的意图优先，
             // 目录恢复后自然重新生效。
-            adapter.setFilter({ allow: visible });
-            onWritePrefs(visible);
+            target.adapter.setFilter({ allow: visible });
+            const persisted = typeof deps.onWritePrefs === 'function' ? deps.onWritePrefs(target.id, visible) : false;
             // 广播 llm/adapters-updated：dsh 的模型选择器**不轮询**目录，只认这个
             // 事件。不广播的话 filter 虽已生效，但 UI 会一直显示旧清单 —— 用户保存
             // 完看模型数量没变，报的就是这个。返回 applied 让前端如实告知：
             // 旧版 dsh 没有这个内部方法时 applied=false，前端提示"重启一次 dsh"。
             const applied = notifyAdaptersUpdated();
-            return sendJson(res, 200, { ok: true, visible, count: visible.length, applied });
+            return sendJson(res, 200, { ok: true, provider: target.id, visible, count: visible.length, applied, persisted });
           }
           if (readOnly(req, res)) return;
-          const current = typeof deps.readPrefs === 'function' ? deps.readPrefs() : null;
-          sendJson(res, 200, { ok: true, visible: current, at: adapter.catalogCache.at });
+          const current = typeof deps.readPrefs === 'function' ? deps.readPrefs(target.id) : null;
+          sendJson(res, 200, { ok: true, provider: target.id, visible: current, at: target.adapter.catalogCache.at });
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: String(error?.message || error) });
+        }
+      },
+    },
+    {
+      /**
+       * 上下文上限覆盖：GET 读当前生效值，POST 写并即时生效（无需重启）。
+       *
+       * 与 model-visibility 同一套约定：读开放、写要面板头；写操作都要广播
+       * adapters-updated，否则 UI 一直显示旧值。
+       */
+      kind: 'exact',
+      path: '/workbuddy/context-overrides',
+      async handler(req, res) {
+        try {
+          if (req.method === 'POST') {
+            if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-workbuddy-panel header' });
+            const body = await readJsonBody(req);
+            const raw = body?.overrides && typeof body.overrides === 'object' && !Array.isArray(body.overrides)
+              ? body.overrides
+              : {};
+            /**
+             * 全局档位（`maxTokens`）：面板上那排「262k / 1M」快捷按钮写的就是它。
+             * 语义是**上限** —— 只压小、不放大，所以 "1M" 等于"不限制"
+             * （目录里没有超过 1M 的模型）。0 / 缺省 = 不限。
+             */
+            if (body?.maxTokens !== undefined) {
+              adapter.setContextMaxTokens(body.maxTokens);
+            }
+            // overrides 显式给了才动它 —— 只切档位时不该把逐模型覆盖抹掉
+            const touchesOverrides = body?.overrides !== undefined;
+            if (touchesOverrides) adapter.setContextOverrides(raw);
+            const applied = typeof deps.writeContextPrefs === 'function'
+              ? deps.writeContextPrefs(
+                touchesOverrides ? adapter.contextOverrides : undefined,
+                body?.maxTokens !== undefined ? adapter.contextMaxTokens : undefined,
+              )
+              : false;
+            const broadcast = notifyAdaptersUpdated();
+            return sendJson(res, 200, {
+              ok: true,
+              overrides: adapter.contextOverrides,
+              maxTokens: adapter.contextMaxTokens,
+              persisted: applied,
+              applied: broadcast,
+            });
+          }
+          if (readOnly(req, res)) return;
+          sendJson(res, 200, {
+            ok: true,
+            overrides: adapter.contextOverrides || {},
+            maxTokens: adapter.contextMaxTokens || 0,
+          });
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: String(error?.message || error) });
+        }
+      },
+    },
+    {
+      /**
+       * 图片能力覆盖：GET 读当前值，POST 写并即时生效。
+       *
+       * 为什么需要：上游目录会漏报多模态能力（实测国际版账号下
+       * `deepseek-v4.1-flash` 的 supports_images 为空，但该模型确实能看图）。
+       * 不手动声明，用户在这个模型下就贴不了图。
+       */
+      kind: 'exact',
+      path: '/workbuddy/vision-overrides',
+      async handler(req, res) {
+        try {
+          if (req.method === 'POST') {
+            if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-workbuddy-panel header' });
+            const body = await readJsonBody(req);
+            const raw = body?.overrides && typeof body.overrides === 'object' && !Array.isArray(body.overrides)
+              ? body.overrides
+              : {};
+            adapter.setVisionOverrides(raw);
+            const persisted = typeof deps.writeVisionPrefs === 'function'
+              ? deps.writeVisionPrefs(adapter.visionOverrides)
+              : false;
+            const applied = notifyAdaptersUpdated();
+            return sendJson(res, 200, { ok: true, overrides: adapter.visionOverrides, persisted, applied });
+          }
+          if (readOnly(req, res)) return;
+          sendJson(res, 200, { ok: true, overrides: adapter.visionOverrides || {} });
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: String(error?.message || error) });
+        }
+      },
+    },
+    {
+      /**
+       * 倍率覆盖：GET 读当前值，POST 写并即时生效。
+       *
+       * 为什么需要：上游目录会漏报倍率 —— 实测国际版目录里
+       * `deepseek-v4.1-flash` 连 `credits` 都没有，而实测 32433 tokens 扣分
+       * 恒为 0（真免费）。漏报导致展示名光秃秃没有价。
+       */
+      kind: 'exact',
+      path: '/workbuddy/credit-overrides',
+      async handler(req, res) {
+        try {
+          // 按 provider 分开：倍率是**账号维度**属性（国际版免费 ≠ 国内版免费）。
+          // 用一份全局覆盖会把国内版也标成免费 —— 实测过这个坑。
+          const url = new URL(req.url, 'http://127.0.0.1');
+          const asked = String(url.searchParams.get('provider') || '').trim();
+          const target = deps.resolveProvider ? deps.resolveProvider(asked) : null;
+          if (!target) {
+            return sendJson(res, 400, { ok: false, error: `未知 provider：${asked || '(空)'}` });
+          }
+          if (req.method === 'POST') {
+            if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-workbuddy-panel header' });
+            const body = await readJsonBody(req);
+            const raw = body?.overrides && typeof body.overrides === 'object' && !Array.isArray(body.overrides)
+              ? body.overrides
+              : {};
+            target.adapter.setCreditOverrides(raw);
+            const persisted = typeof deps.writeCreditPrefs === 'function'
+              ? deps.writeCreditPrefs(target.id, target.adapter.creditOverrides)
+              : false;
+            const applied = notifyAdaptersUpdated();
+            return sendJson(res, 200, {
+              ok: true, provider: target.id, overrides: target.adapter.creditOverrides, persisted, applied,
+            });
+          }
+          if (readOnly(req, res)) return;
+          sendJson(res, 200, {
+            ok: true, provider: target.id, overrides: target.adapter.creditOverrides || {},
+          });
         } catch (error) {
           sendJson(res, 500, { ok: false, error: String(error?.message || error) });
         }

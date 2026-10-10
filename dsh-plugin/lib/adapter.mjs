@@ -187,14 +187,35 @@ async function toWireMessage(message, resolveImage) {
   const blocks = Array.isArray(message.content) ? message.content : [];
 
   if (role === 'tool') {
-    const parts = [];
+    const textParts = [];
+    const imageBlocks = [];
     for (const block of blocks) {
-      if (block?.type === 'text') parts.push(block.text || '');
+      if (block?.type === 'text') textParts.push(block.text || '');
+      else if (block?.type === 'image' && block.offloaded !== true) imageBlocks.push(block);
+    }
+    const text = textParts.join('');
+    // 纯文本工具结果保持字符串形态（上游与既有行为都以此为准）。
+    if (!imageBlocks.length) {
+      return {
+        role: 'tool',
+        tool_call_id: String(message.toolCallId || ''),
+        content: text || '(no output)',
+      };
+    }
+    // 带图时必须走 OpenAI 的多段内容数组：read_image 这类工具把图片放在
+    // **tool 结果**里，若只取 text 块，图片会被整段丢掉，模型只看到
+    // "image/png 320x200" 这类元数据文字，从而回答"我看不到图片"。
+    const parts = [];
+    if (text) parts.push({ type: 'text', text });
+    for (const block of imageBlocks) {
+      const url = await resolveImage(block.attachment).catch(() => null);
+      if (url) parts.push({ type: 'image_url', image_url: { url } });
+      else parts.push({ type: 'text', text: '[图片：无法读取该附件]' });
     }
     return {
       role: 'tool',
       tool_call_id: String(message.toolCallId || ''),
-      content: parts.join('') || '(no output)',
+      content: parts,
     };
   }
 
@@ -394,6 +415,41 @@ export class WorkBuddyAdapter {
     /** 对话 TRANSPORT 失败时回调（宿主端用来作废「桥活着」的短 TTL 缓存）。 */
     this.onTransportFailure = options.onTransportFailure || (() => {});
     this.filter = options.filter || {};
+    /**
+     * 上下文上限覆盖：`{ '<modelId>': <正整数 tokens> }`。
+     *
+     * 为什么需要：dsh 的「设置 → 模型」只能编辑**配置层声明**的 provider；
+     * 插件是运行时注册的（没有 settingsNs），那页的上下文输入框对它不可用。
+     * 这里是插件自己的等价能力 —— 写在 cordis.patch.yml 或面板里改都行。
+     */
+    this.contextOverrides = { ...(options.contextOverrides || {}) };
+    /** 全局上下文上限（token）。0 = 不限制。 */
+    this.contextMaxTokens = Math.max(0, Math.floor(Number(options.contextMaxTokens) || 0));
+    /**
+     * 模型选择器里是否展示消耗倍率（默认开）。
+     *
+     * 选择器只渲染 `name`，所以倍率编在展示名里（`id` 是路由键，不能动）。
+     * 关掉它：`cordis.patch.yml` 里给 workbuddy 条目设 `showCredits: false`。
+     */
+    this.showCredits = options.showCredits !== false;
+    /**
+     * 图片能力覆盖：`{ '<modelId>': true | false }`。
+     *
+     * 上游目录会漏报多模态能力（实测国际版账号下 `deepseek-v4.1-flash` 的
+     * `supports_images` 为空，而该模型在客户端里确实能看图）。照搬目录字段会
+     * 让用户在 DSH 里贴不了图。这里补一个双向覆盖：true 强制声明支持、
+     * false 强制声明不支持；未列出的模型按目录走，不猜。
+     */
+    this.visionOverrides = { ...(options.visionOverrides || {}) };
+    /**
+     * 倍率覆盖：`{ '<modelId>': number }`（0 = 免费）。
+     *
+     * 上游目录会**漏报倍率**：实测国际版目录里 `deepseek-v4.1-flash` 连
+     * `credits` 字段都没有，但实测 32433 tokens 扣分恒为 0（真免费）。
+     * 漏报导致展示名没有价 —— 用户既怕贵不敢用、又不知道它免费。
+     * 这里允许手动声明；只收非负数，其余忽略（按目录走）。
+     */
+    this.creditOverrides = { ...(options.creditOverrides || {}) };
     this.defaults = options.defaults || {};
     this.catalogTtlMs = options.catalogTtlMs ?? 60_000;
     /** 目录缓存，避免每次模型选择都打一次桥。 */
@@ -451,6 +507,98 @@ export class WorkBuddyAdapter {
     };
   }
 
+  /**
+   * 运行时更新上下文上限覆盖（面板里改上下文时调用）。
+   *
+   * 与 setFilter 同理：不重建适配器，只换一个字段。
+   * 非法值直接丢弃 —— dsh 的 `INVALID_MODEL_CONTEXT` 校验要求正整数，
+   * 传错会让 resolveModel 抛错、模型直接不可用。
+   */
+  setContextOverrides(overrides) {
+    const out = {};
+    for (const [key, raw] of Object.entries(overrides || {})) {
+      const id = String(key || '').trim();
+      const n = Number(raw);
+      if (!id || !Number.isFinite(n) || !Number.isInteger(n) || n <= 0) continue;
+      out[id] = n;
+    }
+    this.contextOverrides = out;
+  }
+
+  /**
+   * 设置全局上下文上限（面板上那排档位按钮用）。
+   *
+   * 只接受正整数；0 / 负数 / NaN / 非数字一律当作"不限制"（0）。
+   * 语义与逐模型覆盖一致：**上限**，只压小不放大。
+   */
+  setContextMaxTokens(value) {
+    const n = Number(value);
+    this.contextMaxTokens = Number.isFinite(n) && Number.isInteger(n) && n > 0 ? n : 0;
+    return this.contextMaxTokens;
+  }
+
+  /**
+   * 运行时更新图片能力覆盖（面板里改时调用）。
+   *
+   * 只接受布尔值：`true`/`false`。其它值（含字符串 "true"）一律丢弃 ——
+   * 这里宁可少一条覆盖，也不能把一个含糊的值当成"支持"，那会让用户贴了图
+   * 却在调用时被上游拒绝。
+   */
+  setVisionOverrides(overrides) {
+    const out = {};
+    for (const [key, raw] of Object.entries(overrides || {})) {
+      const id = String(key || '').trim();
+      if (!id) continue;
+      if (raw === true) out[id] = true;
+      else if (raw === false) out[id] = false;
+    }
+    this.visionOverrides = out;
+    return this.visionOverrides;
+  }
+
+  /**
+   * 运行时更新倍率覆盖（面板里改时调用）。
+   *
+   * 只接受**非负有限数**：`0` = 免费，正数 = 直接采用。
+   * 负数 / NaN / 非数字一律丢弃（按目录走）—— 宁可不标，也不能标个负数。
+   * 数字字符串要认（表单与 YAML 常写成字符串）。
+   */
+  setCreditOverrides(overrides) {
+    const out = {};
+    for (const [key, raw] of Object.entries(overrides || {})) {
+      const id = String(key || '').trim();
+      if (!id) continue;
+      // 空白先排除再谈数值：Number('') === 0 会把"没填"误当成"免费"
+      if (raw === null || raw === undefined) continue;
+      if (typeof raw === 'string' && raw.trim() === '') continue;
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n < 0) continue;
+      out[id] = n;
+    }
+    this.creditOverrides = out;
+    return this.creditOverrides;
+  }
+
+  /**
+   * 模型 id → 生效的上下文上限（token）。
+   *
+   * **这是"上限"，不是"声称值"**：只取 min，绝不放大。
+   *   - 目录说 1M、覆盖设 200k → 200k（用户想压小，这才有用）
+   *   - 目录说 96k、覆盖设 1M  → 96k（不能把小模型吹大：dsh 会据此塞更多
+   *     历史，结果在上游拿到 context 错误 —— 放大只会制造更难查的失败）
+   *
+   * 非法覆盖值一律忽略（返回目录原值），保证返回的永远是正整数。
+   */
+  effectiveContext(modelId, catalogValue) {
+    const capFor = (id) => {
+      const n = Number(this.contextOverrides?.[id]);
+      return Number.isFinite(n) && Number.isInteger(n) && n > 0 ? n : 0;
+    };
+    const caps = [catalogValue, capFor(modelId), this.contextMaxTokens]
+      .filter((n) => Number.isFinite(n) && Number.isInteger(n) && n > 0);
+    return caps.length ? Math.min(...caps) : undefined;
+  }
+
   /** 模型选择器看到的目录。 */
   async listModels(provider = this.provider) {
     let catalog;
@@ -460,7 +608,12 @@ export class WorkBuddyAdapter {
       this.catalogError = String(error?.message || error);
       throw error;
     }
-    return toAdapterModels(catalog, this.filter).map((m) => ({
+    return toAdapterModels(catalog, {
+      ...this.filter,
+      showCredits: this.showCredits,
+      visionOverrides: this.visionOverrides,
+      creditOverrides: this.creditOverrides,
+    }).map((m) => ({
       provider,
       id: m.id,
       name: m.name,
@@ -484,17 +637,22 @@ export class WorkBuddyAdapter {
     const catalog = await this.catalog();
     const hit = catalog.find((m) => m && m.id === model);
     if (!hit) return { provider, id: model, name: model };
-    const [mapped] = toAdapterModels([hit]);
+    const [mapped] = toAdapterModels([hit], {
+      visionOverrides: this.visionOverrides,
+      creditOverrides: this.creditOverrides,
+    });
     const efforts = [
       { id: 'low', name: 'Low' },
       { id: 'medium', name: 'Medium' },
       { id: 'high', name: 'High' },
     ];
+    // 上下文上限：目录值 → 模型级覆盖 → 全局上限，取最小（见 effectiveContext）。
+    const contextWindow = this.effectiveContext(model, mapped?.contextWindow);
     return {
       provider,
       id: model,
       name: mapped?.name || model,
-      ...(mapped?.contextWindow ? { context: { contextWindow: mapped.contextWindow } } : {}),
+      ...(contextWindow ? { context: { contextWindow } } : {}),
       ...(mapped?.maxTokens ? { defaultMaxTokens: mapped.maxTokens } : {}),
       ...(mapped?.inputModalities ? { inputModalities: mapped.inputModalities } : {}),
       ...(mapped?.reasoning ? { reasoning: { efforts, defaultEffort: 'medium' } } : {}),
