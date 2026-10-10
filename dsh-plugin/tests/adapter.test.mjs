@@ -441,7 +441,18 @@ test('listModels / resolveModel 使用桥目录的元数据', async () => {
     assert.equal(resolved.name, 'Stub Model');
     assert.equal(adapter.providerInfo('workbuddy').id, 'workbuddy');
     assert.equal(adapter.providerRetryPolicy().mode, 'normal');
+    // dsh 的 token meter 无条件调用 imageRequestPricing；缺方法会抛 TypeError。
+    assert.equal(adapter.imageRequestPricing(), undefined);
   } finally { await stub.close(); }
+});
+
+test('imageRequestPricing 必须是函数（dsh 计量环节无条件调用）', () => {
+  // 回归：适配器是普通 class，不继承 dsh 的 LlmAdapter 基类，
+  // 所以基类的空默认实现不会兜底，必须自己声明。
+  const adapter = makeAdapter('http://127.0.0.1:1');
+  assert.equal(typeof adapter.imageRequestPricing, 'function');
+  // "不声明计价"用 undefined 表达，调用方据此回退到中立估算。
+  assert.equal(adapter.imageRequestPricing('workbuddy', 'any-model'), undefined);
 });
 
 test('文本流：block-start → text-delta → block-end → usage → finish', async () => {

@@ -243,6 +243,12 @@ npm run release:check      # = vendor:check + 单测 + 独立分发演练（发�
   `adapter.providerInfo()` 与 `adapter.providerRetryPolicy()`，**没有 instanceof
   检查**，所以适配器是普通对象即可；profile 的 `node_modules` 里本来也解析不到
   那些包。可选服务（`tools` / `commands` / `webServer`）统一走 `ctx.inject` 等就绪。
+- **必须自己声明 `imageRequestPricing()`**。dsh 的 token meter 对每条路由**无条件**调用
+  `adapter.imageRequestPricing(provider, model)` —— 基类 `LlmAdapter` 原本用空默认实现
+  兜底，但本适配器不继承基类，兜底不生效，缺方法会抛
+  `TypeError: ... .imageRequestPricing is not a function`，整条路由在计量环节崩溃。
+  返回 `undefined` 表示「本路由不声明图片计价」，调用方回退到中立估算；上报的真实
+  usage 仍是权威值。
 - **适配器必须走 `ctx.llm` 属性**而不是 `ctx.get('llm')`：cordis 的服务代理会把
   `this.ctx` 绑到**调用方**的 fiber，注册才不会挂到别人的生命周期上。
 - **派发失败必须以 `finish` 块收尾**（`kind: 'error'`），不能向调用方抛；

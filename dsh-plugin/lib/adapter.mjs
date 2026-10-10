@@ -484,6 +484,22 @@ export class WorkBuddyAdapter {
     };
   }
 
+  /**
+   * dsh 的 token meter 对每条注册路由**无条件**调用 `adapter.imageRequestPricing()`。
+   * 本适配器是普通 class、不继承 dsh 的 LlmAdapter 基类，缺这个方法会直接抛
+   * `TypeError: ... .imageRequestPricing is not a function`，让整条 workbuddy 路由
+   * 在计量环节崩溃。
+   *
+   * 返回 `undefined` 表示"本路由不声明图片计价"，调用方会回退到自己的中立估算 ——
+   * 这正是 workbuddy 想要的行为：桥不做 vision token 精算，用通用估算即可，
+   * 上报的真实 usage 仍然是权威值。
+   *
+   * @returns {undefined} 始终不声明路由自有的图片计价。
+   */
+  imageRequestPricing() {
+    return undefined;
+  }
+
   /** 拉取桥的目录（带 TTL 缓存）。 */
   async catalog({ refresh = false } = {}) {
     const now = Date.now();
