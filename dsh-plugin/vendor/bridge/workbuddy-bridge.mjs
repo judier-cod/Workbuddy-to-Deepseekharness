@@ -149,6 +149,24 @@ function minutesOfDay(hhmm) {
 }
 
 /**
+ * 上游促销的时段描述（`modelPromotions[].schedule`）。
+ *
+ * 两种形状可单用也可同时出现：
+ *   - `daily`：每日时段，如 `[{start:"23:00", end:"7:50"}]`（跨零点时 start > end）
+ *   - `validFrom` / `validUntil`：活动的绝对起止时间
+ * `timezone` 是 IANA 时区名（实测为 "Asia/Shanghai"）。
+ *
+ * 用 typedef 而不是 `object`：`tsc --checkJs` 下直接访问 `object` 的属性会报
+ * TS2339，而这个项目的 CI 就跑 `npm run check:types`。
+ *
+ * @typedef {object} PromotionSchedule
+ * @property {string} [timezone] IANA 时区名
+ * @property {string} [validFrom] 生效起点（可被 Date.parse 解析）
+ * @property {string} [validUntil] 生效终点（可被 Date.parse 解析）
+ * @property {Array<{ start?: string, end?: string }>} [daily] 每日时段列表
+ */
+
+/**
  * 促销时段当前是否生效。
  *
  * 上游的 `schedule` 有两种形状（都实测过）：
@@ -162,7 +180,7 @@ function minutesOfDay(hhmm) {
  * 任何字段无法解析时**按"生效"处理**（保守：宁可显示促销价，也不要
  * 因为解析失败把已经打折的价格显示成全价 —— 后者会让用户多花冤枉钱）。
  *
- * @param {object} schedule 上游给的 schedule 对象
+ * @param {PromotionSchedule} [schedule] 上游给的 schedule 对象
  * @param {Date} [now] 当前时间（测试注入用）
  */
 function scheduleActive(schedule, now = new Date()) {
@@ -956,6 +974,14 @@ function buildHeaders(auth, model, conversationId) {
  * 返回的 res 兼容 bridge 现有消费方式（res.ok / res.status / res.text() /
  * res.body.getReader() 由下面的 shim 补齐）。
  */
+/**
+ * 非 2xx 响应体的预读缓存。
+ *
+ * 用 WeakMap 而不是给 IncomingMessage 挂自定义属性：后者在 `tsc --checkJs`
+ * 下会报 TS2339（属性不存在于类型上），而且污染 Node 原生对象。
+ */
+const preReadBodies = new WeakMap();
+
 function upstreamRequest(endpointUrl, { headers, body, signal }) {
   const url = new URL(endpointUrl);
   const doRequest = url.protocol === 'https:' ? httpsRequest : httpRequest;
@@ -970,7 +996,27 @@ function upstreamRequest(endpointUrl, { headers, body, signal }) {
         headers,
         agent: agentFor(url.protocol),
       },
-      (res) => resolve(res),
+      (res) => {
+        /**
+         * **只对非 2xx 预读** body，2xx 一律不碰。
+         *
+         * 为什么只碰非 2xx：挂 `on('data')` 会把流切到流动模式。2xx 的 SSE 正文
+         * 由 `shimResponse.body`（ReadableStream）消费，这里若也去听，两边会
+         * **分食同一份数据** —— 实测这么做会让 14 个用例失败（SSE 内容被抢走）。
+         * 而非 2xx 的体很小（错误页，还会被截断到 160 字符），预读没有代价。
+         *
+         * 为什么必须预读：`shimResponse.text()` 是事后挂监听的读法，若拿到响应时
+         * 体已经流完（`end` 已派发），监听永远不触发 → Promise 永不 resolve →
+         * 请求挂死。实测 Node 25 + "上游 401 + text/html"就是这个场景，用例固定
+         * 超时 120 秒，而桥的业务逻辑是对的。
+         */
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const chunks = [];
+          res.on('data', (c) => chunks.push(c));
+          res.on('end', () => { preReadBodies.set(res, Buffer.concat(chunks).toString('utf8')); });
+        }
+        resolve(res);
+      },
     );
     req.on('error', reject);
     if (signal) {
@@ -991,9 +1037,28 @@ function shimResponse(res) {
     status: res.statusCode,
     headers: res.headers,
     text: () => new Promise((resolve, reject) => {
+      /**
+       * 流已经结束（`end` 已派发）时不能再挂 `data`/`end` 监听 —— 它们永远
+       * 不会再触发，这个 Promise 就永不 resolve，请求挂死到客户端超时。
+       *
+       * 实测（Node 25 / 本机）：上游回 401 + text/html 时，体在 callUpstream
+       * 返回前就已流完，`await res.text()` 直接挂住 —— bridge.test.mjs 的
+       * 账本截断用例因此固定超时（120 秒），而桥的业务逻辑是对的。
+       *
+       * 兜底：缓存过就直接用；没缓存说明数据已被别处消费/丢弃，返回空串而不是
+       * 挂死 —— 上层据此仍能记一条失败并给出可读错误，比"客户端超时"好得多。
+       */
+      if (res.readableEnded === true || res.complete === true) {
+        resolve(preReadBodies.get(res) ?? '');
+        return;
+      }
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        preReadBodies.set(res, text);
+        resolve(text);
+      });
       res.on('error', reject);
     }),
     body: new ReadableStream({
@@ -1163,13 +1228,10 @@ async function callUpstream(bodyString, model, conversationId, clientSignal) {
   };
 
   let res = await attemptWithStaleRetry(auth);
-  console.error('[TRACE] first attempt status', res.status);
   if (!API_KEY && (res.status === 401 || res.status === 403) && auth.refresh) {
     const next = await refreshAuth(auth);
-    console.error('[TRACE] refreshAuth ->', next ? 'ok' : 'null');
     if (next) { auth = next; res = await attemptWithStaleRetry(auth); }
   }
-  console.error('[TRACE] post-refresh status', res.status, 'reused', res.reusedSocket);
 
   // the gateway occasionally wraps a momentary upstream failure as 400 code 11133: retry idempotently
   /*
@@ -1188,12 +1250,9 @@ async function callUpstream(bodyString, model, conversationId, clientSignal) {
    */
   const status = res.status;
   if (status !== 400 && (status < 200 || status >= 300)) {
-    console.error('[TRACE] guard A: reading body');
     const text = await res.text().catch(() => '');
-    console.error('[TRACE] guard A: got body', text.length);
     return { res, bodyText: text, upstreamStartedAt: upEnter };
   }
-  console.error('[TRACE] guard A: skipped, status', status);
 
   for (let i = 0; res.status === 400 && i < TRANSIENT_400_DELAYS.length; i++) {
     const text = await res.text();
@@ -1815,10 +1874,23 @@ function recordRequest(entry) {
     // key 哈希前 8 位）—— 桥不可用时静默跳过，不影响记账主流程。
     const client = requestScope.getStore()?.client;
     if (client) entry = { ...entry, client };
+    /**
+     * **错误原文在这里统一截断**，不依赖调用方自觉。
+     *
+     * 为什么要收口在这里：上游失败时可能是**整段 HTML**（实测 APISIX 的 401 回
+     * 4 KB HTML），原样落盘会让账本行膨胀、CSV 导出被换行/长度撑爆，控制台的
+     * 「最近请求」也会刷屏。读侧（recentRequests/summarizeUsage）虽然也调
+     * shortError，但**账本文件本身**会先被污染 —— 那份数据没有第二份副本。
+     *
+     * 单一收口点 = 以后新增任何记账调用方都自动受保护，不必记得截断。
+     */
+    const normalized = entry && typeof entry.error === 'string'
+      ? { ...entry, error: shortError(entry.error) }
+      : entry;
     const file = usageFile();
     syncUsageMirror(file);
 
-    const line = JSON.stringify({ t: Date.now(), ...entry });
+    const line = JSON.stringify({ t: Date.now(), ...normalized });
     usageLines.push(line);
     if (usageLines.length > MAX_USAGE_LINES) {
       usageLines = usageLines.slice(-Math.floor(MAX_USAGE_LINES / 2));
@@ -2932,7 +3004,30 @@ async function handleRequest(req, res) {
      * 保留 `CLIENT_KEY_HASHES.size` 只是为了让「只配了 client key」的语义清楚。
      */
     if (identifyClientId(req) === null) {
-      return json(res, 401, { error: { message: 'workbuddy-bridge: bad or missing token' } });
+      /**
+       * 401 必须**可操作**：只说 "bad token" 会让用户无从下手。
+       *
+       * 常见成因是"令牌变了" —— 桥在未配置 WORKBUDDY_LOCAL_TOKEN 时会自动生成
+       * 一把（每次重启都不同），而客户端还存着上一把。所以这里同时给出
+       * 「去哪拿新的」与「为什么可能是旧的」两条指引 —— bridge.test.mjs 对这两
+       * 点都有断言（它比实现更严格，这里补齐实现）。
+       *
+       * **绝不能回显任何真实令牌**（本响应体可能进日志/前端）；同一份测试也守着这点。
+       */
+      return json(res, 401, {
+        error: {
+          message: 'workbuddy-bridge: bad or missing token',
+          hint: '本地回环令牌缺失或不匹配。请到控制台的「客户端接入」页（/clients）复制当前令牌，'
+            + '填进客户端的 Authorization: Bearer <token>。'
+            + '若之前能用而现在失败：桥未配置 WORKBUDDY_LOCAL_TOKEN 时会自动生成新令牌，重启即变（stale/旧），'
+            + '把 .env 里的 WORKBUDDY_LOCAL_TOKEN 固定下来即可升级到稳定配置。',
+          howToFix: [
+            '打开控制台的「客户端接入」页取令牌',
+            '或用启动日志里的 WORKBUDDY_LOCAL_TOKEN= 一行',
+            '想固定不变：在 .env 里设 WORKBUDDY_LOCAL_TOKEN=<你的令牌>',
+          ],
+        },
+      });
     }
 
     if (url.pathname === '/health') {
@@ -3558,8 +3653,16 @@ server.listen(PORT, HOST, () => {
   // ── 连接预热：listen 后立刻向上游开一条 TLS 连接放进池子 ─────────────────
   // 首次对话请求就免去 DNS + TCP + TLS 握手（实测 ~150ms）。只预热、不发请求体；
   // 失败完全无害 —— Agent 会在真正请求时重连。
+  //
+  // **必须尊重 CODEBUDDY_ENDPOINT**：它读的应该是"这次真正要打的上游"，
+  // 而不是无条件去读登录文件里的 domain。否则在**测试/隔离环境**里会去预热
+  // 真实外网地址（实测：本机直连 copilot.tencent.com 不通时，这条预热会一直
+  // 挂着，把后续 chat 响应一起拖死 —— bridge.test.mjs 的账本截断用例因此
+  // 固定超时，而桥的业务逻辑其实是对的）。
   try {
-    const endpoint = API_KEY ? (EXPLICIT_ENDPOINT || 'https://copilot.tencent.com') : pickUpstream(JSON.parse(readFileSync(AUTH_PATH, 'utf8'))?.auth?.domain || '');
+    const endpoint = (API_KEY || EXPLICIT_ENDPOINT)
+      ? (EXPLICIT_ENDPOINT || 'https://copilot.tencent.com')
+      : pickUpstream(JSON.parse(readFileSync(AUTH_PATH, 'utf8'))?.auth?.domain || '');
     const url = new URL(endpoint);
     const req = (url.protocol === 'https:' ? httpsRequest : httpRequest)({
       hostname: url.hostname,
