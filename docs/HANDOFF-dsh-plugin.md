@@ -1,12 +1,102 @@
 # 交接文档：dsh-plugin-workbuddy（WorkBuddy → DeepSeek Harness 原生插件）
 
-> 写给下一个接手的人（或未来的自己）。本会话把 `workbuddy-to-dsh` 从"独立桥 + 手写
-> YAML 注册"升级成了一个**已装好、已验证、正在服役**的 dsh 原生插件。本文记录它
-> 现在的形态、全部关键契约（都是踩过坑换来的）、验证体系、对真实系统动过的每一处，
-> 以及继续开发前必须知道的事。
+> 写给下一个接手的人（或未来的自己）。本文记录插件现在的形态、全部关键契约
+> （都是踩过坑换来的）、验证体系、对真实系统动过的每一处，以及继续开发前必须
+> 知道的事。
 >
-> 交接时状态：**全部绿**。27 项测试通过，渲染验证两场景通过，插件路由正被真实
-> agent 轮次使用中。
+> **第 1 节及之后**是上一轮会话（把项目升级成 dsh 原生插件）的原始记录，仍然有效。
+> **第 0 节**是本轮新增的 —— 多账号、模型元数据、计费时段、以及两个桥的真实 bug。
+
+---
+
+## 0. 本轮更新（多账号 + 计费时段 + 两个桥的真实 bug）
+
+> 本轮起点：单账号插件（27 项测试）。终点：**157 项测试全绿**、CI 7/7 通过、
+> 已推到 `judier-cod/workbuddy-to-dsh`（Public）。下面按"新能力 → 新契约 →
+> 修掉的 bug"组织，每条都带可复核的证据。
+
+### 0.1 新增能力
+
+| 能力 | 位置 | 要点 |
+|---|---|---|
+| **多账号分组** | `lib/index.js` `asAccounts()` | `accounts: [{id, displayName, authFile, port}]`；每组一条独立桥（独立端口/登录文件/日志）+ 独立 provider（`workbuddy-ai`）。**失败隔离**：某组起不来不影响其它组 |
+| 偏好按 provider 分开 | `visibleByProvider` / `creditsByProvider` | 可见性、倍率各按账号存。**用一份全局清单会把别的组一刀切**（真踩过） |
+| **倍率覆盖** | `creditOverrides` | 上游目录会漏报 `credits`，允许手动声明（0 = 免费） |
+| **促销时段计费** | `bridge` `scheduleActive()` | 解析 `schedule.daily`（含跨零点）+ `validFrom/validUntil`，按促销自带时区换算；折扣 `factor` 真正乘进倍率（0.79 → 0.4） |
+| **促销徽章进展示名** | `models.mjs` `withCreditTagAndBadge()` | 只标影响价格判断的（免费/折扣/错峰）；营销文案不标；**免费但无促销来源时不编造**（不写"限时免费"） |
+| 上下文上限 | `contextOverrides` / `contextMaxTokens` | 语义是 **cap**：只压小不放大（放大只会让 dsh 多塞历史、然后上游报错） |
+| 图片能力覆盖 | `visionOverrides` | 上游目录漏报多模态时手动声明（国际版 `deepseek-v4.1-flash` 就是漏报） |
+| 各账号额度卡 | `client.js` `GroupQuotaCards` | 额度按账号算，合成一个数字没意义（实测国内版 2433 / 国际版 0） |
+
+### 0.2 本轮修掉的两个**桥的真实 bug**（都是被环境差异掩盖的）
+
+诊断方法：`bridge.test.mjs` 在作者环境 29/29 通过（提交信息写的），但本机固定
+超时 120 秒。**先用 `git stash` 证明与我的改动无关**，再逐层定位。
+
+**Bug 1：`shimResponse.text()` 在响应体已流完时永久挂起**
+- 症状：上游回 `401 + text/html` 时，桥**永不响应**，客户端只看到超时。
+- 根因：`text()` 是"事后挂 `data`/`end` 监听"的读法。若拿到响应时体已经流完
+  （`end` 已派发），监听永远不触发 → Promise 永不 resolve。
+- 实测：Node 25 下该响应体会在 `callUpstream` 返回前就流完；Node 22（作者环境）
+  时序恰好相反，所以只有跨版本才暴露。
+- 修法：`upstreamRequest` 里**只对非 2xx 预读** body 存进 WeakMap，`text()` 先判
+  `readableEnded`/`complete` 再决定取值还是挂监听。
+- **踩坑警告**：第一版我给**所有**响应都挂了 `data` 监听，结果与 `shimResponse.body`
+  （SSE 的 ReadableStream）**分食同一份数据** —— 14 个用例立刻失败。2xx 一律不碰。
+
+**Bug 2：账本记录不截断 `error`**
+- 症状：上游 4 KB HTML 原样写进 `usage.jsonl`。
+- 影响：账本行膨胀、CSV 导出被撑爆、控制台「最近请求」刷屏。读侧虽也调
+  `shortError`，但**文件本身先被污染**，而账本没有第二份副本。
+- 修法：在 `recordRequest()` **单一收口点**截断 —— 以后新增任何记账调用方自动受保护。
+
+### 0.3 本轮新增/强化的契约（继续开发前必读）
+
+1. **`vendor/` 必须与仓库同步** —— 改了 `bridge/` 或 `lib/` 后跑
+   `node dsh-plugin/scripts/vendor.mjs`。CI 第一项就是 `vendor.mjs --check`，
+   不同步直接红。（本轮就因为改了桥而漏同步被抓到一次。）
+2. **CI 用 Node 22**（`.github/workflows/release-check.yml` 写死）。本机 Node 25
+   与 22 在 HTTP 流时序上有差异 —— 本地测试全绿不等于 CI 绿，反之亦然。
+3. **`tsc --checkJs` 很严**：给函数写 `@param {object}` 后直接访问属性会报 TS2339，
+   要用 `@typedef` 描述形状（本轮 `PromotionSchedule` 就是这么加的）。
+4. **provider 对账要给旧宿主留活路**：响应里没有 `provider` 字段 = 旧宿主/测试桩，
+   **视为可信**；要求"必须有"会把老版本和离线样例全判成"没数据"（表格 0 行）。
+5. **`viewProvider` 用空串代表主分组**，而接口回显的是 `"workbuddy"` ——
+   直接拿两者比较会永远对不上（面板会一直停在"正在读取…"）。用 `activeProvider`。
+6. **偏好存储一律合并写**（`mergePrefs`）：只改一个键、保留其余全部键（含未知键）
+   + 原子替换。**整体重建对象会把别的键冲掉**（真踩过：23 个可见模型变 2 个）。
+7. **空值判定先于数值判定**：`Number('')`、`Number(null)` 都是 0 —— 直接用数值
+   判断会把"没填"当成"免费"（标错价）。先 `blank` 再 `Number`。
+8. **`--live` 截图绝不能提交**：`panel-render.mjs` 默认离线、产物落 `docs/`；
+   `--live` 抓真实数据（含账号 ID）、产物落**已被 gitignore** 的 `docs/_review/`。
+   仓库是 Public，这条是硬约束。
+
+### 0.4 本轮验证记录（可复核）
+
+```sh
+node dsh-plugin/scripts/vendor.mjs --check   # ✅ 一致（17 文件 749 KB）
+npm run check:types                          # ✅ 0 error
+npm run lint                                 # ✅ 0 problem
+node --test "dsh-plugin/tests/*.test.mjs"    # ✅ 110/110
+node --test lib/*.test.mjs                   # ✅ 18/18
+node --test bridge/bridge.test.mjs           # ✅ 29/29（本轮从 26/2 修到全绿）
+node dsh-plugin/scripts/verify-standalone.mjs# ✅ 12 项全过
+```
+
+端到端（真实账号）：两个分组各自调模型分别返回 `CN` / `AI`；按 provider 的
+可见性与倍率互不干扰（实测改 A 组不动 B 组）。
+
+### 0.5 环境备忘（本机，覆盖第 10 节的旧记录）
+
+- **Node v25.2.1**（`C:\Program Files\nodejs\node.exe`）；CI 用 22；DSH 自带 24.21.0。
+- dsh CLI：`D:\Apps\DeepSeekHarness\resources\runtime\cli\bin\dsh.cmd`（ELECTRON_RUN_AS_NODE 包装）。
+- `DSH_HOME=C:\Users\局二\.dsh`；profile `desktop`；DSH 0.2.0-rc.2。
+- 仓库检出：`D:\deepseek\workbuddy-to-dsh`；远程 `judier-cod/workbuddy-to-dsh`（Public）。
+- **git 走代理**：系统代理 `127.0.0.1:7890`（Clash），但 git 不读系统代理。
+  已配 `http.https://github.com.proxy`（只对 GitHub 生效，不动全局）。
+  **换网络后跑 `tools/dev/git-proxy.ps1`** —— 它实测直连/代理哪条通再调配置。
+- GitHub 凭据已由 GCM 缓存（`C:\Program Files\Git\mingw64\bin\git-credential-manager.exe`，
+  不在 PATH，用绝对路径配的）。
 
 ---
 
@@ -185,16 +275,16 @@ dsh-plugin/
 ## 6. 验证体系
 
 ```sh
-# 1) 纯逻辑 27 项（打桩上游，不碰真实额度）
+# 1) 纯逻辑（打桩上游，不碰真实额度）
 npm run test:plugin          # = node --test "dsh-plugin/tests/*.test.mjs"
-# 预期：tests 27 / pass 27 / fail 0
+# 预期：tests 110 / pass 110 / fail 0   （本轮从 27 涨到 110，见第 0 节）
+
+node --test lib/*.test.mjs   # 18 项：bundlesAllInstalled / bundleInAsar / find-dsh …
+node --test bridge/bridge.test.mjs  # 29 项：桥的合约（起真桥进程打真实 HTTP）
 
 # 2) 设置页渲染验证（无头 Chrome/Edge + 真实数据）
 npm run panel:shot           # = node dsh-plugin/tests/panel-render.mjs
-node dsh-plugin/tests/panel-render.mjs --offline   # 只用内置样例
-# 预期：场景 1（9 标签页逐个点开、内容断言、逐页横向溢出检查、图表/表格/交互、无页面错误）
-#       场景 2（宿主旧构建 404：控制台域面板给出"重启一次 dsh"，桥域功能不受影响）
-# 产物：docs/plugin-panel.png / -usage.png / -diagnose.png / -chat.png
+# 产物：docs/plugin-panel*.png（**可提交**；--live 的产物落 docs/_review/ 且被 gitignore）
 ```
 
 渲染验证的环境细节：`tools/dev/ui-harness.mjs` 找 Chrome/Edge；React UMD 首次运行下载到 `.tmp-research/vendor/`（删了会重下）；打桩装在**外壳页面里**（`harnessHtml(routes)`）而不是 CDP——`openPage(..., { injectStub: false })`，因为 CDP 注入会连子框架一起打桩。端口：8795 静态壳、8796 场景 1、8797 场景 2；CDP 9333/9334。
