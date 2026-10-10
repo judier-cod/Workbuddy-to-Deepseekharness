@@ -6,7 +6,7 @@
 ## 快速上手
 
 ```cmd
-git clone https://github.com/Ianzhyh/workbuddy-to-dsh && cd workbuddy-to-dsh
+git clone https://github.com/judier-cod/workbuddy-to-dsh && cd workbuddy-to-dsh
 启动.cmd                 :: 双击：自动定位 Node、起服务、开控制台
 node tools\doctor.mjs    :: 命令行自检
 npm run release:check    :: 完整门禁（vendor:check + 单测 + 插件测试 + 独立分发演练）

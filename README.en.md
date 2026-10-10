@@ -46,7 +46,7 @@ native plugin**.
 
 ## Quick start (Windows)
 
-1. `git clone https://github.com/Ianzhyh/workbuddy-to-dsh && cd workbuddy-to-dsh`
+1. `git clone https://github.com/judier-cod/workbuddy-to-dsh && cd workbuddy-to-dsh`
 2. Double-click `启动.cmd` — it locates Node.js, starts the bridge + console and
    opens `http://127.0.0.1:8792` in your browser.
 3. Open the **Client Access** tab for Base URL & token:
@@ -54,7 +54,7 @@ native plugin**.
    - Anthropic: `http://127.0.0.1:8790` (no `/v1`)
    - API key: `wb-local-bridge` (or your `WORKBUDDY_LOCAL_TOKEN`)
 
-DeepSeek Harness users: `dsh plugin add github:Ianzhyh/workbuddy-to-dsh`, then
+DeepSeek Harness users: `dsh plugin add github:judier-cod/workbuddy-to-dsh`, then
 register models in the plugin's settings page. That page is **bilingual** —
 the `EN` / `中` toggle in its top-right corner switches all nine tabs
 (upstream data such as model descriptions and chat content is left as-is):

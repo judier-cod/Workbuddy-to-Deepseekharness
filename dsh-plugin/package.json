@@ -57,11 +57,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Ianzhyh/workbuddy-to-dsh.git",
+    "url": "git+https://github.com/judier-cod/workbuddy-to-dsh.git",
     "directory": "dsh-plugin"
   },
-  "homepage": "https://github.com/Ianzhyh/workbuddy-to-dsh/tree/main/dsh-plugin#readme",
+  "homepage": "https://github.com/judier-cod/workbuddy-to-dsh/tree/main/dsh-plugin#readme",
   "bugs": {
-    "url": "https://github.com/Ianzhyh/workbuddy-to-dsh/issues"
+    "url": "https://github.com/judier-cod/workbuddy-to-dsh/issues"
   }
 }

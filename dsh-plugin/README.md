@@ -391,7 +391,7 @@ npm publish
 ```
 
 发布前先跑根目录 `npm run release:check`（vendor 快照必须与仓库一致）。
-GitHub 直装（`dsh plugin add github:Ianzhyh/workbuddy-to-dsh`）始终可用，npm 只是
+GitHub 直装（`dsh plugin add github:judier-cod/workbuddy-to-dsh`）始终可用，npm 只是
 降低"没有 git 环境的用户"的门槛。
 
 ---
