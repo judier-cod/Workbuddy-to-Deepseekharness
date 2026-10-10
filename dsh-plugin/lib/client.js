@@ -1928,7 +1928,7 @@ body.dark .wb-root,
         // 积分卡放在最前：这是大家真正在意的东西，值得单独一张卡 + 大号数字
         h(QuotaCard, { status, reload, busy, onOpenTab }),
         // 多账号：每个分组各一张积分卡（额度是按账号算的，必须分开看）
-        h(GroupQuotaCards, { status, busy }),
+        h(GroupQuotaCards, { status }),
 
         alerts.length
           ? h('div', { className: 'wb-card' },
@@ -2005,7 +2005,7 @@ body.dark .wb-root,
      *
      * 只有一个分组时整块不渲染（保持单账号界面原样，不增加噪音）。
      */
-    function GroupQuotaCards({ status, busy }) {
+    function GroupQuotaCards({ status }) {
       const groups = Array.isArray(status?.groupQuotas) ? status.groupQuotas : [];
       if (groups.length === 0) return null;
       const toneOf = (remain, size) => {
@@ -2663,7 +2663,7 @@ body.dark .wb-root,
     }
 
     // ─────────────────────────── 可用模型 / 体检 ───────────────────────────
-    function ModelsPanel({ onStartConsole, busy, sampleModel, onUseModel, status: panelStatus, onUseModelFor }) {
+    function ModelsPanel({ onStartConsole, busy, sampleModel, onUseModel, status: panelStatus }) {
       const [refreshTick, setRefreshTick] = useState(0);
       // 当前查看哪个 provider 的目录。多账号下每个分组有各自的模型清单与显示偏好。
       const [viewProvider, setViewProvider] = useState('');
@@ -2718,16 +2718,11 @@ body.dark .wb-root,
       const [prefsDirty, setPrefsDirty] = useState(false);
       const [prefsSaving, setPrefsSaving] = useState(false);
       /**
-       * 已填充 `visibility` 的**是哪个 provider** 的数据。
-       *
-       * 为什么需要它：切换分组后，新请求返回之前 `prefsApi.data` 仍是**上一组**
-       * 的响应 —— 这时若只看 `prefsApi.data.ok` 就填 `visibility`，会把 A 组的
-       * 勾选显示成 B 组的，用户以为改了这一组、其实看到的是另一组的值
-       * （报的就是"国际版勾选不生效"）。
-       *
-       * 用响应里回显的 provider 字段对账：只有对得上的才采用。
+       * 切换分组后，新请求返回之前 `prefsApi.data` 仍是**上一组**的响应 ——
+       * 这时若只看 `prefsApi.data.ok` 就填 `visibility`，会把 A 组的勾选显示成
+       * B 组的，用户以为改了这一组、其实看到的是另一组的值
+       * （报的就是"国际版勾选不生效"）。所以下面用 providerMatches 对账。
        */
-      const [prefsLoadedFor, setPrefsLoadedFor] = useState(null);
       useEffect(() => {
         // 只在首次拿到响应时初始化勾选状态（后续 reload 不覆盖用户的未保存改动）
         if (!prefsLoaded && prefsApi.data && prefsApi.data.ok) {
@@ -2738,13 +2733,11 @@ body.dark .wb-root,
           if (!providerMatches(prefsApi.data)) return;
           setVisibility(Array.isArray(prefsApi.data.visible) ? prefsApi.data.visible : null);
           setPrefsLoaded(true);
-          setPrefsLoadedFor(activeProvider);
         }
       }, [prefsApi.data, prefsLoaded, activeProvider]);
       // 切换 provider：重置全部按组的状态，否则会拿着上一组的勾选去改这一组
       useEffect(() => {
         setPrefsLoaded(false);
-        setPrefsLoadedFor(null);
         setVisibility(null);
         setPrefsDirty(false);
         setDetail('');

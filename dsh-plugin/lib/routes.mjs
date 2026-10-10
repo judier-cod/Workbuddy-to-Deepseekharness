@@ -48,7 +48,9 @@ async function readJsonBody(req, limit = 64 * 1024) {
  * @param {(line: string, detail?: unknown) => void} deps.log
  */
 export function createRouteTable(deps) {
-  const { snapshot, supervisor, consoleSupervisor, client, adapter, paths, provider, log, onUpstreamMutation = () => {}, onWritePrefs = () => {}, notifyAdaptersUpdated = () => false } = deps;
+  // onWritePrefs / writeXxxPrefs 一律经 deps 取用（它们要带 provider 参数），
+  // 因此这里不解构 —— 解构出来只会是个未使用的变量（ESLint no-unused-vars）。
+  const { snapshot, supervisor, consoleSupervisor, client, adapter, paths, provider, log, onUpstreamMutation = () => {}, notifyAdaptersUpdated = () => false } = deps;
 
   /** 写操作的准入检查。 */
   const guard = (req) => req.headers['x-workbuddy-panel'] === '1';

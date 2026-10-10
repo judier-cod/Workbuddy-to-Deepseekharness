@@ -185,8 +185,20 @@ async function startStubUpstream(models = ['stub-model'], opts = {}) {
       });
       return;
     }
-    res.writeHead(404, { 'content-type': 'application/json' });
-    res.end('{}');
+    /*
+     * 兜底 404 也必须**先把请求体读完**再响应。
+     *
+     * 为什么：Node 的 HTTP 服务在"还没读完请求体就 end 响应"时，这条 keep-alive
+     * 连接会进入不一致状态 —— 后一个复用它的请求**永远收不到响应**。
+     * 实测代价：`refreshAuth`（用全局 fetch，走该兜底分支拿 404）之后，桥重试
+     * chat 会复用这条被污染的连接，于是整个请求挂死；表现为「401 + text/html」
+     * 用例固定卡满测试超时（120 秒），而桥的业务逻辑其实是对的。
+     */
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end('{}');
+    });
   });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   return {
@@ -1627,7 +1639,13 @@ test('桥：上游超长错误原文必须压成单行并截断（不得把整�
    * 而刷新在测试桩上必然失败（桩没有 /v2/plugin/auth/token/refresh），
    * 走满 `refreshAuth` 的 8 秒超时 + 后续重试。这是**刻意保留的真实行为**
    * （生产里刷新成功就会重试），不该为了让测试快而去掉。
+   *
+   * **但请求侧必须自带超时**：本用例原先直接 `await fetch(...)` 且无 signal ——
+   * 桥一旦不返回，整个用例就挂到 120 秒的测试上限才失败（实测如此，且与桥的
+   * 业务逻辑无关）。带上 25 秒 signal 后，卡住时能立刻失败并给出可读原因，
+   * 而不是把"测试框架超时"当成唯一线索。
    */
+  const REQ_TIMEOUT_MS = 25_000;
   // 造一段带换行的长 HTML：既测截断，也测换行被压平
   const longHtml = '<html>\n  <head><title>401</title></head>\n  <body>\n'
     + 'x'.repeat(4000)
@@ -1635,12 +1653,18 @@ test('桥：上游超长错误原文必须压成单行并截断（不得把整�
   const stub = await startStubUpstream(['stub-model'], { chatRaw: longHtml, chatStatus: 401, chatType: 'text/html' });
   const bridge = await startBridge({ CODEBUDDY_ENDPOINT: stub.base }, { auth: READABLE_FAKE_AUTH });
   try {
-    const res = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { ...auth, 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'stub-model', messages: [{ role: 'user', content: 'hi' }] }),
-    });
-    await res.text();
+    let res;
+    try {
+      res = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { ...auth, 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'stub-model', messages: [{ role: 'user', content: 'hi' }] }),
+        signal: AbortSignal.timeout(REQ_TIMEOUT_MS),
+      });
+      await res.text();
+    } catch (error) {
+      assert.fail(`桥在 ${REQ_TIMEOUT_MS} ms 内没有响应（上游 401 + text/html 场景）：${error?.message || error}`);
+    }
     assert.ok(res.status >= 400, '上游 401 时桥不能回 200');
 
     await new Promise((r) => setTimeout(r, 300));
