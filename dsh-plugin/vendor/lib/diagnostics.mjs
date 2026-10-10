@@ -461,11 +461,41 @@ export async function diagnose() {
   try {
     names = readdirSync(dir).filter((f) => f.endsWith('.info'));
   } catch { /* 目录不存在 */ }
-  push('authfiles', '登录文件', names.length === 0 ? 'fail' : names.length > 1 ? 'warn' : 'ok',
-    names.length ? names.join('  ·  ') : `目录为空：${dir}`,
-    names.length > 1
-      ? `存在多个账号快照，已固定使用 ${effectiveAuthFile().split(/[\\/]/).pop()}，避免选错账号`
-      : '');
+  /**
+   * 登录文件：**多快照不再是警告**。
+   *
+   * 这条原本是单账号时代的口径（"多个 .info 容易选错账号"）。但多账号分组
+   * 就是设计成**同时驱动多个账号**的 —— 每个分组各绑一个登录文件，多快照是
+   * 正常且预期的状态，不该一直挂黄点让人以为哪里不对（实测用户就被这个黄点
+   * 问过"为什么不绿"）。
+   *
+   * 判据用"快照能不能解开凭据"（{@link listAccounts} 现成的能力），不依赖
+   * 插件的运行时配置 —— 诊断库是独立模块，读不到插件内部状态：
+   *   - 0 个            → fail（真的没登录过）
+   *   - 1 个            → ok
+   *   - 多个，全部可用   → **ok**（这正是多账号想达到的状态）
+   *   - 多个，有不可用的 → warn（如实提示哪个有问题）
+   */
+  let accountsInfo = null;
+  try { accountsInfo = await listAccounts(); } catch { /* 拿不到就退回条数判定 */ }
+  const brokenAccounts = (accountsInfo?.accounts || []).filter((a) => a.usable === false);
+
+  // 提示只在**需要动手**时给（fail/warn）；全绿时不挂"建议："前缀 ——
+  // 那会让人以为还有什么要做。多快照全可用是正常状态，写在 detail 里就够。
+  push('authfiles', '登录文件',
+    names.length === 0 ? 'fail' : brokenAccounts.length ? 'warn' : 'ok',
+    names.length === 0
+      ? `目录为空：${dir}`
+      : names.join('  ·  ') + (names.length > 1 && !brokenAccounts.length
+        ? `（${names.length} 个都可用，多账号分组各自独立使用与计费）`
+        : ''),
+    names.length === 0
+      ? '先在 WorkBuddy 桌面端登录一次'
+      : brokenAccounts.length
+        ? `${brokenAccounts.length} 个账号快照无法解开凭据：`
+          + brokenAccounts.map((a) => a.name).join(', ')
+          + '（可能是另一个 build 写入的）'
+        : '');
 
   const cred = await credentialStatus();
   if (cred.error) {
@@ -496,9 +526,20 @@ export async function diagnose() {
       ? ''
       : '在「可用模型」里勾选后保存。DSH Desktop 0.2.0 会在下次启动时把 settings.yaml 导入 profile 的 patch 层');
 
-  push('credref', '凭据引用', dsh.hasBridgeKey ? 'ok' : 'fail',
-    dsh.hasBridgeKey ? '.credentials.yaml 已含 WORKBUDDY_BRIDGE_KEY' : '缺少占位凭据',
-    dsh.hasBridgeKey ? '' : 'pi-ai 的 OpenAI 实现要求必须提供 API key 引用');
+  /**
+   * 占位凭据只为**手写的 llm-pi-ai 路由**而存在（pi-ai 的 OpenAI 实现强制要求
+   * apiKeyEnv 引用）。插件的原生适配器在运行时自己注入本地回环令牌，不读
+   * apiKeyEnv —— 所以"没有占位 key"只在真的有手写路由时才构成问题。
+   * 否则这一项会在插件模式下永远误报 fail（用户看到一个无从修起的红点）。
+   */
+  const needsCredRef = dsh.patchHasRoute || dsh.settingsHasRoute;
+  push('credref', '凭据引用', needsCredRef ? (dsh.hasBridgeKey ? 'ok' : 'fail') : 'ok',
+    dsh.hasBridgeKey
+      ? '.credentials.yaml 已含 WORKBUDDY_BRIDGE_KEY'
+      : (needsCredRef ? '缺少占位凭据' : '无需占位（插件原生路由不走 apiKeyEnv）'),
+    needsCredRef && !dsh.hasBridgeKey
+      ? 'pi-ai 的 OpenAI 实现要求必须提供 API key 引用'
+      : '');
 
   const missing = dsh.bundles.filter((b) => !b.installed);
   const desktop = config.dsh.desktopVersion ? ` · DSH ${config.dsh.desktopVersion}` : '';

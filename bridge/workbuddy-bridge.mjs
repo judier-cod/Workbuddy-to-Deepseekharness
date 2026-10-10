@@ -138,6 +138,76 @@ function creditsOf(model) {
   return undefined;
 }
 
+/** "HH:MM"（或 "H:MM"）→ 当天的分钟数；非法返回 null。 */
+function minutesOfDay(hhmm) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(hhmm || '').trim());
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (!Number.isInteger(h) || !Number.isInteger(min) || h > 23 || min > 59) return null;
+  return h * 60 + min;
+}
+
+/**
+ * 促销时段当前是否生效。
+ *
+ * 上游的 `schedule` 有两种形状（都实测过）：
+ *   1. 每日时段：`{ timezone, daily: [{start:"23:00", end:"7:50"}, ...] }`
+ *      —— 跨零点要能正确处理（start > end 表示跨夜）。
+ *   2. 绝对区间：`{ timezone, validFrom, validUntil }`
+ *      —— 活动的起止日期。
+ * 两种可以同时出现（限时免费既给了 daily 也可能给 validFrom/Until）。
+ *
+ * **没有 schedule = 视为长期有效**（上游大部分促销就是这样）。
+ * 任何字段无法解析时**按"生效"处理**（保守：宁可显示促销价，也不要
+ * 因为解析失败把已经打折的价格显示成全价 —— 后者会让用户多花冤枉钱）。
+ *
+ * @param {object} schedule 上游给的 schedule 对象
+ * @param {Date} [now] 当前时间（测试注入用）
+ */
+function scheduleActive(schedule, now = new Date()) {
+  if (!schedule || typeof schedule !== 'object') return true;
+
+  // 1) 绝对区间：validFrom / validUntil
+  const from = schedule.validFrom ? Date.parse(schedule.validFrom) : null;
+  const until = schedule.validUntil ? Date.parse(schedule.validUntil) : null;
+  const ts = now.getTime();
+  if (Number.isFinite(from) && ts < from) return false;
+  if (Number.isFinite(until) && ts > until) return false;
+
+  // 2) 每日时段：daily[]，任一段命中即生效
+  if (Array.isArray(schedule.daily) && schedule.daily.length) {
+    // 按 schedule 自称的时区取"当地几点"。拿不到该时区就退回本机时间。
+    let hm = now.getHours() * 60 + now.getMinutes();
+    const tz = schedule.timezone;
+    if (typeof tz === 'string' && tz) {
+      try {
+        const parts = new Intl.DateTimeFormat('en-GB', {
+          timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false,
+        }).formatToParts(now);
+        const hh = parts.find((p) => p.type === 'hour')?.value;
+        const mm = parts.find((p) => p.type === 'minute')?.value;
+        const local = minutesOfDay(`${hh}:${mm}`);
+        if (local !== null) hm = local;
+      } catch { /* 时区名不被支持：用本机时间，不因此判为"不生效" */ }
+    }
+    for (const slot of schedule.daily) {
+      const start = minutesOfDay(slot?.start);
+      const end = minutesOfDay(slot?.end);
+      if (start === null || end === null) continue;
+      if (start <= end) {
+        if (hm >= start && hm <= end) return true;
+      } else if (hm >= start || hm <= end) {
+        // 跨零点：如 23:00–07:50
+        return true;
+      }
+    }
+    return false;
+  }
+
+  return true;
+}
+
 // Locate the CodeBuddy / WorkBuddy desktop login file across platforms.
 // Override with WORKBUDDY_AUTH_FILE when the desktop app stores it elsewhere.
 const AUTH_DIRS = [
@@ -2202,15 +2272,31 @@ async function fetchCatalog() {
         if (Array.isArray(promos) && promos.length) {
           shape.sources[`${path}#modelPromotions`] = promos.length;
           if (!shape.promotionFields) shape.promotionFields = Object.keys(promos[0] || {});
+          // schedule / hover / priority 也留档：时段促销（夜间/错峰）的正确性
+          // 依赖它们。之前只挑 5 个字段，schedule 丢了 —— 排障时看 /health
+          // 就能知道"为什么这个折扣此刻没生效"。
           shape.promotionDetail = promos.map((p) => ({
             badge: typeof p.badge === 'object' ? JSON.stringify(p.badge) : p.badge,
+            // display: "activeOnly" = 仅激活时段显示徽章/折扣（上游语义）
+            display: typeof p.badge === 'object' ? p.badge?.display : p.display,
             discount: p.discount,
             enabled: p.enabled,
             kind: p.kind,
             models: p.modelIds,
+            ...(p.schedule !== undefined ? { schedule: p.schedule } : {}),
+            ...(p.hover !== undefined ? { hover: p.hover } : {}),
+            ...(p.priority !== undefined ? { priority: p.priority } : {}),
           }));
           for (const p of promos) {
             if (!p || typeof p !== 'object' || p.enabled === false) continue;
+            /**
+             * 时段判断：不在激活时段的促销**不参与定价与徽章**。
+             *
+             * 之前没有这一步，导致"夜间折扣 23:00–7:50"在白天也显示半价、
+             * "错峰使用"的徽章全天挂着 —— 用户看到的价与实际扣的费对不上。
+             * schedule 解析失败时 scheduleActive 按生效处理（保守，见其注释）。
+             */
+            if (!scheduleActive(p.schedule)) continue;
             // badge 可能是字符串，也可能是 {text,color} 这类对象
             let label = p.badge;
             if (label && typeof label === 'object') {
@@ -2224,7 +2310,7 @@ async function fetchCatalog() {
             const free = p.discount?.factor === 0
               || /^0x$/i.test(String(p.discount?.discountedCredits || ''));
             for (const mid of (Array.isArray(p.modelIds) ? p.modelIds : [])) {
-              if (typeof mid === 'string') promotions.set(mid, { label, free });
+              if (typeof mid === 'string') promotions.set(mid, { label, free, factor: p.discount?.factor });
             }
           }
         }
@@ -2274,13 +2360,23 @@ async function fetchCatalog() {
       const upstreamKept = kept.filter((m) => !m._supplemented).length;
       catalogCache = {
         at: Date.now(),
-        models: kept.map((m) => ({
+        models: kept.map((m) => {
+          const promo = promotions.get(m.id);
+          // 倍率 = 目录价 × 促销因子。夜间折扣 factor=0.5 之类在这里落地，
+          // 否则用户看到的价与实际扣的费对不上（深夜该是半价却显示全价）。
+          // factor 缺失（纯徽章促销）不影响倍率；factor=0 已由 free 覆盖。
+          const base = creditsOf(m);
+          const factor = typeof promo?.factor === 'number' ? promo.factor : null;
+          const effectiveCredits = (base !== undefined && factor !== null && factor > 0)
+            ? Math.round(base * factor * 100) / 100
+            : (promo?.free ? 0 : base);
+          return {
           id: m.id,
           name: m.name || m.id,
           context: m.maxInputTokens,
           maxOutput: m.maxOutputTokens,
           images: !!m.supportsImages,
-          credits: m.credits,
+          credits: effectiveCredits,
           // 上游的推理能力标记：supportsReasoning=true 表示该模型接受推理强度控制
           //（选择器要据此显示"推理等级"下拉）；onlyReasoning 表示该模型只能以
           // 推理模式使用。不上报数据里的这两个字段，插件就无法给模型声明
@@ -2294,9 +2390,10 @@ async function fetchCatalog() {
           descriptionZh: m.descriptionZh,
           descriptionEn: m.descriptionEn,
           isDefault: m.isDefault,
-          badge: promotions.get(m.id)?.label,
-          free: promotions.get(m.id)?.free === true,
-        })),
+          badge: promo?.label,
+          free: promo?.free === true,
+          };
+        }),
         // 诊断用：各端点的命中数量与模型字段名
         shape,
         /**

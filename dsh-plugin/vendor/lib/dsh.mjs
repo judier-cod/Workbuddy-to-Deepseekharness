@@ -6,9 +6,70 @@
  * 该分节热重载，无需重启。凭据走 `$DSH_HOME/.credentials.yaml` 的 `refs:`，
  * 由 `apiKeyEnv` 按请求解析。
  */
-import { copyFileSync, existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
-import { join } from 'node:path';
+import { closeSync, copyFileSync, existsSync, openSync, readFileSync, readSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import config from '../config.mjs';
+
+/**
+ * 打包版 DSH 的 bundle 落在 `resources/app.asar` 内，而**普通 Node 的 fs 读不进
+ * asar**（只有 Electron 打了 asar 补丁）。这会让 dsh-base / dsh-web-app 在
+ * 本机这种安装形态下**永远被误报为缺失**。
+ *
+ * 这里做一次**最小、只读**的 asar 头部解析来确认包是否存在：
+ *   asar 布局 = [4B 头部 pickle 长度][pickle][文件体]
+ *   pickle 里含一个 JSON 索引（files 树），足以判断"包在不在"，
+ *   而不必解压、不必起 Electron 进程（那要几百毫秒且很重）。
+ *
+ * 只在常规路径判定失败时调用；任何异常都返回 false（宁可保留原判定，
+ * 也不要把"不确定"粉饰成"已安装"）。
+ *
+ * @param {string} name 包名，如 `@deepseek-ai/dsh-base`
+ * @param {string} [runtimeDir] DSH runtime 目录（app.asar 与它同级）
+ */
+export function bundleInAsar(name, runtimeDir = config.dsh.runtime) {
+  try {
+    if (!runtimeDir || !name) return false;
+    const parts = String(name).split('/').map((s) => s.trim()).filter(Boolean);
+    // 包名不能空、不能含 `.`/`..`，也不能是纯分隔符 —— 这类输入没有意义，
+    // 且会在下面的索引遍历里被误判（`'   '` 曾一路走到 return true）。
+    if (parts.length === 0 || parts.some((p) => p === '.' || p === '..')) return false;
+    // runtime 位于 <root>/resources/runtime，asar 是 <root>/resources/app.asar
+    const resources = dirname(runtimeDir);
+    const asarPath = join(resources, 'app.asar');
+    if (!existsSync(asarPath)) return false;
+
+    const fd = openSync(asarPath, 'r');
+    try {
+      const head = Buffer.alloc(8);
+      if (readSync(fd, head, 0, 8, 0) < 8) return false;
+      const payloadSize = head.readUInt32LE(4);
+      // 头部异常巨大 = 不是 asar / 已损坏，直接放弃（不盲目分配内存）
+      if (!Number.isFinite(payloadSize) || payloadSize <= 0 || payloadSize > 32 * 1024 * 1024) return false;
+      const payload = Buffer.alloc(payloadSize);
+      if (readSync(fd, payload, 0, payloadSize, 8) < payloadSize) return false;
+      const text = payload.toString('utf8');
+      const start = text.indexOf('{');
+      if (start < 0) return false;
+      const header = JSON.parse(text.slice(start));
+      // 按 `dsh/node_modules/<name>` 走索引
+      let cur = (header?.files?.dsh?.files?.node_modules?.files) || {};
+      for (let i = 0; i < parts.length; i += 1) {
+        const next = cur?.[parts[i]];
+        // 必须是**对象**且真的带 files / 是叶子节点。空对象 `{}` 也是 truthy，
+        // 只判 `!next` 会被它骗过去。
+        if (!next || typeof next !== 'object') return false;
+        if (i === parts.length - 1) return true;
+        cur = next.files;
+        if (!cur || typeof cur !== 'object') return false;
+      }
+      return false;
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
 
 /**
  * 读取 dsh 侧全部相关状态。不返回任何凭据值。
@@ -98,7 +159,20 @@ export function readDshStatus() {
           join(config.dsh.home, 'profiles', 'node_modules', name),
           join(config.dsh.profileDir, 'node_modules', name),
         ];
-        out.bundles.push({ name, installed: candidates.some((c) => existsSync(c)) });
+        let installed = candidates.some((c) => existsSync(c));
+        /**
+         * 打包版 DSH（本机形态）把 bundle 放在 resources/app.asar 里。
+         * **普通 Node 的 fs 看不进 asar**（只有 Electron 打了 asar 补丁才行），
+         * 于是 dsh-base / dsh-web-app 在这种形态下必然被判"缺失"—— 而 profile
+         * 其实是活着的（本诊断能跑起来就是证明）。
+         *
+         * 因此：常规路径都落空时，再检查 app.asar 内部。asar 是自定义格式，
+         * 不做完整解析（那是 Electron 的活）—— 只做**最小、只读、无副作用**
+         * 的判断：运行时目录旁边存在 app.asar 且它内部有该包的 package.json。
+         * 用 electron 读一次很重（要起进程），所以只在常规判定失败时才走。
+         */
+        if (!installed) installed = bundleInAsar(name);
+        out.bundles.push({ name, installed });
       }
     } catch (err) {
       out.bundlesError = err.message;
