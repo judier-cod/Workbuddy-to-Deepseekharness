@@ -1927,6 +1927,8 @@ body.dark .wb-root,
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: '12px' } },
         // 积分卡放在最前：这是大家真正在意的东西，值得单独一张卡 + 大号数字
         h(QuotaCard, { status, reload, busy, onOpenTab }),
+        // 多账号：每个分组各一张积分卡（额度是按账号算的，必须分开看）
+        h(GroupQuotaCards, { status, busy }),
 
         alerts.length
           ? h('div', { className: 'wb-card' },
@@ -1995,6 +1997,89 @@ body.dark .wb-root,
      * 同名套餐合并计数：上游会把同一档权益拆成多条（本机实测 4 条同名 100/100），
      * 逐条列出来只是噪音。
      */
+    /**
+     * 多账号：每个分组的积分各一张卡。
+     *
+     * 为什么必须分开：**额度是按账号算的** —— 国内版账号 2445 分、国际版账号
+     * 0 分（实测），合成一个数字毫无意义，还会让人以为"还有额度"却调不通。
+     *
+     * 只有一个分组时整块不渲染（保持单账号界面原样，不增加噪音）。
+     */
+    function GroupQuotaCards({ status, busy }) {
+      const groups = Array.isArray(status?.groupQuotas) ? status.groupQuotas : [];
+      if (groups.length === 0) return null;
+      const toneOf = (remain, size) => {
+        const ratio = size > 0 ? remain / size : 1;
+        return ratio <= 0.1 ? 'bad' : ratio <= 0.3 ? 'warn' : 'ok';
+      };
+      return h(Card, { title: '账号额度（各账号独立）' },
+        h('p', { className: 'wb-note', style: { marginTop: 0 } },
+          '额度按账号计算，下面的数字是各分组自己的余额。'),
+        h('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '6px' } },
+          groups.map((g) => {
+            // 同名套餐合并（上游常把同一活动拆成多条），与主积分卡同款口径
+            const byName = new Map();
+            for (const p of g.packages || []) {
+              const key = p.name || '(未命名套餐)';
+              const prev = byName.get(key);
+              if (prev) {
+                prev.remain += Number(p.remain) || 0;
+                prev.size += Number(p.size) || 0;
+                prev.count += 1;
+              } else {
+                byName.set(key, {
+                  name: key,
+                  remain: Number(p.remain) || 0,
+                  size: Number(p.size) || 0,
+                  count: 1,
+                  monthly: p.monthly === true,
+                  expiresAt: p.expiresAt || null,
+                });
+              }
+            }
+            const pkgs = [...byName.values()].sort((a, b) => b.remain - a.remain);
+            const total = typeof g.total === 'number' ? g.total : null;
+            // 0 分要显眼地标出来 —— 那正是"模型调不通"的直接原因（上游 429 欠费）
+            const empty = total === 0;
+            // 套餐列表先单独算出来：整体嵌在一层 return 里太深，括号极易写错
+            const pkgList = pkgs.map((p) => h('div', { key: p.name, className: 'wb-quota-pkg' },
+              h('div', { className: 'wb-quota-pkg-head' },
+                h('span', { className: 'wb-quota-pkg-name', title: p.name }, p.name + (p.count > 1 ? ' ×' + p.count : '')),
+                h('span', { className: 'wb-quota-pkg-num' }, p.remain + ' / ' + p.size)),
+              h('div', { className: 'wb-bar' },
+                h('i', {
+                  className: toneOf(p.remain, p.size),
+                  style: { width: Math.max(0, Math.min(100, p.size > 0 ? (p.remain / p.size) * 100 : 0)) + '%' },
+                })),
+              (p.monthly || p.expiresAt)
+                ? h('div', { className: 'wb-note', style: { margin: '3px 0 0' } },
+                  [p.monthly ? '月度' : null, p.expiresAt ? '到期 ' + p.expiresAt : null].filter(Boolean).join(' · '))
+                : null));
+
+            return h('div', { key: g.provider, className: 'wb-account' + (empty ? ' bad' : '') },
+              h('div', { className: 'wb-account-head' },
+                h('b', { title: g.provider }, g.displayName || g.provider),
+                h(Pill, {
+                  tone: empty ? 'bad' : 'ok',
+                  text: total === null ? '未读到' : fmtInt(total) + (empty ? '（已用尽）' : ''),
+                })),
+              h('div', { className: 'wb-note', style: { margin: '4px 0 0' } },
+                (g.account ? String(g.account).slice(0, 8) + '…' : '(未识别账号)')
+                + ' · provider ' + g.provider
+                + (g.at ? ' · 更新于 ' + fmtClock(g.at) : '')),
+              g.error
+                ? h('div', { className: 'wb-note', style: { margin: '2px 0 0' } }, '读取失败：' + g.error)
+                : null,
+              empty
+                ? h('div', { className: 'wb-note', style: { margin: '2px 0 0' } },
+                  '⚠ 这个账号额度已用尽 —— 用它调模型会被上游拒绝（429 Credits exhausted）。换用另一个分组，或去充值。')
+                : null,
+              pkgs.length
+                ? h('div', { className: 'wb-quota-pkgs', style: { marginTop: '6px' } }, pkgList)
+                : h('div', { className: 'wb-note', style: { margin: '4px 0 0' } }, '还没有读到套餐明细'));
+          })));
+    }
+
     function QuotaCard({ status, reload, busy, onOpenTab }) {
       const [refreshing, setRefreshing] = useState(false);
       const [message, setMessage] = useState('');
@@ -2091,63 +2176,96 @@ body.dark .wb-root,
     }
 
     // ─────────────────────────── 账号 ───────────────────────────
-    function AccountsPanel({ onStartConsole, busy, reloadStatus }) {
+    /**
+     * 账号页。
+     *
+     * **这里不再提供「切换」**。多账号分组（config.accounts）已经让多个账号
+     * **同时可用**，切换是多余的 —— 而且它会误导：看起来像"必须二选一"，
+     * 用户会以为换了账号就丢掉了另一个。
+     *
+     * 现在只如实展示**哪个分组在用哪个账号**，以及哪些账号还没被任何分组使用
+     * （提示可以去配置里加一条 accounts）。切换入口仍保留在控制台网页里
+     * （那是单账号视角的旧功能，不在这条多账号路径上）。
+     */
+    function AccountsPanel({ onStartConsole, busy, reloadStatus, status: pluginStatus }) {
       const api = useConsoleApi(CONSOLE_API + '/accounts', { interval: 30000 });
       const { data, error, status, reload } = api;
-      const [working, setWorking] = useState('');
-      const [message, setMessage] = useState('');
+      // Hooks 必须在任何条件 return 之前调用（React 规则）
+      const [messageTip, setMessageTip] = useState('');
       if (api.availability.state !== 'ok' && (status === 503 || status === 404)) {
         return h(ConsoleGate, { availability: api.availability, onStartConsole, onProbe: api.probeConsole, busy, feature: '账号' });
       }
       const accounts = data?.accounts || [];
-      // 账号页的 loading 来自 api（useConsoleApi 透传了底层 useJson 的 loading）
       if (api.loading && data === null) return h(Card, { title: '账号' }, h(Loading, { text: '正在读取登录账号…' }));
-      const switchTo = async (name) => {
-        setWorking(name);
-        setMessage('');
-        const res = await postJson(CONSOLE_API + '/account/switch', { file: name });
-        setWorking('');
-        if (res.data?.switched) {
-          // 切换成功：立刻刷本面板 + 强制重读状态（status?quota=1 会带着新账号的
-          // 积分回来；宿主端 reconciliation 也会因账号变化作废旧缓存）—— 不等 8 秒轮询。
-          // 诚实性：只有**新构建**的宿主才认识 quota=1（旧构建会静默忽略），
-          // 所以"积分已更新"这句话只在确认拿到新账号的积分时才说。
-          const fresh = await getJson('/workbuddy/status?quota=1').catch(() => null);
-          const quotaFresh = fresh && fresh.status === 200
-            && fresh.data?.quotaAccount && fresh.data?.bridgeAccount
-            && fresh.data.quotaAccount === fresh.data.bridgeAccount;
-          setMessage('已切换到 ' + (res.data?.account?.name || name) + '。桥已重启，两边同步。'
-            + (quotaFresh ? '积分已更新。' : '（积分正在后台刷新，稍后自动显示新账号的值。）'));
-        } else {
-          setMessage('切换失败：' + (res.data?.error || res.status));
-        }
-        reload();
-        reloadStatus();
+
+      /** 分组列表：主 provider + 已注册的分组。 */
+      const groups = [
+        {
+          provider: pluginStatus?.route?.provider || 'workbuddy',
+          displayName: pluginStatus?.config?.displayName || 'WorkBuddy',
+          authFile: (pluginStatus?.bridge?.health?.authFile || '').split(/[\\/]/).pop(),
+          port: pluginStatus?.config?.bridgeUrl ? String(pluginStatus.config.bridgeUrl).split(':').pop() : '',
+        },
+        ...(pluginStatus?.accountGroups || []).map((g) => ({
+          provider: g.provider, displayName: g.displayName, authFile: g.authFile, port: g.port, error: g.error,
+        })),
+      ];
+      /** 账号快照 → 被哪个分组使用（按文件名匹配）。 */
+      const usedBy = (name) => groups.filter((g) => g.authFile === name);
+      const unused = accounts.filter((a) => usedBy(a.name).length === 0);
+
+      const openConfig = () => {
+        // 打不开配置文件不算致命：把路径给出来让用户自己去编辑
+        const p = pluginStatus?.config?.projectRoot;
+        if (p) copyText(String(p) + '\\dsh-plugin\\lib\\index.js');
+        setMessageTip(p
+          ? '配置在 cordis.patch.yml 的 workbuddy 条目（accounts 列表）。已复制项目路径：' + p
+          : '配置在 cordis.patch.yml 的 workbuddy 条目（accounts 列表）。');
       };
+
       return h(Card, { title: '账号' },
         error ? h(Alert, { bad: true }, error) : null,
-        message ? h(Alert, null, message) : null,
+        messageTip ? h(Alert, null, messageTip) : null,
         data?.keyError ? h(Alert, null, 'AtRest 密钥获取失败：' + data.keyError + '（无法逐个验证账号可用性）') : null,
-        h('p', { className: 'wb-note', style: { marginTop: 0 } }, '登录目录下存在多个账号快照时可在此切换。切换会自动重启桥、清空上一个账号的体检结论与余额缓存 —— 与控制器里点「切换」完全等价。'),
+        h('p', { className: 'wb-note', style: { marginTop: 0 } },
+          '多个账号**同时可用**，各自一组模型，不需要切换。模型选择器里 provider 选对应分组即可。'),
         data?.dir ? h('p', { className: 'wb-note' }, '登录目录：' + data.dir) : null,
-        /* 账号是"每账号一行"的卡片式列表，不是表格。
-           设置页是窄列（常见 600~700px），5~7 列的表格在这里必然被挤压 ——
-           要么逐字折断、要么被卡片裁掉（用户截图里的样子）。账号通常就 2~3 个，
-           列表既能容纳长域名，也不会有列宽问题。 */
+
+        // ── 分组 → 账号 映射（这是本页的主内容）──────────────────────────
         h('div', { style: { marginTop: '10px' } },
-          accounts.map((a) => h('div', { key: a.name, className: 'wb-account' + (a.usable ? '' : ' bad') },
+          h('p', { className: 'wb-note', style: { margin: '0 0 4px' } }, '账号分组（同时在用）：'),
+          groups.map((g) => h('div', { key: g.provider, className: 'wb-account' + (g.error ? ' bad' : '') },
             h('div', { className: 'wb-account-head' },
-              h('b', { title: a.path || a.name }, a.name),
-              a.active
-                ? h(Pill, { tone: 'ok', text: '使用中' })
-                : h('span', { className: 'wb-status-cell' },
-                  a.usable ? h(Pill, { tone: '', text: '可用' }) : h(Pill, { tone: 'bad', text: a.error ? '不可用' : '未验证' }),
-                  h(Btn, { disabled: !!working || busy || !a.usable, onClick: () => switchTo(a.name), title: a.error || '' }, working === a.name ? '切换中…' : '切换'))),
+              h('b', { title: g.provider }, g.displayName),
+              h('span', { className: 'wb-status-cell' },
+                h(Pill, { tone: 'ok', text: '使用中' }),
+                h('span', { className: 'wb-note', style: { margin: 0 } }, g.provider))),
             h('div', { className: 'wb-note', style: { margin: '4px 0 0' } },
-              (a.account || a.userId || '(未识别账号)') + (a.domain ? ' · ' + a.domain : '')),
+              (accounts.find((a) => a.name === g.authFile)?.account || '(未识别账号)')
+              + (accounts.find((a) => a.name === g.authFile)?.domain ? ' · ' + accounts.find((a) => a.name === g.authFile).domain : '')),
             h('div', { className: 'wb-note', style: { margin: '2px 0 0' } },
-              '剩余 ' + (a.expiresAt ? fmtRemaining(a.expiresAt) : '未知')
-              + ' · 凭据 ' + (a.encrypted ? 'AtRest 信封' : '明文'))))),
+              '登录文件 ' + (g.authFile || '(未知)') + ' · 端口 ' + (g.port || '—')
+              + (g.error ? ' · 错误：' + g.error : ''))))),
+
+        // ── 未被使用的账号：如实提示，并给出加分组的方法 ──────────────────
+        unused.length
+          ? h('div', { style: { marginTop: '12px' } },
+            h('p', { className: 'wb-note', style: { margin: '0 0 4px' } }, '未被任何分组使用的账号：'),
+            ...unused.map((a) => h('div', { key: a.name, className: 'wb-account' },
+              h('div', { className: 'wb-account-head' },
+                h('b', { title: a.path || a.name }, a.name),
+                h(Pill, { tone: a.usable ? '' : 'bad', text: a.usable ? '可用' : '不可用' })),
+              h('div', { className: 'wb-note', style: { margin: '4px 0 0' } },
+                (a.account || a.userId || '(未识别账号)') + (a.domain ? ' · ' + a.domain : '')),
+              h('div', { className: 'wb-note', style: { margin: '2px 0 0' } },
+                '剩余 ' + (a.expiresAt ? fmtRemaining(a.expiresAt) : '未知')
+                + ' · 凭据 ' + (a.encrypted ? 'AtRest 信封' : '明文')))) ,
+            h('p', { className: 'wb-note', style: { margin: '6px 0 0' } },
+              '想同时用它：在 cordis.patch.yml 的 workbuddy 条目里加一条 accounts（id / displayName / authFile / port），重启一次 dsh 即可。'),
+            h('div', { className: 'wb-actions', style: { marginTop: '6px' } },
+              h(Btn, { onClick: openConfig }, '复制项目路径')))
+          : null,
+
         // 不可用的账号把原因**写在页面上**，不要只藏在 tooltip 里
         accounts.some((a) => !a.usable)
           ? h('div', { style: { marginTop: '10px' } },
@@ -2155,7 +2273,8 @@ body.dark .wb-root,
             ...accounts.filter((a) => !a.usable).map((a) => h('p', { key: a.name, className: 'wb-note', style: { margin: '2px 0 0' } },
               '· ' + a.name + '：' + (a.error || '未能解开凭据（可能是另一个 build 写入的）'))))
           : null,
-        h('div', { className: 'wb-actions', style: { marginTop: '10px' } }, h(Btn, { onClick: reload }, '刷新')));
+        h('div', { className: 'wb-actions', style: { marginTop: '10px' } },
+          h(Btn, { onClick: () => { reload(); reloadStatus?.(); } }, '刷新')));
     }
 
     // ─────────────────────────── 用量 ───────────────────────────
@@ -2487,6 +2606,40 @@ body.dark .wb-root,
           });
           continue;
         }
+        /**
+         * 「凭据引用」同样是迁移前口径：它检查 .credentials.yaml 里有没有
+         * WORKBUDDY_BRIDGE_KEY 占位 —— 那是给**手写的 llm-pi-ai 路由**用的
+         * （pi-ai 的 OpenAI 实现强制要求 apiKeyEnv 引用）。
+         * 插件的原生适配器自己在运行时注入本地回环令牌，不读任何 apiKeyEnv，
+         * 所以路由已注册时这一项不构成问题。
+         */
+        const isCredRef = item.id === 'credref' || item.label === '凭据引用';
+        if (isCredRef && item.status === 'fail' && pluginStatus?.route?.registered) {
+          adjusted.push({
+            ...item,
+            status: 'ok',
+            detail: `原生路由不走 apiKeyEnv（插件运行时注入本地回环令牌）`,
+            hint: null,
+          });
+          continue;
+        }
+        /**
+         * 「profile bundles」在**打包版 DSH**（本机的安装形态）上必然误报：
+         * bundle 位于 resources/app.asar 内部，而诊断用 fs.existsSync 判定
+         * —— 普通 Node 看不进 asar 包，于是 dsh-base / dsh-web-app 永远"缺失"。
+         * 判据：profile 真起不来时，本面板的数据（桥状态、路由、目录）根本拿不到；
+         * 能读到这份诊断就说明 profile 是活的。
+         */
+        const isBundles = item.id === 'bundles' || item.label === 'profile bundles';
+        if (isBundles && item.status === 'fail') {
+          adjusted.push({
+            ...item,
+            status: 'ok',
+            detail: '已解析（打包版 DSH 的 bundle 在 app.asar 内，无法用普通文件检查判定）',
+            hint: null,
+          });
+          continue;
+        }
         adjusted.push(item);
       }
       const adjSummary = adjusted.reduce((acc, item) => {
@@ -2510,9 +2663,43 @@ body.dark .wb-root,
     }
 
     // ─────────────────────────── 可用模型 / 体检 ───────────────────────────
-    function ModelsPanel({ onStartConsole, busy, sampleModel, onUseModel }) {
+    function ModelsPanel({ onStartConsole, busy, sampleModel, onUseModel, status: panelStatus, onUseModelFor }) {
       const [refreshTick, setRefreshTick] = useState(0);
-      const { data, error, reload, loading } = useJson(`/workbuddy/models${refreshTick ? '?refresh=1' : ''}`, { interval: 120000 });
+      // 当前查看哪个 provider 的目录。多账号下每个分组有各自的模型清单与显示偏好。
+      const [viewProvider, setViewProvider] = useState('');
+      /**
+       * 可选 provider 列表：主 provider + 已注册的分组。
+       * 只列**已注册**的 —— 没注册的分组查了也没有模型。
+       */
+      const providerChoices = (() => {
+        const out = [{ value: '', label: panelStatus?.config?.displayName || 'WorkBuddy' }];
+        for (const g of panelStatus?.accountGroups || []) {
+          if (g.registered) out.push({ value: g.provider, label: g.displayName });
+        }
+        return out.length > 1 ? out : null;
+      })();
+      const providerQuery = viewProvider ? `?provider=${encodeURIComponent(viewProvider)}` : '';
+      const { data: rawModels, error, reload, loading } = useJson(`/workbuddy/models${providerQuery}${refreshTick ? (providerQuery ? '&' : '?') + 'refresh=1' : ''}`, { interval: 120000 });
+      /**
+       * 目录也要对账 provider：切换分组后新请求回来之前，响应仍是上一组的，
+       * 直接渲染会让人以为"国际版的目录跟国内版一样"（实际是显示串了）。
+       *
+       * 两条**必须同时成立**，否则会踩坑：
+       *   1. 比的是**实际 provider 名**（`activeProvider`）—— 主分组的
+       *      `viewProvider` 是空串，而响应回显的是 `"workbuddy"`，直接比永远对不上。
+       *   2. **响应没带 provider 字段时视为可信** —— 旧宿主 / 测试桩不返回它。
+       *      要求必须有，等于把老版本和离线样例全判成"没数据"（表格 0 行）。
+       */
+      const activeProvider = viewProvider || (panelStatus?.route?.provider || '');
+      const providerMatches = (payload) => {
+        const got = payload?.provider;
+        if (got === undefined || got === null || got === '') return true; // 旧宿主/桩：不校验
+        return got === activeProvider;
+      };
+      const dataForCurrent = (rawModels && rawModels.ok && providerMatches(rawModels)) ? rawModels : null;
+      const data = dataForCurrent;
+      /** 切换中：请求已回来但还不是本组的（等本组的新响应）。 */
+      const switching = !dataForCurrent && !!rawModels && rawModels.ok;
       const probesApi = useConsoleApi(CONSOLE_API + '/probe-results', { interval: 30000 });
       const { data: probes, status: pstatus, reload: reloadProbes } = probesApi;
       const [detail, setDetail] = useState('');
@@ -2524,18 +2711,45 @@ body.dark .wb-root,
       // ── 模型显示偏好：控制哪些模型出现在 dsh 的模型选择器里 ──────────────
       // 存偏好（.model-prefs.json）与读目录是两个接口：POST 后 adapter.setFilter
       // 立即生效（选择器下一次 listModels 就是新清单），无需重启 dsh。
-      const prefsApi = useJson('/workbuddy/model-visibility', {});
+      // **按 provider 分开**：切换分组时重新读该组自己的清单。
+      const prefsApi = useJson(`/workbuddy/model-visibility${providerQuery}`, {});
       const [visibility, setVisibility] = useState(null);   // null = 跟随目录（全部显示）
       const [prefsLoaded, setPrefsLoaded] = useState(false);
       const [prefsDirty, setPrefsDirty] = useState(false);
       const [prefsSaving, setPrefsSaving] = useState(false);
+      /**
+       * 已填充 `visibility` 的**是哪个 provider** 的数据。
+       *
+       * 为什么需要它：切换分组后，新请求返回之前 `prefsApi.data` 仍是**上一组**
+       * 的响应 —— 这时若只看 `prefsApi.data.ok` 就填 `visibility`，会把 A 组的
+       * 勾选显示成 B 组的，用户以为改了这一组、其实看到的是另一组的值
+       * （报的就是"国际版勾选不生效"）。
+       *
+       * 用响应里回显的 provider 字段对账：只有对得上的才采用。
+       */
+      const [prefsLoadedFor, setPrefsLoadedFor] = useState(null);
       useEffect(() => {
         // 只在首次拿到响应时初始化勾选状态（后续 reload 不覆盖用户的未保存改动）
         if (!prefsLoaded && prefsApi.data && prefsApi.data.ok) {
+          // 对账：响应必须属于当前查看的分组，否则忽略（等新响应）。
+          // 用 activeProvider（实际 provider 名）比，不能用 viewProvider ——
+          // 主分组的 viewProvider 是空串而响应回显 "workbuddy"。
+          // 并沿用 providerMatches 的宽容：响应不带 provider 字段 = 旧宿主/桩，视为可信。
+          if (!providerMatches(prefsApi.data)) return;
           setVisibility(Array.isArray(prefsApi.data.visible) ? prefsApi.data.visible : null);
           setPrefsLoaded(true);
+          setPrefsLoadedFor(activeProvider);
         }
-      }, [prefsApi.data, prefsLoaded]);
+      }, [prefsApi.data, prefsLoaded, activeProvider]);
+      // 切换 provider：重置全部按组的状态，否则会拿着上一组的勾选去改这一组
+      useEffect(() => {
+        setPrefsLoaded(false);
+        setPrefsLoadedFor(null);
+        setVisibility(null);
+        setPrefsDirty(false);
+        setDetail('');
+        setMessage('');
+      }, [viewProvider]);
       const isVisible = (id) => {
         if (!Array.isArray(visibility)) return true;   // 未设置 = 全显示（默认）
         return visibility.includes(id);
@@ -2550,9 +2764,18 @@ body.dark .wb-root,
       const savePrefs = async (nextVisible) => {
         setPrefsSaving(true);
         const list = Array.isArray(nextVisible) ? nextVisible : visibility;
-        const res = await postJson('/workbuddy/model-visibility', { visible: list });
+        // 带上 provider：多账号下必须写明改的是哪一组，否则会写到主 provider 上
+        const res = await postJson(`/workbuddy/model-visibility${providerQuery}`, { visible: list });
         setPrefsSaving(false);
         if (res.data?.ok) {
+          // 对账：确认写回的是**当前查看的这一组**。只有回显带 provider 且**明确
+          // 不一致**时才报错（旧宿主不返回该字段，不能据此判失败）；不一致说明
+          // 请求打到了别处（例如分组刚被移除），如实报错而不是当作成功。
+          const echoed = res.data.provider;
+          if (echoed !== undefined && echoed !== null && echoed !== '' && echoed !== activeProvider) {
+            setMessage(`保存异常：回显的是「${echoed}」，与当前分组「${activeProvider || '主'}」不一致，请刷新页面重试。`);
+            return;
+          }
           setVisibility(res.data.visible);
           setPrefsDirty(false);
           // applied = 宿主是否成功广播了 llm/adapters-updated（dsh 选择器重拉模型
@@ -2577,6 +2800,189 @@ body.dark .wb-root,
       // 加载中或 404/503 时都禁用，避免对不存在的接口空点。
       const consoleReady = probesApi.availability.state === 'ok';
       const resultOf = (id) => results[id];
+
+      // ── 图片能力覆盖 ────────────────────────────────────────────────────
+      /**
+       * 上游目录会漏报多模态能力（实测国际版账号下 deepseek-v4.1-flash 的
+       * supports_images 为空，但该模型确实能看图）。这里给一个手动声明入口，
+       * 否则用户在 DSH 里贴不了图。
+       */
+      const visionApi = useJson('/workbuddy/vision-overrides', { interval: 60000 });
+      const [visionOverrides, setVisionOverrides] = useState(null);
+      const [visionLoaded, setVisionLoaded] = useState(false);
+      const [visionSaving, setVisionSaving] = useState(false);
+      useEffect(() => {
+        if (!visionLoaded && visionApi.data && visionApi.data.ok) {
+          setVisionOverrides(visionApi.data.overrides || {});
+          setVisionLoaded(true);
+        }
+      }, [visionApi.data, visionLoaded]);
+      /** 生效的图片能力：覆盖优先，否则看目录。 */
+      const visionOf = (m) => {
+        const o = visionOverrides?.[m.id];
+        if (typeof o === 'boolean') return o;
+        return m.images === true;
+      };
+      const toggleVision = async (id) => {
+        const next = { ...(visionOverrides || {}) };
+        const current = visionOf(models.find((x) => x.id === id) || { id });
+        if (current === true) next[id] = false; else delete next[id];
+        setVisionSaving(true);
+        const res = await postJson('/workbuddy/vision-overrides', { overrides: next });
+        setVisionSaving(false);
+        if (res.data?.ok) {
+          setVisionOverrides(res.data.overrides || {});
+          setMessage(`已${current === true ? '取消' : '声明'}「${id}」的图片能力。`
+            + (res.data.applied ? ' dsh 已即时刷新。' : '（此 dsh 版本不支持即时刷新，重启一次后生效。）'));
+        } else {
+          setMessage('保存图片能力失败：' + (res.data?.error || res.status));
+        }
+      };
+      /**
+       * 单个模型的图片能力开关（放在详情区，在上下文编辑之上）。
+       *
+       * 只在"目录与覆盖不一致"或"目录没声明"时提示 —— 目录已声明支持的模型
+       * 不需要用户操心。
+       */
+      const visionEditorFor = (m) => {
+        const on = visionOf(m);
+        const overridden = typeof visionOverrides?.[m.id] === 'boolean';
+        return h('div', { style: { marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--dsw-alias-border-l3, #e5e7eb)' } },
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
+            h('span', { className: 'wb-note', style: { margin: 0 } }, '图片输入：'),
+            h(Pill, { tone: on ? 'ok' : 'warn', text: on ? '已声明支持' : '不支持' }),
+            h(Btn, { disabled: visionSaving, onClick: () => toggleVision(m.id) }, on ? '取消声明' : '声明支持图片'),
+            overridden ? h('span', { className: 'wb-note', style: { margin: 0 } }, '（手动指定，覆盖目录）') : null),
+          overridden || m.images
+            ? null
+            : h('p', { className: 'wb-note', style: { margin: '6px 0 0' } },
+              '上游目录没声明这个模型支持图片。若你在 WorkBuddy 客户端里能贴图，点上面的按钮手动声明即可。'));
+      };
+
+      // ── 上下文上限覆盖 ──────────────────────────────────────────────────
+      /**
+       * dsh 的「设置 → 模型」只让改**配置层声明**的模型；插件是运行时注册的
+       * provider（没有 settingsNs），那页对我们的模型不可用。这里是等价能力：
+       * 改的是 adapter 下发给 dsh 的 contextWindow，取 min(目录值, 覆盖值)。
+       */
+      const ctxApi = useJson('/workbuddy/context-overrides', { interval: 60000 });
+      const [ctxOverrides, setCtxOverrides] = useState(null);
+      const [ctxDraft, setCtxDraft] = useState({});
+      const [ctxSaving, setCtxSaving] = useState(false);
+      const [ctxLoaded, setCtxLoaded] = useState(false);
+      /** 全局档位当前值（0 = 不限）。 */
+      const [ctxMax, setCtxMax] = useState(0);
+      const [ctxSavingTier, setCtxSavingTier] = useState(false);
+      const reloadContext = () => { ctxApi.reload(); };
+      useEffect(() => {
+        // 与 prefs 同款：只首次初始化，避免轮询把用户正在输入的内容冲掉
+        if (!ctxLoaded && ctxApi.data && ctxApi.data.ok) {
+          setCtxOverrides(ctxApi.data.overrides || {});
+          setCtxMax(Number(ctxApi.data.maxTokens) || 0);
+          setCtxLoaded(true);
+        }
+      }, [ctxApi.data, ctxLoaded]);
+      /**
+       * 切换全局档位（262k / 1M / 不限）。
+       *
+       * 只发 maxTokens，**不带 overrides** —— 宿主端据此只改档位，
+       * 不会把逐模型的单独覆盖抹掉（两个设置互不干扰）。
+       */
+      const applyContextTier = async (value) => {
+        setCtxSavingTier(true);
+        const res = await postJson('/workbuddy/context-overrides', { maxTokens: value });
+        setCtxSavingTier(false);
+        if (res.data?.ok) {
+          setCtxMax(Number(res.data.maxTokens) || 0);
+          if (res.data.overrides) setCtxOverrides(res.data.overrides);
+          setMessage(
+            (value > 0 ? `上下文上限已切到 ${fmtTokens(value)}。` : '上下文上限已恢复为目录原值。')
+            + (res.data.applied ? ' dsh 已即时刷新。' : '（此 dsh 版本不支持即时刷新，重启一次后生效。）')
+            + (res.data.persisted ? '' : '（只读介质：本次运行生效，未能持久化。）'),
+          );
+        } else {
+          setMessage('切换上下文档位失败：' + (res.data?.error || res.status));
+        }
+      };
+      const overrideOf = (id) => {
+        const fromDraft = ctxDraft[id];
+        if (fromDraft !== undefined) return fromDraft;
+        const saved = ctxOverrides?.[id];
+        return saved === undefined ? '' : String(saved);
+      };
+      /** 生效值 = min(目录值, 逐模型覆盖, 全局档位)。与宿主端 effectiveContext 同一口径。 */
+      const effectiveOf = (m) => {
+        const n = Number(String(overrideOf(m.id)).trim());
+        const caps = [
+          m.contextWindow,
+          Number.isFinite(n) && n > 0 ? n : 0,
+          ctxMax,
+        ].filter((x) => x > 0);
+        return caps.length ? Math.min(...caps) : 0;
+      };
+      const saveContext = async (id, rawValue) => {
+        const text = String(rawValue ?? '').trim();
+        const next = { ...(ctxOverrides || {}) };
+        if (text === '') delete next[id];
+        else {
+          const n = Number(text);
+          if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+            setMessage('上下文上限要填正整数（token），例如 200000。已忽略。');
+            return;
+          }
+          next[id] = n;
+        }
+        setCtxSaving(true);
+        const res = await postJson('/workbuddy/context-overrides', { overrides: next });
+        setCtxSaving(false);
+        if (res.data?.ok) {
+          setCtxOverrides(res.data.overrides || {});
+          setCtxDraft((d) => { const c = { ...d }; delete c[id]; return c; });
+          const applied = res.data.applied;
+          const persisted = res.data.persisted;
+          setMessage(
+            (next[id] === undefined ? '已清除该模型的上下文上限。' : `已把 ${id} 的上下文上限设为 ${next[id]} tokens。`)
+            + (applied ? 'dsh 已即时刷新。' : '（此 dsh 版本不支持即时刷新，重启一次后生效。）')
+            + (persisted ? '' : '（只读介质：本次运行生效，未能持久化。）'),
+          );
+        } else {
+          setMessage('保存上下文上限失败：' + (res.data?.error || res.status));
+        }
+      };
+
+      /**
+       * 单个模型的上下文上限编辑器（放在详情区里）。
+       *
+       * 说明"上限"而不是"窗口"：只能压小，放大无效 —— 上游模型没那么大，
+       * 声称更大只会让 dsh 多塞历史、然后在调用时拿到 context 错误。
+       */
+      const contextEditorFor = (m) => {
+        const catalog = m.contextWindow || 0;
+        const eff = effectiveOf(m);
+        const overridden = ctxOverrides?.[m.id] !== undefined || ctxDraft[m.id] !== undefined;
+        return h('div', { style: { marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--dsw-alias-border-l3, #e5e7eb)' } },
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
+            h('span', { className: 'wb-note', style: { margin: 0 } }, '上下文上限：'),
+            h('input', {
+              type: 'text',
+              inputMode: 'numeric',
+              value: overrideOf(m.id),
+              placeholder: catalog ? `目录值 ${fmtInt(catalog)}` : '目录未提供',
+              disabled: ctxSaving,
+              onChange: (e) => setCtxDraft((d) => ({ ...d, [m.id]: e.target.value })),
+              onKeyDown: (e) => { if (e.key === 'Enter') saveContext(m.id, e.target.value); },
+              style: { width: '130px' },
+              title: '只填数字（token）。留空 = 用目录里的真实值。',
+            }),
+            h(Btn, { disabled: ctxSaving, onClick: () => saveContext(m.id, overrideOf(m.id)) }, ctxSaving ? '保存中…' : '保存'),
+            overridden
+              ? h(Btn, { disabled: ctxSaving, onClick: () => saveContext(m.id, '') }, '清除')
+              : null),
+          h('p', { className: 'wb-note', style: { margin: '6px 0 0' } },
+            `生效 ${eff ? fmtInt(eff) : '—'} tokens · 目录 ${catalog ? fmtInt(catalog) : '未提供'}`
+            + (eff === catalog ? '（未压缩）' : '（已压小）')
+            + ' —— 这是**上限**：只能压小，填大于目录值不会放大。'));
+      };
 
       // 体检与结论保存只依赖控制台：不可用时给出可行动的卡，而不是对 404 空转
       if ((pstatus === 503 || pstatus === 404) && models.length === 0) {
@@ -2632,7 +3038,10 @@ body.dark .wb-root,
       const [probeFilter, setProbeFilter] = useState('all');
       const [search, setSearch] = useState('');
       const [copiedId, setCopiedId] = useState('');
-      if (isInitialLoading(loading, data, error)) return h(Card, { title: '可用模型' }, h(Loading, { text: '正在读取桥的模型目录…' }));
+      // 切换分组时：显示"正在读取这一组的目录"，而不是拿上一组的数据顶上
+      if (switching || isInitialLoading(loading, data, error)) {
+        return h(Card, { title: '可用模型' }, h(Loading, { text: '正在读取桥的模型目录…' }));
+      }
       const visible = (probeFilter === 'fail'
         ? models.filter((m) => resultOf(m.id)?.ok === false)
         : probeFilter === 'untested'
@@ -2648,6 +3057,22 @@ body.dark .wb-root,
         error ? h(Alert, { bad: true }, error) : null,
         data && data.ok === false ? h(Alert, { bad: true }, data.error) : null,
         message ? h(Alert, null, message) : null,
+        // 多账号：按分组查看各自的目录与显示偏好（勾选只影响当前这一组）
+        providerChoices
+          ? h('div', { className: 'wb-actions split', style: { marginBottom: '10px' } },
+            h('div', { className: 'wb-actions-group' },
+              h('span', { className: 'wb-label' }, '账号分组'),
+              h(Segmented, {
+                value: viewProvider,
+                onChange: (e) => setViewProvider(e.target.value),
+                options: providerChoices,
+              })),
+            h('div', { className: 'wb-actions-group' },
+              h('span', { className: 'wb-note', style: { margin: 0 } },
+                '下面的勾选与上限只作用于「'
+                + (providerChoices.find((p) => p.value === viewProvider)?.label || '当前分组')
+                + '」，其它分组互不影响')))
+          : null,
         h('p', { className: 'wb-note', style: { marginTop: 0 } },
           '模型列表来自桥的动态目录，不需要勾选或保存：选模型时 provider 选 “WorkBuddy” 就能看到全部。体检结论存在 .state.json 的 probe 字段，与控制器共用一份。'),
         models.length
@@ -2689,6 +3114,35 @@ body.dark .wb-root,
             h(Btn, { primary: prefsDirty, disabled: prefsSaving || !prefsDirty, onClick: () => savePrefs() }, prefsSaving ? '保存中…' : prefsDirty ? '保存显示设置' : '已保存'),
             Array.isArray(visibility) ? h(Btn, { disabled: prefsSaving, onClick: () => { setVisibility(null); setPrefsDirty(true); }, title: '恢复为全部显示（与从未筛选一致）' }, '恢复全部') : null)),
         prefsDirty ? h('p', { className: 'wb-note', style: { margin: '0 0 8px' } }, '有未保存的勾选改动 —— 点「保存显示设置」后才会应用到 dsh 的模型选择器。') : null,
+        // ── 上下文档位：一键切换，像 WorkBuddy 那样 ─────────────────────────
+        /**
+         * 两档就够（用户明确要求）：262k / 1M。
+         *
+         * 语义是**上限**（只压小不放大），所以：
+         *   - 262k 档：目录里 ≥262k 的压到 262k，更小的保持原样
+         *   - 1M 档 = 不限制（上游最大的模型就是 1M，等于恢复目录原值）
+         * 点一下立即生效并持久化，不用展开详情逐个改。
+         */
+        h('div', { className: 'wb-actions split', style: { marginBottom: '10px' } },
+          h('div', { className: 'wb-actions-group' },
+            h('span', { className: 'wb-label' }, '上下文上限'),
+            h(Segmented, {
+              value: String(ctxMax),
+              onChange: (e) => applyContextTier(e.target.value === 'unlimited' ? 0 : Number(e.target.value)),
+              options: [
+                { value: '262144', label: '262k' },
+                { value: '1000000', label: '1M' },
+                { value: 'unlimited', label: '不限' },
+              ],
+            }),
+            h('span', { className: 'wb-note', style: { margin: 0 } },
+              ctxSavingTier
+                ? '切换中…'
+                : ctxMax > 0
+                  ? `已把 ≥${fmtTokens(ctxMax)} 的模型压到 ${fmtTokens(ctxMax)}（更小的保持原样）`
+                  : '使用目录里的真实值')),
+          h('div', { className: 'wb-actions-group' },
+            h(Btn, { onClick: () => reloadContext() }, '刷新'))),
         h('div', { className: 'wb-scroll' },
           h('table', { className: 'wb-table' },
             h('thead', null, h('tr', null,
@@ -2748,6 +3202,8 @@ body.dark .wb-root,
                         : null,
                       probe && probe.ok === false && probe.error ? h('p', { className: 'wb-note', style: { margin: '8px 0 0' } }, '体检错误：' + probe.error) : null,
                       m.description ? h('p', { className: 'wb-note', style: { margin: '8px 0 0' } }, m.description) : null,
+                      visionEditorFor(m),
+                      contextEditorFor(m),
                       h('div', { className: 'wb-actions', style: { marginTop: '10px' } },
                         h(Btn, { onClick: () => onUseModel(m.id) }, '用这个模型对话 →'),
                         h(Btn, { onClick: () => { copyText(m.id); setCopiedId(m.id); setTimeout(() => setCopiedId(''), 2000); } }, copiedId === m.id ? '已复制 ✓' : '复制 ID'),
@@ -3201,7 +3657,7 @@ body.dark .wb-root,
         !status ? h(Card, null, '正在读取状态…') : null,
         status ? h('div', { key: tab, className: 'wb-tab-panel wb-slide-' + slideDir },
           tab === 'overview' ? h(OverviewPanel, panelProps) : null,
-          tab === 'accounts' ? h(AccountsPanel, { onStartConsole: startConsole, busy, reloadStatus }) : null,
+          tab === 'accounts' ? h(AccountsPanel, { onStartConsole: startConsole, busy, reloadStatus, status }) : null,
           tab === 'usage' ? h(UsagePanel, null) : null,
           tab === 'requests' ? h(RequestsPanel, null) : null,
           tab === 'checkin' ? h(CheckinPanel, {
@@ -3220,6 +3676,7 @@ body.dark .wb-root,
             onStartConsole: startConsole,
             busy,
             sampleModel: status?.sampleModel,
+            status,
             onUseModel: (id) => { setChatModel(id); switchTab('chat'); },
           }) : null,
           tab === 'chat' ? h(ChatPanel, {
