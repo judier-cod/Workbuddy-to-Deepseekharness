@@ -264,6 +264,49 @@ function resolveAuthPath() {
 
 const AUTH_PATH = resolveAuthPath();
 
+/**
+ * 旧记录（本次改动之前写入的）没有 `acct` 字段。
+ *
+ * 给它们一个固定桶而不是"归到某个账号"：那些行**无法归因**（当时根本没记），
+ * 硬塞给主账号会让"国内版花了多少"这个数字撒谎。单列一桶至少是诚实的，
+ * 面板也能照实显示"未标注账号"。
+ *
+ * 定义在 {@link ACCOUNT_LABEL} **之前**：那个 IIFE 在模块求值时就跑，
+ * 引用后面才声明的 const 会撞 TDZ（`Cannot access before initialization`）——
+ * 平时靠文件名分支提前返回掩盖住了，属于会随机炸的雷。
+ */
+const UNKNOWN_ACCOUNT = 'unknown';
+
+/**
+ * 本桥服务的**账号标签**，写进账本每一条记录的 `acct` 字段。
+ *
+ * 取值优先级：
+ *   1. `WORKBUDDY_ACCOUNT_LABEL` —— 插件为每个 provider 显式注入
+ *      （主账号 `workbuddy`、分组 `workbuddy-ai`）。这是**首选**：与 dsh 模型
+ *      选择器里的 provider 名一一对应，用户能直接把账本上的账号对上界面上的分组。
+ *   2. 登录文件名（去掉 `.info`），如 `workbuddy-desktop-ai` —— 独立启动桥
+ *      （不经插件）时的兜底，至少能区分"哪个登录文件"。
+ *   3. `unknown`。
+ *
+ * 为什么不用 JWT 里的 userId 当标签：那是 36 字符的 UUID，账本里每行都写一遍
+ * 太占地方，而且用户认不出 `xxxxxxxx-…` 对应界面上哪个分组。userId 仍然保留在
+ * /health 与积分归属里做身份核对，两件事各司其职。
+ *
+ * **只算一次**：登录文件在运行期可能被客户端重写，但"这个端口是哪个账号"是
+ * 启动时就定下的事实 —— 每次记账都去 stat 文件既慢又会让同一个账号中途换标签，
+ * 把历史记录劈成两半。
+ */
+const ACCOUNT_LABEL = (() => {
+  const explicit = String(process.env.WORKBUDDY_ACCOUNT_LABEL || '').trim();
+  if (explicit) return explicit;
+  try {
+    const base = AUTH_PATH.replace(/\\/g, '/').split('/').pop() || '';
+    const name = base.replace(/\.info$/i, '').trim();
+    if (name) return name;
+  } catch { /* 路径异常：落到 unknown */ }
+  return UNKNOWN_ACCOUNT;
+})();
+
 const log = (...a) => { if (LOG) console.error(`[${new Date().toISOString()}]`, ...a); };
 
 // ── At-rest credential opener (WorkBuddy desktop 5.6.0+) ─────────────────
@@ -1785,9 +1828,18 @@ async function relayAnthropicStream(up, res, model, estInputTokens) {
  * 把失败也记下来是必要的：否则「某个模型调不通」在控制台上完全不可见，
  * 只能去翻原始日志。
  *
- * 上限 MAX_USAGE_LINES 条，超出后截断保留最近一半，避免文件无限增长。
+ * **每条记录带 `acct`（账号标签）**：多账号时两个桥（不同端口、不同登录文件）
+ * 跑的是同一个脚本、写的是**同一个账本文件**（见 usageFile()），所以不记账号
+ * 就分不清「这 375 分是谁花的」—— 实测两个账号的 /v1/usage 汇总完全相同，
+ * 因为读的本来就是同一份文件。
+ *
+ * **保留策略：按账号各留 MAX_USAGE_LINES_PER_ACCOUNT 条**，某个账号超出就把它
+ * 自己砍到一半。按账号而不是全局，是因为全局上限会被**吵的那个账号吃掉**：
+ * 国际版免费、调用频繁，它一超限就把国内版的历史一起冲掉。
+ * 旧记录没有 `acct`，展示时归 {@link UNKNOWN_ACCOUNT} 一桶，但**不参与裁剪**
+ * （它们不会增长，套上限只会在升级瞬间误伤已有历史，见 accountOfLine）。
  */
-const MAX_USAGE_LINES = 2000;
+const MAX_USAGE_LINES_PER_ACCOUNT = 1000;
 let usageLines = null;
 /**
  * 上次与账本文件同步后的**指纹**（字节数 + mtimeMs），用来发现「文件被外部改动」。
@@ -1868,12 +1920,87 @@ function syncUsageMirror(file) {
   if (size !== usageBytes || mtimeMs !== usageMtimeMs) loadUsageLines(file);
 }
 
+/**
+ * 从账本行里取出账号标签。
+ *
+ * 返回 `null` 表示**这一行根本没有 `acct` 键**（本次改动之前写入的旧记录）。
+ * 与"标签值为 unknown"是两回事，必须分开：旧记录是一个**只减不增的冻结集合**
+ * （新记录永远带 acct 键），所以它们不能被当成一个"会持续增长的账号"去套上限 ——
+ * 否则升级后第一次记账就会把用户积攒的历史砍掉一大截。
+ *
+ * 实测过这个坑：升级前账本已有 1204 行旧记录，若把它们全归入一个受 1000 上限
+ * 约束的桶，第一次新请求就会触发裁剪，**当场丢掉 705 行**用户历史。
+ */
+function accountOfLine(line) {
+  try {
+    const row = JSON.parse(line);
+    const a = row && row.acct;
+    return typeof a === 'string' && a ? a : (row && 'acct' in row ? UNKNOWN_ACCOUNT : null);
+  } catch {
+    // 半截行 / 非 JSON：归入旧记录那类（无法归因），同样不进上限桶
+    return null;
+  }
+}
+
+/**
+ * 按账号裁剪账本：每个账号最多 MAX_USAGE_LINES_PER_ACCOUNT 条，某个账号超出就
+ * **把它自己**砍到一半。
+ *
+ * 与旧的"全局 2000 条一起砍"的关键差别：旧策略下，调用频繁的那个账号一超限，
+ * 另一个账号的历史**跟着一起被砍**（因为砍的是整个数组的前一半）。多账号时这
+ * 等于"吵的那个把安静的挤掉"。现在各账号独立计数，互不牵连。
+ *
+ * **没有 `acct` 的旧记录不参与裁剪**（见 {@link accountOfLine}）：它们是冻结的
+ * 历史，不会增长，给它们套上限只会在升级瞬间误伤用户已有的数据。文件总行数
+ * 因此上界 = 旧记录数 + 各账号上限之和，仍是有限的。
+ *
+ * 返回 `{ trimmed, removed }`；`trimmed === false` 表示没动过，调用方据此决定
+ * 是否重写整个文件（避免每次记账都重写上千行）。
+ */
+function trimUsageByAccount() {
+  /*
+   * **快速路径**：总行数不超过单账号上限时，任何账号都不可能超限
+   * （某账号的条数 ≤ 总行数 ≤ 上限），直接返回。
+   *
+   * 为什么值得加这一行：旧实现只判 `usageLines.length > MAX`，是 O(1)；
+   * 而按账号裁剪必须**逐行解析 JSON** 才能知道每行属于谁，是 O(n)。这段代码
+   * 跑在**每一次记账**的关键路径上（每个请求一次），实测 1400+ 行时约 1.2ms。
+   * 有了这道闸，账本还小的用户（绝大多数）回到 O(1)。
+   */
+  if (usageLines.length <= MAX_USAGE_LINES_PER_ACCOUNT) return { trimmed: false, removed: 0 };
+
+  const byAccount = new Map();
+  for (let i = 0; i < usageLines.length; i += 1) {
+    const acct = accountOfLine(usageLines[i]);
+    if (acct === null) continue; // 旧记录：冻结，永不裁剪
+    const list = byAccount.get(acct);
+    if (list) list.push(i); else byAccount.set(acct, [i]);
+  }
+
+  const drop = new Set();
+  for (const [, indexes] of byAccount) {
+    if (indexes.length <= MAX_USAGE_LINES_PER_ACCOUNT) continue;
+    // 保留**最近一半**（indexes 天然按写入顺序递增，取尾部即最新）
+    const keepFrom = indexes.length - Math.floor(MAX_USAGE_LINES_PER_ACCOUNT / 2);
+    for (let k = 0; k < keepFrom; k += 1) drop.add(indexes[k]);
+  }
+  if (drop.size === 0) return { trimmed: false, removed: 0 };
+
+  usageLines = usageLines.filter((_, i) => !drop.has(i));
+  return { trimmed: true, removed: drop.size };
+}
+
 function recordRequest(entry) {
   try {
     // 调用方归因（B2 凭据分层）： ALS 里带着本次请求的 client id（local 或
     // key 哈希前 8 位）—— 桥不可用时静默跳过，不影响记账主流程。
-    const client = requestScope.getStore()?.client;
+    const scope = requestScope.getStore();
+    const client = scope?.client;
     if (client) entry = { ...entry, client };
+    // 推理档位：同样从 ALS 取，这样**所有**记账点（含各种失败早退）都自动带上，
+    // 不必逐处传参。空串 = 本次没发 reasoning_effort（不写进账本，保持行紧凑）。
+    const effort = scope?.effort;
+    if (effort) entry = { ...entry, effort };
     /**
      * **错误原文在这里统一截断**，不依赖调用方自觉。
      *
@@ -1890,10 +2017,32 @@ function recordRequest(entry) {
     const file = usageFile();
     syncUsageMirror(file);
 
-    const line = JSON.stringify({ t: Date.now(), ...normalized });
+    // acct 放在最前（t 之后）：同一账号的记录连续可读，人工 tail 账本时一眼能
+    // 看出这段是谁的。显式传入的 acct 优先（测试/特殊调用方可覆盖）。
+    const line = JSON.stringify({ t: Date.now(), acct: ACCOUNT_LABEL, ...normalized });
     usageLines.push(line);
-    if (usageLines.length > MAX_USAGE_LINES) {
-      usageLines = usageLines.slice(-Math.floor(MAX_USAGE_LINES / 2));
+    let { trimmed, removed } = trimUsageByAccount();
+    if (trimmed) {
+      /*
+       * **重写前先以磁盘为准重建。**
+       *
+       * 为什么必须这样：多账号时**两个桥进程写同一个文件**，而截断是"整份重写"。
+       * 从上次 syncUsageMirror 到这次 rewrite 之间，另一个桥可能已追加了若干行 ——
+       * 直接拿内存镜像重写会把它们**永久抹掉**（那些行只存在对方的内存里）。
+       *
+       * 先读盘、再补回自己这条，丢数据的窗口就从"整个请求处理过程"缩到
+       * "读盘到 rename 之间"这一瞬。残留窗口无法靠单文件原子写消除（要跨进程
+       * 锁），但已压到"极端巧合下丢一行用量"，与旧实现同级。
+       */
+      let disk = null;
+      try { disk = readFileSync(file, 'utf8').split('\n').filter(Boolean); } catch { /* 读不到就退回内存镜像 */ }
+      if (disk && disk.length) {
+        // 自己这条可能已在盘上（异常重试等），别写成两行
+        usageLines = disk.includes(line) ? disk : [...disk, line];
+      }
+      const second = trimUsageByAccount();
+      removed += second.removed;
+      if (LOG) log(`usage ledger trimmed: -${removed} lines (per-account cap ${MAX_USAGE_LINES_PER_ACCOUNT})`);
       const text = `${usageLines.join('\n')}\n`;
       /*
        * **原子替换**：先写临时文件再 rename，不直接覆盖账本。
@@ -1903,10 +2052,15 @@ function recordRequest(entry) {
        * 而项目里没有第二份副本。同目录内 rename 是原子的（Windows 上也是），
        * 崩在任何一步都不会破坏原文件。
        *
+       * 临时文件名**必须带 pid**：多账号时两个桥进程写同一个账本，而截断是
+       * 各自独立触发的。用固定名 `${file}.tmp` 时两边可能同时写同一个临时文件
+       * → 其中一个 rename 到半份内容（另一个还在写）。带上 pid 后各写各的。
+       * 插件自己的偏好写入早就用了 `.tmp-${process.pid}`，这里对齐同一标准。
+       *
        * 这也是项目自己的标准：`lib/dsh.mjs` 写 dsh 配置是先备份再写。
        * 账本这份数据比配置更没有第二份副本，不该比它更随意。
        */
-      const tmp = `${file}.tmp`;
+      const tmp = `${file}.tmp-${process.pid}`;
       writeFileSync(tmp, text);
       renameSync(tmp, file);
       usageBytes = Buffer.byteLength(text);
@@ -1967,6 +2121,14 @@ function recentRequests(limit = 50) {
   return rows.slice(-limit).reverse().map((r) => ({
     t: r.t,
     model: r.model || '',
+    // 账号标签：面板/控制台用它区分"这次调用走的是哪个账号"。旧记录没有这个
+    // 字段，回 unknown 而不是省略 —— 省略会让前端把 undefined 显示成空白，
+    // 看起来像渲染坏了；unknown 至少是明确的一句话。
+    acct: typeof r.acct === 'string' && r.acct ? r.acct : UNKNOWN_ACCOUNT,
+    // 推理档位：本次请求下发的 reasoning_effort（没发就是空串）。
+    // 面板「最近请求」用它显示"思考档位" —— 用户据此核对选择器里选的档位
+    // 有没有真的发出去。
+    effort: typeof r.effort === 'string' ? r.effort : '',
     stream: r.stream === true,
     ms: Number(r.ms) || 0,
     ok: r.ok !== false,
@@ -2017,6 +2179,20 @@ function summarizeUsage(days = 7, opts = {}) {
   const byModel = new Map();
   const byDay = new Map();
   const byHour = wantHours ? new Map() : null;
+  /**
+   * 按账号分桶。多账号时两个桥写同一个账本，只有这里拆开才能回答
+   * "国际版花了多少分" —— 否则看到的是两个账号的合计（旧版正是如此，
+   * 实测两个端口返回完全相同的 total）。
+   */
+  const byAccount = new Map();
+  /**
+   * 按推理档位分桶（`high`/`medium`/`low`/未发）。
+   *
+   * 回答"开 high 到底比不开发多花多少 token / 积分" —— 这是用户调那个旋钮时
+   * 唯一想知道的事，而原来账本连档位都没记。空档位归 `(默认)`：那是"没下发
+   * reasoning_effort"，交给上游默认，与显式选 low 是两回事，不能合并。
+   */
+  const byEffort = new Map();
   const failures = [];
   // creditCalls 单独计数：上游**并非每次**都回报 credit。不区分「回报了 0」和
   // 「没回报」的话，两者在页面上只能显示成同一个「—」，看起来像统计坏了。
@@ -2026,13 +2202,19 @@ function summarizeUsage(days = 7, opts = {}) {
 
   for (const r of rows) {
     if (r.t < since) continue;
+    const acct = typeof r.acct === 'string' && r.acct ? r.acct : UNKNOWN_ACCOUNT;
 
     // 失败的请求单独归类：它没有 token、没有扣分，混进成功率会误导
     if (r.ok === false) {
       total.failed += 1;
+      const a = byAccount.get(acct) || { account: acct, calls: 0, promptTokens: 0, completionTokens: 0, ms: 0, credit: 0, creditCalls: 0, failed: 0 };
+      a.failed += 1;
+      byAccount.set(acct, a);
       failures.push({
         t: r.t,
         model: r.model || '',
+        acct,
+        effort: typeof r.effort === 'string' ? r.effort : '',
         stream: r.stream === true,
         ms: Number(r.ms) || 0,
         status: Number(r.status) || 0,
@@ -2065,6 +2247,20 @@ function summarizeUsage(days = 7, opts = {}) {
     if (hasCredit) { d.credit += cr; d.creditCalls += 1; }
     byDay.set(day, d);
 
+    const a = byAccount.get(acct)
+      || { account: acct, calls: 0, promptTokens: 0, completionTokens: 0, ms: 0, credit: 0, creditCalls: 0, failed: 0 };
+    a.calls += 1; a.promptTokens += pt; a.completionTokens += ct; a.ms += Number(r.ms) || 0;
+    if (hasCredit) { a.credit += cr; a.creditCalls += 1; }
+    byAccount.set(acct, a);
+
+    // 推理档位：空串 → '(默认)'（没下发 reasoning_effort，交给上游默认）
+    const effortKey = typeof r.effort === 'string' && r.effort ? r.effort : '(默认)';
+    const e = byEffort.get(effortKey)
+      || { effort: effortKey, calls: 0, promptTokens: 0, completionTokens: 0, credit: 0, creditCalls: 0 };
+    e.calls += 1; e.promptTokens += pt; e.completionTokens += ct;
+    if (hasCredit) { e.credit += cr; e.creditCalls += 1; }
+    byEffort.set(effortKey, e);
+
     if (byHour) {
       const hour = localHour(r.t);
       const h = byHour.get(hour) || { key: hour, calls: 0, promptTokens: 0, completionTokens: 0, credit: 0, creditCalls: 0 };
@@ -2079,6 +2275,8 @@ function summarizeUsage(days = 7, opts = {}) {
   total.credit = round4(total.credit);
   for (const m of byModel.values()) m.credit = round4(m.credit);
   for (const d of byDay.values()) d.credit = round4(d.credit);
+  for (const a of byAccount.values()) a.credit = round4(a.credit);
+  for (const e of byEffort.values()) e.credit = round4(e.credit);
 
   // 补齐 24 个桶：没调用的整点也要出现（记 0），否则柱状图会跳变——
   // 空的那小时直接消失，看上去像时间轴缺了一段。
@@ -2097,6 +2295,21 @@ function summarizeUsage(days = 7, opts = {}) {
     total,
     models: [...byModel.values()].sort((a, b) => b.calls - a.calls),
     days: [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day)),
+    /**
+     * 按账号拆分（调用多的在前）。
+     *
+     * `total` 是**合计**（保持既有契约不变，老消费方照旧），这里是它的分解 ——
+     * 两者对得上（各账号之和 === total）。多账号用户靠它回答"国际版花了多少分"，
+     * 而单账号用户看到的就是一行与自己 total 相同的数字，不增加困惑。
+     */
+    accounts: [...byAccount.values()].sort((a, b) => b.calls - a.calls),
+    /**
+     * 按推理档位拆分（调用多的在前）。
+     *
+     * 回答"开 high 比不开发多花多少 token / 积分"。空档位显示为 `(默认)`
+     * （没下发 reasoning_effort，交给上游默认）—— 与显式选 low 不是一回事。
+     */
+    efforts: [...byEffort.values()].sort((a, b) => b.calls - a.calls),
     // 只有 ?hours=1 才带这个字段（checklist R1.4-4：按需计算，不白算）
     ...(hours ? { hours } : {}),
     // 最近 20 条失败，新的在前；页面用它做「为什么调不通」的第一手线索
@@ -2970,7 +3183,11 @@ function trackInflight(req, res, model, stream) {
 const server = createServer((req, res) => {
   // 请求级上下文：入口处识别调用方一次（local / client key 哈希前 8 位），
   // 账本与限流在处理链的任何深处用 requestScope.getStore() 取用。
-  requestScope.run({ client: identifyClientId(req) }, () => handleRequest(req, res));
+  //
+  // `effort` 先留空、解析 body 后再填：**store 是可变对象**，这样深处任意一个
+  // recordRequest（含各种失败早退路径）都能自动带上推理档位，不必逐处传参 ——
+  // 与 client 的归因同一套机制，新增记账点也不会漏。
+  requestScope.run({ client: identifyClientId(req), effort: '' }, () => handleRequest(req, res));
 });
 
 async function handleRequest(req, res) {
@@ -3047,6 +3264,9 @@ async function handleRequest(req, res) {
         uptimeMs: Date.now() - STARTED_AT,
         auth,
         authFile: AUTH_PATH,
+        // 本桥写进账本的账号标签：多账号时账本是按它分桶的，这里回传一份
+        // 好让消费方能"把账本上的账号对上界面上的分组"，不必去猜文件名。
+        account: ACCOUNT_LABEL,
         // 客户端定位结果（**只读内存缓存、绝不触发探测** —— /health 有 4 秒超时
         // 约束，慢探测会让控制台把桥误判成"未运行"；没定位过就显示空）
         clientExe: atRestUsedExe || wbExeCache || '',
@@ -3209,6 +3429,19 @@ async function handleRequest(req, res) {
       let payload;
       try { payload = JSON.parse(raw); } catch { return json(res, 400, { error: { message: 'invalid JSON body' } }); }
       const wantStream = payload.stream === true;
+      /*
+       * 推理档位（`reasoning_effort`）记进请求级上下文，供账本落盘。
+       *
+       * 为什么要记：它是**用户唯一能在界面上调的"质量/成本"旋钮**，而账本原来
+       * 完全不记 —— 面板的「最近请求」看不出这次到底用没用推理、用的哪一档，
+       * 用户没法核对"我选了 high，到底发出去了没有"。实测排查"推理等级下拉
+       * 有没有生效"时，只能靠翻原始日志，非常费劲。
+       *
+       * 只收字符串并**截断**（同 model id 的理由：客户端可控字段，账本行必须有界）。
+       */
+      const effortRaw = payload.reasoning_effort;
+      const effort = typeof effortRaw === 'string' ? shortError(effortRaw, 32) : '';
+      if (requestScope.getStore()) requestScope.getStore().effort = effort;
       // model 的类型与长度必须**先收敛**：它是客户端可控字段，会进账本、进日志、
       // 还会被原样回显（见 MAX_MODEL_ID_LEN 的说明）。数组/对象/数字/布尔一律拒绝
       // —— 否则类型混淆会让"长度"判断失效（如数组的 length 是元素个数），而且

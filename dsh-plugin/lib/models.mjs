@@ -170,18 +170,41 @@ export function effectiveCredits(model, overrides) {
 }
 
 /**
+ * 判断一个模型是否支持**推理强度控制**（选择器里的「推理等级」下拉）。
+ *
+ * 默认以上游目录为准，但允许用 `reasoningOverrides` 覆盖 —— 与
+ * {@link supportsImages} 完全同源的坑：上游目录**会漏报**。实测国内版
+ * `deepseek-v4.1-flash` 带 `supports_reasoning: true`，而国际版同一模型
+ * **整个字段都没有**（连 `credits`、`supports_images` 也一起漏报）。
+ * 实测国际版接受 `reasoning_effort: "high"` 并正常返回 200 —— 它确实支持，
+ * 只是目录没说。
+ *
+ * 覆盖是**双向**的：`true` 强制声明支持（漏报时用）、`false` 强制声明不支持
+ * （误报时用）。未列出的模型一律按目录走，不猜。
+ *
+ * @param {object} model 桥上 `/v1/models` 的一项
+ * @param {Record<string, boolean>} [overrides] 模型 id → 是否支持推理
+ */
+export function supportsReasoning(model, overrides) {
+  const id = String(model?.id ?? '');
+  if (overrides && typeof overrides === 'object' && typeof overrides[id] === 'boolean') {
+    return overrides[id];
+  }
+  // 桥的 supports_reasoning（上游 supportsReasoning 的透传）；兼容旧形状 reasoning:true
+  return model?.supports_reasoning === true || model?.supportsReasoning === true || model?.reasoning === true;
+}
+
+/**
  * 把桥的一个模型对象翻译成 dsh 适配器的模型元数据。
  * @param {object} model 桥上 `/v1/models` 的一项
- * @param {{ showCredits?: boolean, visionOverrides?: Record<string, boolean> }} [options]
+ * @param {{ showCredits?: boolean, visionOverrides?: Record<string, boolean>, creditOverrides?: Record<string, number>, reasoningOverrides?: Record<string, boolean> }} [options]
  */
 export function toAdapterModel(model, options = {}) {
   const id = String(model.id);
   const contextWindow = Number(model.context_window || model.contextWindow || 0) || undefined;
   const maxTokens = Number(model.max_output_tokens || model.maxTokens || 0) || undefined;
   const images = supportsImages(model, options.visionOverrides);
-  // 推理能力：桥以 supports_reasoning（上游 supportsReasoning 的透传）标记；
-  // 兼容直接给 reasoning:true 的旧形状。
-  const reasoning = model.supports_reasoning === true || model.supportsReasoning === true || model.reasoning === true;
+  const reasoning = supportsReasoning(model, options.reasoningOverrides);
   const baseName = String(model.name || id);
   /** 促销徽章：桥给了字段级 badge（如「夜间折扣」），也可能在 tags 里（旧宿主）。 */
   const badge = String(model.badge || '').trim()
@@ -224,16 +247,32 @@ export function toAdapterModels(catalog, filter = {}) {
       showCredits: filter.showCredits === true,
       visionOverrides: filter.visionOverrides,
       creditOverrides: filter.creditOverrides,
+      reasoningOverrides: filter.reasoningOverrides,
     }));
   }
   return out;
 }
 
-/** 桥侧的完整目录（含 credits / vendor 等展示字段），给面板与工具用。 */
-export function toDirectory(catalog) {
+/**
+ * 桥侧的完整目录（含 credits / vendor 等展示字段），给面板与工具用。
+ *
+ * `images` / `credits` / `reasoning` 都必须与适配器**同口径**（走 supportsImages /
+ * effectiveCredits / supportsReasoning 并带上覆盖），不能直接读上游字段：
+ * 上游目录会漏报 —— 实测国际版账号下 `deepseek-v4.1-flash` 的
+ * `supports_images` 为空、`credits` 与 `supports_reasoning` 整个字段都没有
+ * （该模型实际能看图、免费、也接受 reasoning_effort）。
+ * 照搬原始字段会导致**面板显示"不支持图片/倍率未知/无推理等级"，而 dsh 侧与
+ * 真实上游都不是这样** —— 两边各说一套，用户不知道该信哪个，且手动声明后毫无反馈。
+ *
+ * @param {Array<object>} catalog 桥 `/v1/models` 的 data
+ * @param {{ visionOverrides?: Record<string, boolean>, creditOverrides?: Record<string, number>, reasoningOverrides?: Record<string, boolean> }} [options]
+ */
+export function toDirectory(catalog, options = {}) {
+  const overrides = options.visionOverrides;
   return (catalog || [])
     .filter((m) => m && typeof m.id === 'string' && isChatModel(m.id))
     .map((m) => {
+      const priced = effectiveCredits(m, options.creditOverrides);
       // 上游把促销徽章混在 tags 里，形如 `badge:限时免费:#FF0000`。
       // 直接当标签显示就是一条噪音（而且把颜色丢了），所以这里拆出来：
       //   - 干净的标签 → tags
@@ -255,9 +294,12 @@ export function toDirectory(catalog) {
         name: String(m.name || m.id),
         contextWindow: Number(m.context_window || 0) || null,
         maxTokens: Number(m.max_output_tokens || 0) || null,
-        images: m.supports_images === true,
-        credits: typeof m.credits === 'number' ? m.credits : null,
-        free: m.free === true,
+        images: supportsImages(m, overrides),
+        credits: priced.credits ?? null,
+        free: priced.free === true,
+        // 是否支持推理强度控制（选择器显示「推理等级」下拉）。与 images/credits
+        // 同口径：走 supportsReasoning + 覆盖，不直读上游字段（会漏报）。
+        reasoning: supportsReasoning(m, options.reasoningOverrides),
         // 上游的厂商标识是单字母代码（f/j/v/e…），不是名字；原样保留但由界面
         // 标注为"标识"，免得被当成厂商名
         vendor: m.vendor ? String(m.vendor) : null,

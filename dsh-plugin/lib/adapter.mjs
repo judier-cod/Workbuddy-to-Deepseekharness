@@ -450,6 +450,16 @@ export class WorkBuddyAdapter {
      * 这里允许手动声明；只收非负数，其余忽略（按目录走）。
      */
     this.creditOverrides = { ...(options.creditOverrides || {}) };
+    /**
+     * 推理能力覆盖：`{ '<modelId>': true | false }`。
+     *
+     * 与 visionOverrides 完全同源的坑：上游目录**会漏报**。实测国内版
+     * `deepseek-v4.1-flash` 带 `supports_reasoning: true`，国际版同一模型
+     * 连这个字段都没有 —— 而实测国际版接受 `reasoning_effort: "high"` 并返回
+     * 200。照搬目录会让选择器少一个「推理等级」下拉，用户以为该模型不支持。
+     * 双向覆盖：true 强制声明支持、false 强制声明不支持；未列出按目录走。
+     */
+    this.reasoningOverrides = { ...(options.reasoningOverrides || {}) };
     this.defaults = options.defaults || {};
     this.catalogTtlMs = options.catalogTtlMs ?? 60_000;
     /** 目录缓存，避免每次模型选择都打一次桥。 */
@@ -580,6 +590,24 @@ export class WorkBuddyAdapter {
   }
 
   /**
+   * 运行时更新推理能力覆盖（面板里改时调用）。
+   *
+   * 与 {@link setVisionOverrides} 同构：只收布尔值，字符串 "true" 一律丢弃 ——
+   * 含糊的值被当成"支持"会让选择器显示一个上游可能拒绝的下拉。
+   */
+  setReasoningOverrides(overrides) {
+    const out = {};
+    for (const [key, raw] of Object.entries(overrides || {})) {
+      const id = String(key || '').trim();
+      if (!id) continue;
+      if (raw === true) out[id] = true;
+      else if (raw === false) out[id] = false;
+    }
+    this.reasoningOverrides = out;
+    return this.reasoningOverrides;
+  }
+
+  /**
    * 模型 id → 生效的上下文上限（token）。
    *
    * **这是"上限"，不是"声称值"**：只取 min，绝不放大。
@@ -613,6 +641,7 @@ export class WorkBuddyAdapter {
       showCredits: this.showCredits,
       visionOverrides: this.visionOverrides,
       creditOverrides: this.creditOverrides,
+      reasoningOverrides: this.reasoningOverrides,
     }).map((m) => ({
       provider,
       id: m.id,
@@ -640,6 +669,7 @@ export class WorkBuddyAdapter {
     const [mapped] = toAdapterModels([hit], {
       visionOverrides: this.visionOverrides,
       creditOverrides: this.creditOverrides,
+      reasoningOverrides: this.reasoningOverrides,
     });
     const efforts = [
       { id: 'low', name: 'Low' },

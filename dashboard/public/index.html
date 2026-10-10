@@ -3167,6 +3167,50 @@ function renderUsage() {
   // 积分排行：与趋势图同一份数据，回答「这段时间积分花在哪了」
   html += renderCreditRanking(u.models);
 
+  /**
+   * 按账号拆分。多账号时两个桥写**同一个账本**，不拆开就分不清"谁花了多少"
+   * （旧版实测两个端口的 total 完全相同 —— 读的本来就是同一份文件）。
+   * 单账号下整块不渲染，不给单账号用户加噪音。
+   */
+  if (Array.isArray(u.accounts) && u.accounts.length > 1) {
+    html += '<h3 class="sub-h">各账号消耗 <span class="hint" style="display:inline">同一份账本，按账号拆分；各账号之和 = 上面的总计</span></h3>'
+      + '<div class="tablewrap" style="max-height:260px">'
+      + '<table><thead><tr><th>账号</th><th class="num">次数</th><th class="num">失败</th><th class="num">输入</th><th class="num">输出</th><th class="num">积分</th></tr></thead><tbody>';
+    for (const a of u.accounts) {
+      html += '<tr>'
+        + '<td class="mono">' + (a.account === 'unknown'
+          ? '<span class="hint">未标注（本次改动前的旧记录）</span>'
+          : escapeAttr(a.account)) + '</td>'
+        + '<td class="num">' + fmtNum(a.calls) + '</td>'
+        + '<td class="num">' + fmtNum(a.failed || 0) + '</td>'
+        + '<td class="mono num">' + fmtNum(a.promptTokens) + '</td>'
+        + '<td class="mono num">' + fmtNum(a.completionTokens) + '</td>'
+        + '<td class="mono num">' + fmtCredit(a.credit, Number(a.creditCalls) > 0) + '</td></tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+
+  /**
+   * 按思考档位拆分：回答"开 high 比不开发多花多少 token / 积分"。
+   * 只有真的用过档位（≥2 种）才渲染，不给不用推理的人加噪音。
+   */
+  if (Array.isArray(u.efforts) && u.efforts.length > 1) {
+    html += '<h3 class="sub-h">各思考档位消耗 <span class="hint" style="display:inline">「默认」= 未下发 reasoning_effort，与显式选 low 不同</span></h3>'
+      + '<div class="tablewrap" style="max-height:260px">'
+      + '<table><thead><tr><th>思考档位</th><th class="num">次数</th><th class="num">输入</th><th class="num">输出</th><th class="num">积分</th></tr></thead><tbody>';
+    for (const e of u.efforts) {
+      html += '<tr>'
+        + '<td class="mono">' + (e.effort === '(默认)'
+          ? '<span class="hint">默认（未下发）</span>'
+          : escapeAttr(e.effort)) + '</td>'
+        + '<td class="num">' + fmtNum(e.calls) + '</td>'
+        + '<td class="mono num">' + fmtNum(e.promptTokens) + '</td>'
+        + '<td class="mono num">' + fmtNum(e.completionTokens) + '</td>'
+        + '<td class="mono num">' + fmtCredit(e.credit, Number(e.creditCalls) > 0) + '</td></tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+
   if (u.models.length) {
     // 明细表在窄屏下会宽于容器：必须放进可横向滚动的壳里，否则整页横向溢出
     html += '<div class="tablewrap" style="max-height:340px">'
@@ -3435,8 +3479,20 @@ function renderRequests() {
       : '—';
     return '<tr' + (r.ok ? '' : ' class="rowfail"') + '>' +
       '<td class="mono">' + fmtTime(r.t) + '</td>' +
+      // 账号列：多账号时两个桥写**同一个账本**，不标出来就分不清某条是谁花的。
+      // 旧记录没有 acct —— 显示"未标注"而不是空白（空白看着像渲染坏了）。
+      '<td class="mono">' + (r.acct && r.acct !== 'unknown'
+        ? escapeAttr(r.acct)
+        : '<span class="hint">未标注</span>') + '</td>' +
       '<td class="mono">' + escapeAttr(r.model) + '</td>' +
-      '<td>' + (r.stream ? '流式' : '非流式') + '</td>' +
+      // 思考档位：本次下发的 reasoning_effort。空 = 没下发（交给上游默认），
+      // 与显式选 low 语义不同，所以分开显示。
+      '<td class="mono">' + (r.effort
+        ? '<span class="tag ok">' + escapeAttr(r.effort) + '</span>'
+        : '<span class="hint">默认</span>') + '</td>' +
+      // 「方式（流式/非流式）」列已去掉：dsh 走这个桥时恒为流式，整列几乎每行
+      // 都一样 —— 实测 1888 条账本里仅 144 条非流式，其中只有 5 条是真实
+      // dsh 调用（其余是探针测试），属于纯噪音。CSV 导出仍保留该字段。
       '<td class="mono num">' + fmtNum(r.ms) + ' ms</td>' +
       '<td class="mono num">' + tokens + '</td>' +
       '<td class="mono num">' + fmtCredit(r.credit, typeof r.credit === 'number') + '</td>' +
@@ -3446,7 +3502,7 @@ function renderRequests() {
 
   box.innerHTML = activeHtml + notice +
     '<div class="tablewrap" id="reqTableWrap" style="max-height:320px"><table><thead><tr>' +
-    '<th>时间</th><th>模型</th><th>方式</th><th class="num">耗时</th><th class="num">输入/输出</th><th class="num">积分</th><th>结果</th>' +
+    '<th>时间</th><th>账号</th><th>模型</th><th>思考档位</th><th class="num">耗时</th><th class="num">输入/输出</th><th class="num">积分</th><th>结果</th>' +
     '</tr></thead><tbody>' + rows + '</tbody></table></div>';
   // 恢复滚动位置（放最后：innerHTML 一换 scrollTop 就归零了）
   const nextWrap = $('reqTableWrap');
@@ -3911,11 +3967,15 @@ async function syncUsableModels() {
 function exportRequestsCsv() {
   const shown = visibleRequests();
   if (!shown.length) { setRegMsg('当前筛选下没有可导出的明细', 'err'); return; }
-  const rows = [['时间', '模型', '方式', '耗时(ms)', '输入 tokens', '输出 tokens', '积分', '结果', '状态码', '错误码', '错误原文']];
+  const rows = [['时间', '账号', '模型', '思考档位', '方式', '耗时(ms)', '输入 tokens', '输出 tokens', '积分', '结果', '状态码', '错误码', '错误原文']];
   for (const r of shown) {
     rows.push([
       new Date(r.t).toLocaleString('zh-CN', { hour12: false }),
+      // 账号：导出后按它分组就能算清"每个账号花了多少"，这是分账号记账的意义所在
+      (r.acct && r.acct !== 'unknown') ? r.acct : '未标注',
       r.model || '',
+      // 思考档位：空 = 没下发（上游默认）。导出后按它分组能对比各档的 token/积分。
+      r.effort || '默认',
       r.stream ? '流式' : '非流式',
       Number(r.ms) || 0,
       typeof r.promptTokens === 'number' ? r.promptTokens : '',

@@ -20,7 +20,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createServer, request as httpRequest } from 'node:http';
-import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -623,12 +623,20 @@ test('桥：账本改用内存镜像后，/v1/usage 与 /v1/requests 的形状�
     assert.equal(failed.ok, false);
     assert.equal(failed.status, 429);
     assert.equal(failed.code, 11133);
+    // 老记录（本次改动前写的）没有 acct：必须回 'unknown'，不能省略、更不能
+    // 硬塞给某个账号（那会让"某账号花了多少"撒谎）。
+    assert.equal(failed.acct, 'unknown', '没有 acct 的旧记录必须归 unknown 桶');
     // 白名单：不能带出账本里的其它字段（这里本来也没有，但形状要固定）
+    // acct / effort 是**有意新增**的：多账号共用一个账本，不记账号就分不清
+    // 谁花的（见 ACCOUNT_LABEL）；effort 是用户唯一能调的"质量/成本"旋钮，
+    // 不记就无法核对"我选了 high 到底发出去没有"。
     assert.deepEqual(
       Object.keys(failed).sort(),
-      ['code', 'error', 'model', 'ms', 'ok', 'status', 'stream', 't'],
+      ['acct', 'code', 'effort', 'error', 'model', 'ms', 'ok', 'status', 'stream', 't'],
       '/v1/requests 的字段集必须稳定（只回元数据白名单）',
     );
+    // 老记录没有 effort：必须回空串（前端据此显示"—"），不能是 undefined
+    assert.equal(failed.effort, '', '没有 effort 的旧记录必须回空串而不是 undefined');
 
     // 小时视图：只有 ?hours=1 才带 hours 字段，且必须是补齐的 24 个桶
     const hourly = await (await fetch(bridge.baseUrl + '/v1/usage?days=1&hours=1', { headers: auth })).json();
@@ -1477,25 +1485,36 @@ test('桥：上游 200 但不是 SSE → 记失败，不回「空回答成功」
 });
 
 /**
- * 账本超过 `MAX_USAGE_LINES`(2000) 时的**截断路径** —— 这条路径此前从未被执行过。
+ * 账本**按账号**截断：每个账号超过 `MAX_USAGE_LINES_PER_ACCOUNT`(1000) 时，
+ * 只有**它自己**被砍到一半，别的账号一条不动。
  *
- * 它做的是「重写整份文件」，而原来是直接 `writeFileSync` 覆盖：进程正好在这时
- * 被杀 / 断电就留下半份文件，丢的是用户自己的用量历史（项目里没有第二份副本）。
- * 现在改成「写临时文件 + rename」原子替换。
+ * 为什么改成按账号：旧实现是"全局 2000 条一起砍"。多账号下两个桥写同一个文件，
+ * 调用频繁的账号（国际版免费、刷得多）一超限，**另一个账号的历史跟着被砍** ——
+ * 等于吵的那个把安静的挤掉。这条测试就是钉住"不再互相牵连"。
  *
- * 断言里那句「每一行都必须是合法 JSON」就是用来抓半截行的：
- * 非原子写入一旦发生，文件末尾会出现一行断掉的 JSON。
+ * 同时保留旧断言的两件事：截断是「重写整份文件」，必须**原子替换**（tmp+rename）
+ * 否则断电会留下半份；以及每一行都必须是合法 JSON（抓半截行）。
  */
-test('桥：账本截断保留最近一半，且每行仍是合法 JSON（原子替换）', { timeout: 30_000 }, async () => {
+test('桥：账本按账号各留一半，一个账号超限不牵连另一个（原子替换）', { timeout: 30_000 }, async () => {
   const stub = await startStubUpstream(['stub-model']);
-  const bridge = await startBridge({ CODEBUDDY_ENDPOINT: stub.base }, { auth: READABLE_FAKE_AUTH });
+  // 本桥的账号标签固定为 acct-under-test，便于断言"只有它被裁"
+  const bridge = await startBridge(
+    { CODEBUDDY_ENDPOINT: stub.base, WORKBUDDY_ACCOUNT_LABEL: 'acct-under-test' },
+    { auth: READABLE_FAKE_AUTH },
+  );
   try {
     const file = join(bridge.dir, 'usage.jsonl');
-    const pre = Array.from({ length: 2001 }, (_, i) => JSON.stringify({
-      t: Date.now() - (2001 - i) * 1000, model: 'pre', stream: false, ms: 1, ok: true,
+    const now = Date.now();
+    // A 账号：1000 条（正好到上限）；B 账号：50 条（远不到）
+    const rowsA = Array.from({ length: 1000 }, (_, i) => JSON.stringify({
+      t: now - (2000 - i) * 1000, acct: 'acct-under-test', model: 'pre-a', stream: false, ms: 1, ok: true,
     }));
-    writeFileSync(file, `${pre.join('\n')}\n`);
+    const rowsB = Array.from({ length: 50 }, (_, i) => JSON.stringify({
+      t: now - (500 - i) * 1000, acct: 'other-account', model: 'pre-b', stream: false, ms: 1, ok: true,
+    }));
+    writeFileSync(file, `${[...rowsA, ...rowsB].join('\n')}\n`);
 
+    // 本桥再记一条 → A 变 1001 条 → 触发裁剪
     await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: { ...auth, 'content-type': 'application/json' },
@@ -1504,10 +1523,116 @@ test('桥：账本截断保留最近一半，且每行仍是合法 JSON（原子
     await new Promise((r) => setTimeout(r, 400));
 
     const lines = readFileSync(file, 'utf8').trim().split('\n').filter(Boolean);
-    assert.ok(lines.length <= 1002, `截断后应保留最近一半，实际 ${lines.length} 行`);
-    assert.ok(lines.length >= 900, `不该把账本清空，实际 ${lines.length} 行`);
     for (const l of lines) JSON.parse(l); // 半截行会在这里抛
-    assert.ok(!existsSync(`${file}.tmp`), '临时文件必须被 rename 掉，不该留在目录里');
+
+    const countOf = (acct) => lines.filter((l) => {
+      const r = JSON.parse(l);
+      return (r.acct || 'unknown') === acct;
+    }).length;
+
+    const aCount = countOf('acct-under-test');
+    const bCount = countOf('other-account');
+
+    assert.ok(aCount <= 501, `超限账号应被砍到一半（≤501），实际 ${aCount}`);
+    assert.ok(aCount >= 400, `不该把超限账号清空，实际 ${aCount}`);
+    assert.equal(bCount, 50,
+      `另一个账号一条都不能少（旧实现会连带砍掉它），实际 ${bCount}`);
+    // 临时文件必须被 rename 掉。名字带 pid（多桥共享账本时避免互踩），
+    // 所以按前缀扫，而不是钉死 `${file}.tmp`。
+    const strayTmp = readdirSync(bridge.dir).filter((f) => f.startsWith('usage.jsonl.tmp'));
+    assert.deepEqual(strayTmp, [], `临时文件必须被 rename 掉，实际残留：${strayTmp.join(', ')}`);
+
+    // 新增的那条必须真的在账本里（重写路径不能把它弄丢）
+    assert.ok(lines.some((l) => { const r = JSON.parse(l); return r.model === 'stub-model'; }),
+      '本次调用的记录必须落盘（重写前要以磁盘为准重建并补回自己这条）');
+  } finally {
+    await bridge.stop();
+    try { await stub.close(); } catch { /* 忽略 */ }
+    rmSync(bridge.dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * 旧账本（没有 `acct` 字段）**既不归到某个账号，也不参与裁剪**。
+ *
+ * 这是升级时最容易误伤用户数据的地方：实测现场账本已有 **1204 行**旧记录
+ * （全部没有 acct）。若把它们当成"一个叫 unknown 的账号"去套 1000 上限，
+ * 升级后**第一次记账**就会触发裁剪、当场丢掉约 705 行历史。
+ *
+ * 正确语义：旧记录是**只减不增的冻结集合**（新记录永远带 acct 键），给它们套
+ * 上限没有意义、只会毁数据。展示时归 unknown 一桶是为了诚实——那些行确实无法
+ * 归因，硬塞给主账号会让"某账号花了多少"撒谎。
+ */
+test('桥：旧账本（无 acct）不参与裁剪、不被新记录连带删除', { timeout: 30_000 }, async () => {
+  const stub = await startStubUpstream(['stub-model']);
+  const bridge = await startBridge(
+    { CODEBUDDY_ENDPOINT: stub.base, WORKBUDDY_ACCOUNT_LABEL: 'main-acct' },
+    { auth: READABLE_FAKE_AUTH },
+  );
+  try {
+    const file = join(bridge.dir, 'usage.jsonl');
+    const now = Date.now();
+    // 关键：旧记录数量**故意超过 1000 上限**，模拟现场那 1204 行
+    const legacy = Array.from({ length: 1204 }, (_, i) => JSON.stringify({
+      t: now - (2000 - i) * 1000, model: 'legacy', stream: false, ms: 1, ok: true,
+    }));
+    writeFileSync(file, `${legacy.join('\n')}\n`);
+
+    // 记一条新请求 → 若旧记录被当成受限账号，这里就会砍掉约 700 行
+    await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'stub-model', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    await new Promise((r) => setTimeout(r, 400));
+
+    const lines = readFileSync(file, 'utf8').trim().split('\n').filter(Boolean);
+    const legacyLeft = lines.filter((l) => { const r = JSON.parse(l); return !('acct' in r); }).length;
+    assert.equal(legacyLeft, 1204,
+      `旧记录必须一行不少地保留（升级不能吃掉用户历史），实际剩 ${legacyLeft}`);
+
+    // 展示时它们归 unknown 桶，且与本账号分开计
+    const usage = await (await fetch(`${bridge.baseUrl}/v1/usage?days=1`, { headers: auth })).json();
+    const unknown = usage.accounts.find((a) => a.account === 'unknown');
+    const main = usage.accounts.find((a) => a.account === 'main-acct');
+    assert.equal(unknown?.calls, 1204, `旧记录应全部计入 unknown，实际 ${unknown?.calls}`);
+    assert.equal(main?.calls, 1, `本账号记录单独成桶，实际 ${main?.calls}`);
+    const sum = usage.accounts.reduce((n, a) => n + a.calls, 0);
+    assert.equal(sum, usage.total.calls, 'accounts 之和必须等于 total.calls');
+  } finally {
+    await bridge.stop();
+    try { await stub.close(); } catch { /* 忽略 */ }
+    rmSync(bridge.dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * 账本里的每条新记录都必须带本桥的 `acct`（来自 WORKBUDDY_ACCOUNT_LABEL）。
+ *
+ * 这是"分账号统计"的地基：标签写歪了，后面所有按账号的汇总都是错的。
+ */
+test('桥：新写入的账本记录带本桥的账号标签', { timeout: 30_000 }, async () => {
+  const stub = await startStubUpstream(['stub-model']);
+  const bridge = await startBridge(
+    { CODEBUDDY_ENDPOINT: stub.base, WORKBUDDY_ACCOUNT_LABEL: 'workbuddy-ai' },
+    { auth: READABLE_FAKE_AUTH },
+  );
+  try {
+    await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'stub-model', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    await new Promise((r) => setTimeout(r, 400));
+
+    const rows = readFileSync(join(bridge.dir, 'usage.jsonl'), 'utf8').trim().split('\n')
+      .filter(Boolean).map((l) => JSON.parse(l));
+    assert.ok(rows.length >= 1, '应当落盘至少一条记录');
+    assert.equal(rows[rows.length - 1].acct, 'workbuddy-ai', '记录必须带本桥的账号标签');
+
+    // /health 也要回传它：消费方靠这个字段把账本账号对上界面分组
+    const health = await (await fetch(`${bridge.baseUrl}/health`, { headers: auth })).json();
+    assert.equal(health.account, 'workbuddy-ai', '/health 必须回传账号标签');
   } finally {
     await bridge.stop();
     try { await stub.close(); } catch { /* 忽略 */ }
@@ -1742,6 +1867,67 @@ test('桥：完全没带凭据时也要给指引（新用户第一次接入手�
     if (real) assert.ok(!body.includes(real), '401 响应体绝不能包含真实令牌');
   } finally {
     await bridge.stop();
+    rmSync(bridge.dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * 回归：**推理档位必须记进账本、并从 /v1/requests 与 /v1/usage 暴露出来。**
+ *
+ * 为什么需要：`reasoning_effort` 是用户唯一能在界面上调的"质量/成本"旋钮，
+ * 而账本原来**完全不记**它 —— 面板「最近请求」看不出这次用没用推理、用的哪一档，
+ * 用户没法核对"我在选择器里选了 high，到底发出去了没有"。
+ *
+ * 现场就是靠翻原始日志才确认的，非常费劲。这条测试钉住三个面：
+ *   1. 账本里真的写了 effort（不是只在内存里）
+ *   2. /v1/requests 回传它（面板要显示"思考档位"）
+ *   3. /v1/usage 按档位聚合（回答"开 high 比不开发多花多少"）
+ */
+test('桥：推理档位记进账本并可从接口读出（回归：面板看不到用了哪档）', { timeout: 30_000 }, async () => {
+  const stub = await startStubUpstream(['stub-model']);
+  const bridge = await startBridge({ CODEBUDDY_ENDPOINT: stub.base }, { auth: READABLE_FAKE_AUTH });
+  try {
+    const send = (extra) => fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'stub-model', messages: [{ role: 'user', content: 'hi' }], ...extra }),
+    });
+
+    await send({ reasoning_effort: 'high' });
+    await new Promise((r) => setTimeout(r, 250));
+    await send({ reasoning_effort: 'low' });
+    await new Promise((r) => setTimeout(r, 250));
+    await send({}); // 不带档位
+    await new Promise((r) => setTimeout(r, 400));
+
+    // ① 账本文件里真的有 effort
+    const rows = readFileSync(join(bridge.dir, 'usage.jsonl'), 'utf8').trim().split('\n')
+      .filter(Boolean).map((l) => JSON.parse(l));
+    const efforts = rows.map((r) => r.effort).filter((e) => e !== undefined);
+    assert.ok(efforts.includes('high'), `账本里应当记下 high，实际 ${JSON.stringify(efforts)}`);
+    assert.ok(efforts.includes('low'), `账本里应当记下 low，实际 ${JSON.stringify(efforts)}`);
+    // 没发的**不写字段**（保持行紧凑），而不是写空串
+    assert.equal(rows[rows.length - 1].effort, undefined,
+      '没下发 reasoning_effort 时不该往账本写这个字段');
+
+    // ② /v1/requests 回传（新的在前）
+    const reqs = await (await fetch(`${bridge.baseUrl}/v1/requests?limit=10`, { headers: auth })).json();
+    assert.equal(reqs.requests[0].effort, '', '不带档位的那条应回空串（前端显示 —）');
+    const highRow = reqs.requests.find((r) => r.effort === 'high');
+    assert.ok(highRow, '/v1/requests 必须回传 effort，否则面板无法显示"思考档位"');
+
+    // ③ /v1/usage 按档位聚合，且各档之和 === total.calls
+    const usage = await (await fetch(`${bridge.baseUrl}/v1/usage?days=1`, { headers: auth })).json();
+    assert.ok(Array.isArray(usage.efforts), '/v1/usage 必须给出按档位的拆分');
+    const byKey = Object.fromEntries(usage.efforts.map((e) => [e.effort, e.calls]));
+    assert.equal(byKey.high, 1, `high 应统计到 1 次，实际 ${JSON.stringify(byKey)}`);
+    assert.equal(byKey.low, 1, `low 应统计到 1 次，实际 ${JSON.stringify(byKey)}`);
+    assert.equal(byKey['(默认)'], 1, '没发档位的归 "(默认)"，与显式选 low 不是一回事');
+    const sum = usage.efforts.reduce((n, e) => n + e.calls, 0);
+    assert.equal(sum, usage.total.calls, '各档位之和必须等于 total.calls');
+  } finally {
+    await bridge.stop();
+    try { await stub.close(); } catch { /* 忽略 */ }
     rmSync(bridge.dir, { recursive: true, force: true });
   }
 });

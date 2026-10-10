@@ -165,6 +165,6 @@ export function summarizeProbeResults(probe) {
 }
 
 /** 模型目录 → 体检面板要用的行（与 /workbuddy/models 同形）。 */
-export function probeRowsFor(catalog) {
-  return toDirectory(catalog);
+export function probeRowsFor(catalog, options = {}) {
+  return toDirectory(catalog, options);
 }

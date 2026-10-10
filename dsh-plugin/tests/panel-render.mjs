@@ -500,6 +500,62 @@ try {
       for (const needle of ['模型 ID', '上下文 / 输出', '多模态', '计费倍率']) {
         if (!inline.text.includes(needle)) problems.push(`模型详情缺少「${needle}」`);
       }
+      /**
+       * 能力声明按钮必须**真的改变取值**。
+       *
+       * 真出过一次：`toggle` 里写的是
+       * `if (current === true) next[id] = false; else delete next[id];`
+       * —— `next[id]` 只会变成 false 或被删除，**永远不会变成 true**。
+       * 而"目录漏报、尚无覆盖"正是该功能要解决的场景（current === false），
+       * 于是走 else → delete 一个不存在的键 → POST 出去 `{}` → 后端毫无变化，
+       * 提示条却照样说"已声明"。按钮成了永久性摆设。
+       *
+       * 这里直接点一次并**核对请求体**：必须出现 `"<模型id>":true`。
+       */
+      const toggleCheck = await page.cdp.evaluate(`(async () => {
+        const id = ${JSON.stringify(detailTarget.id)};
+        const box = document.querySelector('.wb-detail');
+        if (!box) return { err: 'no detail box' };
+        // 找到"声明支持…"按钮（图片或推理）
+        const btn = [...box.querySelectorAll('.wb-btn')]
+          .find((b) => /^声明支持/.test(b.textContent.trim()));
+        if (!btn) return { err: 'no declare button', text: box.innerText.slice(0, 300) };
+        const label = btn.textContent.trim();
+        // 拦截下一次 fetch，读出真实请求体
+        const orig = window.fetch;
+        let captured = null;
+        window.fetch = function (input, init) {
+          try {
+            if (String(input).includes('-overrides') && init && init.body) captured = init.body;
+          } catch (e) { /* ignore */ }
+          return orig.apply(this, arguments);
+        };
+        btn.click();
+        await new Promise((r) => setTimeout(r, 900));
+        window.fetch = orig;
+        return { label, captured };
+      })()`);
+      if (toggleCheck.err) {
+        problems.push(`能力声明按钮检查失败：${toggleCheck.err}`);
+      } else {
+        const body = String(toggleCheck.captured || '');
+        /*
+         * 断言请求体里**至少有一个模型被显式置为 true**。
+         *
+         * 不依赖 detailTarget.id（那列取的是勾选框，本来就是空的 —— 是这段
+         * 既有测试代码的老毛病）。这里要抓的是"按钮是不是空操作"：
+         * 修复前 payload 恒为 `{}`（因为 next[id] 只会被删/置 false），
+         * 修复后必然带 `"<某模型>":true`。
+         */
+        const anyTrue = /"[^"]+"\s*:\s*true/.test(body);
+        if (!anyTrue) {
+          problems.push(`点「${toggleCheck.label}」没有把任何模型置为 true`
+            + `（请求体=${body.slice(0, 200)}）—— 按钮是空操作，用户会被成功提示误导`);
+        } else {
+          const m = body.match(/"([^"]+)"\s*:\s*true/);
+          console.log(`能力声明：点「${toggleCheck.label}」→ 请求体把 ${m ? m[1] : '?'} 置为 true ✓`);
+        }
+      }
       if (inline.width < 200) problems.push(`模型详情宽度异常（${inline.width}px）`);
       console.log(`模型详情：点 ${detailTarget.id} → 紧跟其下展开（${inline.width}px 宽${inline.isLast ? '，位于表尾' : ''}）`);
       // 留一张"详情紧跟行"的证据图

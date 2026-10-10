@@ -173,12 +173,12 @@ function writeContextPrefs(overrides, maxTokens) {
 }
 
 /**
- * 解析「模型 id → 是否支持图片」的映射。
+ * 解析「模型 id → 布尔能力」的映射（图片输入、推理等级这类）。
  *
  * **只收布尔值**：`true`/`false` 才算数，字符串 "true" 一律丢弃 ——
- * 含糊的值被当成"支持"，会让用户贴了图却在调用时被上游拒绝。
+ * 含糊的值被当成"支持"，会让用户贴了图/选了推理等级，却在调用时被上游拒绝。
  */
-function asVisionOverrides(value) {
+function asBoolOverrides(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   const out = {};
   for (const [key, raw] of Object.entries(value)) {
@@ -190,12 +190,113 @@ function asVisionOverrides(value) {
   return out;
 }
 
-/** 读持久化的图片能力覆盖（与可见清单、上下文同文件，互不覆盖）。 */
-function readVisionPrefs() {
+/** 图片能力覆盖的解析（与 asBoolOverrides 同义，保留名字便于对照既有引用）。 */
+function asVisionOverrides(value) {
+  return asBoolOverrides(value);
+}
+
+/**
+ * 布尔能力覆盖的**通用**读写 —— 图片输入与推理等级形状完全一致
+ * （模型 id → true/false，按 provider 分桶），共用一份实现而不是复制两遍：
+ * 这类"复制出来的平行代码"迟早分叉（可见性/倍率上已经各踩过一次）。
+ *
+ * 键布局：`<kind>ByProvider: { '<provider>': { '<modelId>': boolean } }`。
+ * 兼容旧的全局键（仅 vision 有过）：只对主 provider 生效，且刻意**不写**
+ * `!primaryProvider` 那种宽容分支 —— 那会让"调用方漏传主 provider"变成静默
+ * 串味，所有分组都读到主 provider 的值（可见性偏好上真踩过）。
+ */
+const BOOL_KINDS = new Set(['vision', 'reasoning']);
+
+/** 读某个 provider 的布尔能力覆盖；null = 没有偏好（走目录）。 */
+function readBoolPrefs(kind, provider, primaryProvider) {
+  if (!BOOL_KINDS.has(kind)) return null;
   try {
     const j = JSON.parse(readFileSync(MODEL_PREFS_PATH, 'utf8'));
-    return asVisionOverrides(j?.vision);
+    const perProvider = j?.[`${kind}ByProvider`];
+    if (perProvider && typeof perProvider === 'object' && perProvider[provider] !== undefined) {
+      return asBoolOverrides(perProvider[provider]);
+    }
+    // 旧全局键（历史上只有 vision 用过）
+    if (j?.[kind] !== undefined && primaryProvider && provider === primaryProvider) {
+      return asBoolOverrides(j[kind]);
+    }
+    return null;
   } catch { return null; }
+}
+
+/**
+ * 写某个 provider 的布尔能力覆盖（不动其它 provider 的键）。
+ *
+ * `primaryProvider` 用于**安全迁移**旧的全局键：那个键只对主 provider 生效
+ * （见 readBoolPrefs）。这里**曾经**无条件把它置 null —— 于是"用户切到分组账号
+ * 随手存一次"就会把主账号还在读的旧声明**销毁**（实测复现：
+ * `{"vision":{...}}` 写一次分组后主 provider 读到 `{}`，图片能力又被静默降级）。
+ *
+ * 正确做法：先把旧值**并入主 provider 的桶**，再清掉旧键。这样无论从哪个分组
+ * 写，主账号的声明都被保留下来，且只迁移一次（迁移后 `current[kind]` 已是 null）。
+ */
+function writeBoolPrefs(kind, provider, overrides, primaryProvider) {
+  if (!BOOL_KINDS.has(kind)) return false;
+  const current = readPrefsFile();
+  const key = `${kind}ByProvider`;
+  const map = (current[key] && typeof current[key] === 'object') ? { ...current[key] } : {};
+  map[provider] = asBoolOverrides(overrides);
+  const patch = { [key]: map };
+  /*
+   * 迁移旧的全局键。只在它**真的带着值**时动手，且必须先落进主 provider 的桶：
+   *   - 旧值 → visionByProvider[主 provider]（仅当该桶还没有键，不覆盖用户新设置）
+   *   - 然后才把旧键置 null
+   * 不传 primaryProvider 时（不该发生）保守处理：不动旧键，宁可留着也不要毁数据。
+   */
+  const legacy = current[kind];
+  if (legacy !== undefined && legacy !== null && primaryProvider) {
+    const legacyVals = asBoolOverrides(legacy);
+    if (Object.keys(legacyVals).length && map[primaryProvider] === undefined) {
+      map[primaryProvider] = legacyVals;
+    }
+    patch[kind] = null;
+  }
+  return mergePrefs(patch);
+}
+
+/**
+ * 读持久化的图片能力覆盖，**按 provider 分开**。
+ *
+ * 为什么必须按 provider：图片能力是**账号维度**的属性 —— 同一个
+ * `deepseek-v4.1-flash` 在国内版目录里 `supports_images: true`，在国际版目录里
+ * 却漏报（为空）。用户在国际版手动声明 `true` 后，这份覆盖不该让国内版也跟着
+ * 变成"手动指定"，更不该在用户想压掉某个分组的误报时连带影响另一组。
+ * 与可见性、倍率同一套结构（`visionByProvider`）。
+ *
+ * 兼容旧的全局 `vision` 键：只对主 provider 生效。刻意**不写**
+ * `!primaryProvider` 那种宽容分支 —— 那会让漏传参数变成静默串味
+ * （可见性偏好上真踩过：漏传主 provider 时每个分组都读到主 provider 的清单）。
+ *
+ * @param {string} provider 要读的 provider 名
+ * @param {string} [primaryProvider] 主 provider 名（判旧键归属用）
+ */
+function readVisionPrefs(provider, primaryProvider) {
+  return readBoolPrefs('vision', provider, primaryProvider);
+}
+
+/**
+ * 读持久化的**推理能力**覆盖，按 provider 分开。
+ *
+ * 与图片能力完全同源的坑：上游目录会漏报。实测国内版 `deepseek-v4.1-flash`
+ * 带 `supports_reasoning: true`，国际版同一模型连这个字段都没有 —— 而实测
+ * 国际版接受 `reasoning_effort: "high"` 且返回 200。不手动声明，dsh 的选择器
+ * 就没有「推理等级」下拉，用户以为该模型不支持推理。
+ */
+function readReasoningPrefs(provider, primaryProvider) {
+  return readBoolPrefs('reasoning', provider, primaryProvider);
+}
+
+/**
+ * 写某个 provider 的推理能力覆盖（不动其它 provider 的键）。
+ * 与 {@link writeVisionPrefs} 同构。
+ */
+function writeReasoningPrefs(provider, overrides, primaryProvider) {
+  return writeBoolPrefs('reasoning', provider, overrides, primaryProvider);
 }
 
 /**
@@ -254,9 +355,20 @@ function writeCreditPrefs(provider, overrides) {
   return mergePrefs({ creditsByProvider: map });
 }
 
-/** 写图片能力覆盖（只改 vision 一个键，其余原样保留）。 */
-function writeVisionPrefs(overrides) {
-  return mergePrefs({ vision: asVisionOverrides(overrides) });
+/**
+ * 写某个 provider 的图片能力覆盖（不动其它 provider 的键）。
+ *
+ * 与 {@link writeCreditPrefs} 同构：按 provider 分桶存。顺带**清掉旧的全局
+ * `vision` 键** —— 它只对主 provider 生效，留着会让"主 provider 读到旧全局值"
+ * 与"分组读到新分桶值"两套语义并存；用户第一次在面板上操作后，意图就完整
+ * 落在 `visionByProvider` 里了。
+ *
+ * **导出供测试**：这条写入路径有个只在"从分组账号保存"时才暴露的缺陷（旧全局
+ * 键被无条件清掉，销毁主账号的声明），必须能直接测真实实现 —— 用桩测不出
+ * "调用方漏绑主 provider"这类接线问题（可见性偏好上正是这么漏过一次）。
+ */
+export function writeVisionPrefs(provider, overrides, primaryProvider) {
+  return writeBoolPrefs('vision', provider, overrides, primaryProvider);
 }
 
 /**
@@ -358,6 +470,15 @@ export const DEFAULTS = {
    * `true` = 强制声明支持；`false` = 强制声明不支持；未列出 = 按目录走。
    */
   visionOverrides: {},
+  /**
+   * 推理能力覆盖：`{ '<modelId>': true | false }`。
+   *
+   * 与 visionOverrides 完全同源的坑：上游目录会漏报 `supports_reasoning`。
+   * 实测国内版 `deepseek-v4.1-flash` 带该字段（true），国际版同一模型整个
+   * 字段都没有 —— 而实测国际版接受 `reasoning_effort: "high"` 并返回 200。
+   * 照搬目录会让选择器少一个「推理等级」下拉。
+   */
+  reasoningOverrides: {},
   /**
    * 倍率覆盖：`{ '<modelId>': number }`（0 = 免费）。
    *
@@ -463,6 +584,7 @@ export function resolveConfig(raw = {}) {
     contextOverrides: asContextOverrides(cfg.contextOverrides),
     contextMaxTokens: Math.max(0, Math.floor(Number(cfg.contextMaxTokens) || 0)),
     visionOverrides: asVisionOverrides(cfg.visionOverrides),
+    reasoningOverrides: asBoolOverrides(cfg.reasoningOverrides),
     creditOverrides: asCreditOverrides(cfg.creditOverrides),
     accountProviderPrefix: String(cfg.accountProviderPrefix || DEFAULTS.accountProviderPrefix)
       .replace(/[^A-Za-z0-9_-]+/g, '') || DEFAULTS.accountProviderPrefix,
@@ -677,6 +799,11 @@ export function apply(ctx, rawConfig = {}) {
     autoStart: config.autoStart,
     nodePath: config.nodePath || undefined,
     timeoutMs: 8000,
+    // 账本按账号分桶：桥把 provider 名写进每条记录的 acct，面板/控制台才能
+    // 分开统计"哪个账号花了多少分"。多账号时两个桥写**同一个**账本文件，
+    // 不打标签就只能得到两个账号的合计（实测两个端口返回过完全相同的 total）。
+    // 用 provider 名而不是登录文件名：与模型选择器里的分组名一一对应。
+    env: { WORKBUDDY_ACCOUNT_LABEL: config.provider },
     onLog: (line) => log(line),
   });
   const client = new BridgeClient({
@@ -773,6 +900,7 @@ export function apply(ctx, rawConfig = {}) {
     contextOverrides: config.contextOverrides,
     contextMaxTokens: config.contextMaxTokens,
     visionOverrides: config.visionOverrides,
+    reasoningOverrides: config.reasoningOverrides,
     creditOverrides: config.creditOverrides,
     defaults: {
       maxTokens: config.defaultMaxTokens,
@@ -819,6 +947,10 @@ export function apply(ctx, rawConfig = {}) {
   // 与可见清单同文件（.model-prefs.json）但不同键；面板改完持久化到这里，
   // 重启后依然生效。配置文件的 contextOverrides 与它合并，面板的优先
   // （同样是"用户在界面上表达的最新意图优先"）。
+  //
+  // 注意：上下文覆盖目前是**全局**的（不按 provider 分桶），所以下面分组
+  // adapter 也要吃到同一份 —— 否则面板里设的上限对分组账号静默失效
+  // （实测过：主 adapter 有 200000，分组是 {}）。
   const savedContext = readContextPrefs();
   if (savedContext) {
     // 逐模型覆盖：配置文件的与面板保存的合并，面板的优先（用户最新意图）
@@ -833,13 +965,26 @@ export function apply(ctx, rawConfig = {}) {
     }
   }
 
-  // ── 0c. 应用面板里保存的图片能力覆盖 ───────────────────────────────────
+  // ── 0c. 应用面板里保存的图片能力覆盖（按 provider 分开）──────────────────
   // 与可见清单、上下文同文件（.model-prefs.json）但不同键。
   // 用途：上游目录漏报多模态能力时手动补声明（如国际版的 deepseek-v4.1-flash）。
-  const savedVision = readVisionPrefs();
+  // **必须按 provider 读**：图片能力是账号维度属性 —— 国内版目录已声明 true、
+  // 国际版漏报，用一份全局覆盖会让两边互相串味。
+  const savedVision = readVisionPrefs(config.provider, config.provider);
   if (savedVision && Object.keys(savedVision).length) {
     adapter.setVisionOverrides({ ...config.visionOverrides, ...savedVision });
-    log(`已应用图片能力覆盖：${Object.keys(savedVision).length} 个模型`);
+    log(`已应用图片能力覆盖：${Object.keys(savedVision).length} 个模型（provider=${config.provider}）`);
+  }
+
+  // ── 0c-2. 应用面板里保存的推理能力覆盖（按 provider 分开）────────────────
+  // 与图片能力完全同源的坑：上游目录漏报 supports_reasoning。实测国内版
+  // deepseek-v4.1-flash 带该字段（true），国际版同一模型整个字段都没有 ——
+  // 而实测国际版接受 reasoning_effort=high 并返回 200。不声明，选择器就没有
+  // 「推理等级」下拉。
+  const savedReasoning = readReasoningPrefs(config.provider, config.provider);
+  if (savedReasoning && Object.keys(savedReasoning).length) {
+    adapter.setReasoningOverrides({ ...config.reasoningOverrides, ...savedReasoning });
+    log(`已应用推理能力覆盖：${Object.keys(savedReasoning).length} 个模型（provider=${config.provider}）`);
   }
 
   // ── 0d. 应用面板里保存的倍率覆盖（按 provider 分开）──────────────────────
@@ -991,6 +1136,10 @@ export function apply(ctx, rawConfig = {}) {
         autoStart: config.autoStart,
         nodePath: config.nodePath || undefined,
         timeoutMs: 8000,
+        // 分组桥的账号标签 = 该分组的 provider 名（如 workbuddy-ai）。
+        // 与主桥同一个键，但各进程独立注入 —— 这正是"账本能分清谁是谁"的依据：
+        // 两个桥写同一个文件，只靠标签区分。
+        env: { WORKBUDDY_ACCOUNT_LABEL: account.provider },
         onLog: (line) => log(`[${account.id}]`, line),
       });
       const groupClient = new BridgeClient({
@@ -1010,7 +1159,8 @@ export function apply(ctx, rawConfig = {}) {
         contextOverrides: config.contextOverrides,
         contextMaxTokens: config.contextMaxTokens,
         visionOverrides: config.visionOverrides,
-    creditOverrides: config.creditOverrides,
+        reasoningOverrides: config.reasoningOverrides,
+        creditOverrides: config.creditOverrides,
         defaults: {
           maxTokens: config.defaultMaxTokens,
           temperature: config.defaultTemperature,
@@ -1042,12 +1192,49 @@ export function apply(ctx, rawConfig = {}) {
         groupAdapter.setFilter({ allow: groupPrefs });
         log(`分组「${account.displayName}」应用显示偏好：${groupPrefs.length} 个模型`);
       }
+      // 上下文上限覆盖：**全局一份**（不按 provider 分桶），所以分组也要吃到。
+      // 这里**曾经漏掉过**：面板里设的上限只喂给主 adapter，分组账号静默失效 ——
+      // 实测主 adapter 有 {deepseek-v4.1-flash:200000}/maxTokens 500000，
+      // 而分组是 {}/0。用户以为设了 1M 上限，实际分组仍按目录原值跑。
+      const groupContextOverrides = {
+        ...config.contextOverrides,
+        ...(savedContext?.overrides || {}),
+      };
+      if (Object.keys(groupContextOverrides).length) {
+        groupAdapter.setContextOverrides(groupContextOverrides);
+        log(`分组「${account.displayName}」应用上下文上限覆盖：${Object.keys(groupContextOverrides).length} 个模型`);
+      }
+      const groupContextMax = savedContext?.maxTokens > 0 ? savedContext.maxTokens : config.contextMaxTokens;
+      if (groupContextMax > 0) {
+        groupAdapter.setContextMaxTokens(groupContextMax);
+        log(`分组「${account.displayName}」应用全局上下文上限：${groupContextMax} tokens`);
+      }
       // 分组自己的倍率覆盖（同样按 provider 分开）——
       // 实测国际版 deepseek-v4.1-flash 免费、国内版 0.11×，一码归一码。
       const groupCredits = readCreditPrefs(account.provider, config.provider);
       if (groupCredits && Object.keys(groupCredits).length) {
         groupAdapter.setCreditOverrides({ ...config.creditOverrides, ...groupCredits });
         log(`分组「${account.displayName}」应用倍率覆盖：${Object.keys(groupCredits).length} 个模型`);
+      }
+      // 分组自己的图片能力覆盖（同样按 provider 分开）。
+      //
+      // 这里**曾经漏掉过**，后果很隐蔽：面板上的覆盖只喂给了主 adapter
+      // （见 0c 段），分组 adapter 拿到的是空的 config.visionOverrides，
+      // 于是"目录漏报 + 用户手动声明 true"的模型在分组下依然被判成纯文本，
+      // dsh 侧把它降级成 "(image omitted: model does not support images)" ——
+      // 用户贴了图却像没贴，还不报错。默认模型走分组 provider 时必现。
+      const groupVision = readVisionPrefs(account.provider, config.provider);
+      if (groupVision && Object.keys(groupVision).length) {
+        groupAdapter.setVisionOverrides({ ...config.visionOverrides, ...groupVision });
+        log(`分组「${account.displayName}」应用图片能力覆盖：${Object.keys(groupVision).length} 个模型`);
+      }
+      // 分组自己的推理能力覆盖 —— 与上面图片能力**同一个坑**：不喂给分组，
+      // 分组下的模型就没有「推理等级」下拉。默认模型走分组 provider 时必现
+      // （本项目正是 workbuddy-ai）。
+      const groupReasoning = readReasoningPrefs(account.provider, config.provider);
+      if (groupReasoning && Object.keys(groupReasoning).length) {
+        groupAdapter.setReasoningOverrides({ ...config.reasoningOverrides, ...groupReasoning });
+        log(`分组「${account.displayName}」应用推理能力覆盖：${Object.keys(groupReasoning).length} 个模型`);
       }
       // 每个分组一条独立路由：模型选择器里就是独立的一组
       llm.registerAdapter([account.provider], groupAdapter);
@@ -1170,21 +1357,33 @@ export function apply(ctx, rawConfig = {}) {
      *
      * 失败只记 per-group 的 error，**不影响其它分组与主账号** —— 一个账号
      * 欠费（429）不该让整页显示不出来。
+     *
+     * `quota === true`（面板「刷新积分」）时**改为 await**：那个按钮的语义是
+     * "现在就给我最新值"，而分组积分若是后台发起就返回旧缓存，按钮刷的只是
+     * 主账号、分组数字纹丝不动 —— 用户看到"刷新了但国际版还是 0"会以为
+     * 那个账号真的没额度。刷新是有意的用户动作，等它一下是对的；
+     * 8 秒轮询那条路径仍然走后台，不受影响。
      */
+    const groupQuotaTasks = [];
     for (const g of accountGroups) {
       if (!g.registered || !g.client) continue;
       const stale = !g.quotaCache.value || Date.now() - g.quotaCache.at > QUOTA_TTL_MS;
-      if (!stale) continue;
-      // 只在桥活着时查；失败静默记在 cache 里（不抛、不 await 阻塞主流程）
-      void (async () => {
+      // 强制刷新时**无条件重取**（TTL 内也要重取），否则按钮点下去没有效果
+      if (!quota && !stale) continue;
+      const task = (async () => {
         try {
-          const value = await g.client.quota();
+          const value = await g.client.quota(signal);
           g.quotaCache = { at: Date.now(), value, error: '' };
         } catch (error) {
           g.quotaCache = { ...g.quotaCache, at: Date.now(), error: String(error?.message || error) };
         }
       })();
+      // 非强制：后台跑、不 await（status 每 8 秒一次，不能被计费端点拖住）
+      if (quota) groupQuotaTasks.push(task);
+      else void task;
     }
+    // 强制刷新才等：并行等待，一个账号慢/失败不影响其它（各自 catch 过）
+    if (groupQuotaTasks.length) await Promise.all(groupQuotaTasks);
 
     // 签到状态：TTL 30 分钟，而且**绝不阻塞** status。
     //
@@ -1251,7 +1450,13 @@ export function apply(ctx, rawConfig = {}) {
         error: g.error,
       })),
       route: { ...state.route },
-      directory: toDirectory(catalog),
+      // 带上覆盖：快照里的目录也要与适配器同口径，否则入口页显示的能力/价格
+      // 会和 dsh 实际收到的不一致（见 toDirectory 注释）。
+      directory: toDirectory(catalog, {
+        visionOverrides: adapter.visionOverrides,
+        reasoningOverrides: adapter.reasoningOverrides,
+        creditOverrides: adapter.creditOverrides,
+      }),
       catalogAt: adapter.catalogCache.at ? new Date(adapter.catalogCache.at).toISOString() : null,
       catalogError: adapter.catalogError || '',
       legacy: { found: state.legacy.found, files: state.legacy.files, cleaned: state.legacy.cleaned },
@@ -1295,7 +1500,7 @@ export function apply(ctx, rawConfig = {}) {
   if (config.tools) {
     useService('tools', (tools) => {
       let count = 0;
-      for (const definition of createTools({ snapshot, supervisor, consoleSupervisor, client, adapter })) {
+      for (const definition of createTools({ snapshot, supervisor, consoleSupervisor, client, adapter, accountGroups })) {
         try {
           tools.register(definition);
           count += 1;
@@ -1416,6 +1621,8 @@ export function apply(ctx, rawConfig = {}) {
         consoleSupervisor,
         client,
         adapter,
+        // 供 restart 连分组桥一起重启（桥 detached，重启 dsh 不会换代码）
+        accountGroups,
         paths: dshPaths,
         provider: config.provider,
         resolveProvider,
@@ -1428,8 +1635,14 @@ export function apply(ctx, rawConfig = {}) {
         readPrefs: (providerId) => readModelPrefs(providerId, config.provider),
         onWritePrefs: writeModelPrefs,
         writeContextPrefs,
-        writeVisionPrefs,
-        readVisionPrefs,
+        // 写入也要绑主 provider：迁移旧的全局键时要把它并进**主 provider** 的桶。
+        // 不绑的话，从分组账号存一次就会把主账号还在读的旧声明销毁（实测复现过）。
+        writeVisionPrefs: (providerId, overrides) => writeVisionPrefs(providerId, overrides, config.provider),
+        // 同 readPrefs 的理由：路由以单参调用。不绑主 provider，旧全局 `vision`
+        // 键的回退分支就永远不成立，升级用户保存过的图片声明会凭空消失。
+        readVisionPrefs: (providerId) => readVisionPrefs(providerId, config.provider),
+        writeReasoningPrefs: (providerId, overrides) => writeReasoningPrefs(providerId, overrides, config.provider),
+        readReasoningPrefs: (providerId) => readReasoningPrefs(providerId, config.provider),
         writeCreditPrefs,
         readCreditPrefs,
         notifyAdaptersUpdated,

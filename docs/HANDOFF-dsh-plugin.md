@@ -90,7 +90,7 @@ node dsh-plugin/scripts/verify-standalone.mjs# ✅ 12 项全过
 
 - **Node v25.2.1**（`C:\Program Files\nodejs\node.exe`）；CI 用 22；DSH 自带 24.21.0。
 - dsh CLI：`D:\Apps\DeepSeekHarness\resources\runtime\cli\bin\dsh.cmd`（ELECTRON_RUN_AS_NODE 包装）。
-- `DSH_HOME=C:\Users\局二\.dsh`；profile `desktop`；DSH 0.2.0-rc.2。
+- `DSH_HOME=%USERPROFILE%\.dsh`；profile `desktop`；DSH 0.2.0-rc.2。
 - 仓库检出：`D:\deepseek\workbuddy-to-dsh`；远程 `judier-cod/workbuddy-to-dsh`（Public）。
 - **git 走代理**：系统代理 `127.0.0.1:7890`（Clash），但 git 不读系统代理。
   已配 `http.https://github.com.proxy`（只对 GitHub 生效，不动全局）。

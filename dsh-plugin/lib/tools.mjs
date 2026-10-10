@@ -6,7 +6,7 @@
  * 工具返回值必须是 JsonValue；模型看到的内容由 `output.render` 产出。
  * 这里统一用「返回格式化好的字符串 + render 成文本块」，好读也好测。
  */
-import { humanDuration } from './models.mjs';
+import { humanDuration, toAdapterModels, effectiveCredits } from './models.mjs';
 
 /** 把一次调用包装成 TextBlock 数组。 */
 const asText = (value) => [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }];
@@ -37,6 +37,14 @@ const fmtTokens = (n) => (Number(n) >= 1000 ? `${(Number(n) / 1000).toFixed(1)}k
  */
 export function createTools(deps) {
   const { snapshot, supervisor, consoleSupervisor, client, adapter } = deps;
+  /**
+   * 已注册的账号分组（`[{ provider, supervisor, adapter, ... }]`）。
+   *
+   * 用于 restart 时**连分组桥一起重启** —— 桥是 detached 的、会活过 dsh 重启，
+   * 只重启主桥会让分组继续跑旧代码（两边行为不一致，极难排查）。缺省空数组，
+   * 单账号下行为与从前完全一致。
+   */
+  const groups = Array.isArray(deps.accountGroups) ? deps.accountGroups : [];
 
   const statusTool = textTool({
     name: 'workbuddy_status',
@@ -118,8 +126,20 @@ export function createTools(deps) {
         const bits = [];
         if (m.context_window) bits.push(`上下文 ${fmtTokens(m.context_window)}`);
         if (m.max_output_tokens) bits.push(`输出上限 ${fmtTokens(m.max_output_tokens)}`);
-        if (typeof m.credits === 'number') bits.push(m.credits === 0 ? '免费' : `倍率 ${m.credits}`);
-        if (m.supports_images) bits.push('支持图片');
+        // 能力/价格都必须走**生效值**（目录 + 用户的覆盖），不能直读桥的原始字段：
+        // 上游目录会漏报（国际版 deepseek-v4.1-flash 的 credits / supports_images /
+        // supports_reasoning 全都没有），直读会让这个工具报的和面板、选择器**相反** ——
+        // 用户看到工具说"不支持图片"，就以为手动声明没生效。
+        const eff = toAdapterModels([m], {
+          showCredits: false,
+          visionOverrides: adapter.visionOverrides,
+          reasoningOverrides: adapter.reasoningOverrides,
+          creditOverrides: adapter.creditOverrides,
+        })[0] || {};
+        const priced = effectiveCredits(m, adapter.creditOverrides);
+        if (typeof priced.credits === 'number') bits.push(priced.credits === 0 ? '免费' : `倍率 ${priced.credits}`);
+        if (eff.inputModalities && eff.inputModalities.includes('image')) bits.push('支持图片');
+        if (eff.reasoning === true) bits.push('支持推理等级');
         // 上游的 vendor 是单字母内部代号（f/e），对用户没有意义，不显示
         lines.push(`- ${m.id}（${m.name || m.id}）：${bits.join('，')}`);
       }
@@ -233,13 +253,52 @@ export function createTools(deps) {
         return `桥未运行（${probe.state}）：${probe.error || ''}`;
       }
       if (action === 'stop') {
+        // 主桥 + 全部分组桥：与 restart 对称。只停主桥会留下每个分组桥继续
+        // 占端口/进程（审计发现的不一致）。
         const result = await supervisor.stop(exec?.signal);
-        return result.ok ? (result.stopped ? '已停止桥。' : '桥本来就没在运行。') : `停止失败：${result.error}`;
+        adapter.invalidate();
+        const lines = [result.ok
+          ? (result.stopped ? `主账号：已停止（pid ${result.pid}）` : '主账号：本来就没在运行')
+          : `主账号：停止失败（${result.error}）`];
+        for (const g of groups) {
+          if (!g.supervisor) { lines.push(`${g.provider}：未注册，跳过`); continue; }
+          try {
+            const r = await g.supervisor.stop(exec?.signal);
+            if (g.adapter) g.adapter.invalidate();
+            lines.push(`${g.provider}：${r.ok ? (r.stopped ? `已停止（pid ${r.pid}）` : '本来就没在运行') : `停止失败（${r.error}）`}`);
+          } catch (err) {
+            lines.push(`${g.provider}：停止失败（${err.message}）`);
+          }
+        }
+        return `桥已停止：\n${lines.join('\n')}`;
       }
       if (action === 'restart') {
-        const result = await supervisor.ensure({ restart: true, signal: exec?.signal });
+        /**
+         * 重启**所有**桥：主账号 + 每个已注册的分组。
+         *
+         * 为什么必须带上分组：桥是 `detached` 起的，**故意活过 dsh 重启**
+         * （见 bridge.mjs 的说明）。于是"改了桥的代码 → 重启 dsh"并不会让桥
+         * 换代码 —— `ensure()` 看到端口上已有桥就 `reused: true` 直接复用。
+         * 实测踩过：插件侧改动已生效，但两个桥还是 7 小时前的旧进程，
+         * `/health` 里 `account` 为空、账本也没有 `acct` 字段。
+         *
+         * 只重启主桥更糟：用户会以为"重启过了"，而分组桥仍跑旧代码 ——
+         * 两个桥行为不一致，排查时极难想到。
+         */
+        const main = await supervisor.ensure({ restart: true, signal: exec?.signal });
         adapter.invalidate();
-        return result.ok ? `桥已重启：pid ${result.health?.pid}，地址 ${supervisor.baseUrl}/v1` : `重启失败：${result.error}`;
+        const lines = [`主账号：${main.ok ? `已重启（pid ${main.health?.pid}）` : `失败（${main.error}）`}`];
+        for (const g of groups) {
+          if (!g.supervisor) { lines.push(`${g.provider}：未注册，跳过`); continue; }
+          try {
+            const r = await g.supervisor.ensure({ restart: true, signal: exec?.signal });
+            if (g.adapter) g.adapter.invalidate();
+            lines.push(`${g.provider}：${r.ok ? `已重启（pid ${r.health?.pid}）` : `失败（${r.error}）`}`);
+          } catch (err) {
+            lines.push(`${g.provider}：失败（${err.message}）`);
+          }
+        }
+        return `桥已重启：\n${lines.join('\n')}`;
       }
       const result = await supervisor.ensure({ signal: exec?.signal });
       adapter.invalidate();

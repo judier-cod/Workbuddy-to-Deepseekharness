@@ -546,6 +546,69 @@ body.dark .wb-root,
       '）—— 桥不会主动打断，请检查客户端与上游': ') — the bridge never interrupts; check the client and the upstream',
       '\n（点击复制完整详情）': '\n(click to copy full details)',
       '点击复制完整详情': 'Click to copy full details',
+      // 账号 / 思考档位（多账号记账与推理等级功能新增）
+      '思考档位': 'Thinking effort',
+      '未标注': 'Unlabeled',
+      '未标注账号（旧记录）': 'Unlabeled (legacy records)',
+      '未标注（本次改动前的旧记录）': 'Unlabeled (records from before this change)',
+      // '默认' 已在上方（低/中/高 那组）有条目，这里不要重复 —— ESLint no-dupe-keys 会拦
+      '默认（未下发）': 'Default (not sent)',
+      '本次请求下发给上游的 reasoning_effort（选择器里选的「推理等级」）':
+        'reasoning_effort sent upstream for this request (the "Reasoning effort" picked in the selector)',
+      '未下发 reasoning_effort（用上游默认）': 'No reasoning_effort sent (upstream default)',
+
+      // ── 模型能力/价格覆盖（面板手动声明）──
+      '图片输入：': 'Image input: ',
+      '推理等级：': 'Reasoning effort: ',
+      '计费倍率：': 'Billing rate: ',
+      '已声明支持': 'Declared supported',
+      '不支持': 'Not supported',
+      '声明支持图片': 'Declare image support',
+      '声明支持推理': 'Declare reasoning support',
+      '取消声明': 'Revoke declaration',
+      '保存倍率': 'Save rate',
+      '恢复目录值': 'Reset to catalog',
+      '（手动指定，覆盖目录）': ' (manually set, overrides catalog)',
+      '上游目录没声明这个模型支持图片。若你在 WorkBuddy 客户端里能贴图，点上面的按钮手动声明即可。':
+        'The upstream catalog does not declare image support for this model. If you can attach images in the WorkBuddy client, use the button above to declare it manually.',
+      // 键必须与代码里**实际写的那一整串**完全一致（这里就是一个字符串字面量，
+      // 不能用 `+` 拼接 —— 对象字面量的键位置不允许表达式）
+      '上游目录没声明这个模型支持推理。实测国际版 deepseek-v4.1-flash 就是漏报（选 reasoning_effort=high 能正常返回）—— 点上面的按钮即可让选择器出现「推理等级」下拉。':
+        'The upstream catalog does not declare reasoning support for this model. The international deepseek-v4.1-flash under-reports this (reasoning_effort=high works) — use the button above to make the "Reasoning effort" dropdown appear.',
+      '倍率只能填 0 或正数（0 = 免费）。': 'The rate must be 0 or a positive number (0 = free).',
+      '各账号消耗（同一份账本，按账号拆分）': 'Usage by account (one shared ledger, split by account)',
+      '合计与上面的总数一致；各账号之和 = 总计。': 'The total matches above; the per-account sum equals the total.',
+      '各思考档位消耗': 'Usage by thinking effort',
+      '「默认」= 没下发 reasoning_effort，交给上游自己决定；与显式选 low 不是一回事。':
+        '"Default" = no reasoning_effort sent, left to the upstream; this is not the same as explicitly picking low.',
+
+      // ── 账号页 / 上下文覆盖（这些是**既有**的漏翻，i18n 门禁一直红着）──
+      '账号分组（同时在用）：': 'Account groups (in use): ',
+      '未被任何分组使用的账号：': 'Accounts not used by any group: ',
+      '多个账号**同时可用**，各自一组模型，不需要切换。模型选择器里 provider 选对应分组即可。':
+        'Multiple accounts are **available at the same time**, each with its own model group — no switching needed. Pick the matching group as the provider in the model selector.',
+      '想同时用它：在 cordis.patch.yml 的 workbuddy 条目里加一条 accounts（id / displayName / authFile / port），重启一次 dsh 即可。':
+        'To use it as well: add an accounts entry (id / displayName / authFile / port) under the workbuddy section of cordis.patch.yml, then restart dsh once.',
+      '复制项目路径': 'Copy project path',
+      '上下文上限': 'Context limit',
+      '上下文上限：': 'Context limit: ',
+      '不限': 'Unlimited',
+      '保存': 'Save',
+      '使用目录里的真实值': 'Use the real catalog value',
+      // 下面这些是**拼接串里的片段**（数字由 fmtInt 插进来），只能按前缀/子串译。
+      // 注意用**全角冒号**：代码里写的是 `失败：`，半角对不上（实测踩过）。
+      '生效 ': 'Effective ',
+      ' · 目录 ': ' · catalog ',
+      '（未压缩）': ' (uncompressed)',
+      ' —— 这是**上限**：只能压小，填大于目录值不会放大。':
+        ' — this is a **cap**: it can only lower, a value above the catalog will not raise it.',
+      '（已压小）': ' (reduced)',
+      '只填数字（token）。留空 = 用目录里的真实值。': 'Numbers only (tokens). Leave empty = use the real catalog value.',
+      '目录值 ': 'Catalog ',
+      '目录未提供': 'Catalog unavailable',
+      '未提供': 'unavailable',
+      '切换上下文档位失败：': 'Failed to switch context tier: ',
+      '登录文件 (未知) · 端口 ': 'auth file (unknown) · port ',
 
       // ── 签到 ──
       '每日签到': 'Daily check-in',
@@ -955,6 +1018,25 @@ body.dark .wb-root,
         (m, head, unit, pct) => head + ' ' + (unit === '次' ? 'calls' : 'credit') + ' (' + pct + '%)'],
       [/^(.+) · (.+) (次|积分)$/,
         (m, head, val, unit) => translateText(head) + ' · ' + val + ' ' + (unit === '次' ? 'calls' : 'credit')],
+
+      /*
+       * ── 上下文覆盖的拼接串（数字由 fmtInt 插进来，词条表够不着）──────
+       * 形如：`生效 1,000,000 tokens · 目录 1,000,000（未压缩） —— 这是**上限**：…`
+       * 必须放在通用冒号规则**之前**，否则会被它抢先切成两半。
+       */
+      [/^生效 (.+) tokens · 目录 (.+?)（(未压缩|已压小)）(.*)$/,
+        (m, eff, cat, state, tail) => 'Effective ' + eff + ' tokens · catalog ' + cat
+          + (state === '未压缩' ? ' (uncompressed)' : ' (reduced)')
+          + translateText(tail)],
+      // 没有状态后缀（eff !== catalog 之外的分支不该出现，但兜住）
+      [/^生效 (.+) tokens · 目录 (.+)$/,
+        (m, eff, cat) => 'Effective ' + eff + ' tokens · catalog ' + cat],
+      [/^勾选只作用于「(.+)」；\*\*上下文上限是全局的\*\*（所有分组共用一份）$/,
+        (m, who) => 'Checkboxes apply only to "' + translateText(who)
+          + '"; the **context limit is global** (shared by all groups)'],
+      [/^目录值 (.+)$/, (m, v) => 'Catalog ' + v],
+      [/^切换上下文档位失败：(.+)$/, (m, rest) => 'Failed to switch context tier: ' + translateText(rest)],
+      [/^登录文件 \(未知\) · 端口 (.+)$/, (m, port) => 'auth file (unknown) · port ' + port],
 
       /*
        * ── 最后兜底：最通用的两条 ────────────────────────────────────────
@@ -2129,8 +2211,19 @@ body.dark .wb-root,
           await reload();
           return;
         }
-        if (res.data?.ok === false) setMessage('刷新失败：' + (res.data?.quotaError || res.data?.error || res.status));
-        else setMessage('已刷新（' + fmtClock(Date.now()) + '）');
+        if (res.data?.ok === false) {
+          setMessage('刷新失败：' + (res.data?.quotaError || res.data?.error || res.status));
+        } else {
+          // 顺带报一下分组账号有几个没读成功 —— 只刷主账号却显示"已刷新"，
+          // 会让人以为下面的分组数字也是新的（它们可能各自失败）。
+          const groups = res.data?.groupQuotas || [];
+          const failed = groups.filter((g) => g.error);
+          setMessage('已刷新（' + fmtClock(Date.now()) + '）'
+            + (groups.length
+              ? `，含 ${groups.length} 个分组账号`
+                + (failed.length ? `（${failed.length} 个读取失败：${failed.map((g) => g.displayName).join('、')}）` : '')
+              : ''));
+        }
         reload();
       };
 
@@ -2365,6 +2458,57 @@ body.dark .wb-root,
               ? h(LineChart, { points, metric })
               : h(ModelBarChart, { models: usage?.models || [], metric })),
           h('p', { className: 'wb-note' }, '只记元数据（时间 / 模型 / 耗时 / token / 积分），不含任何对话内容。')),
+        /**
+         * 按账号拆分。多账号时两个桥写**同一个账本**，只有拆开才能回答
+         * "这个账号花了多少分" —— 否则看到的是两个账号的合计（旧版正是如此，
+         * 实测两个端口返回过完全一样的 total）。单账号下整块不渲染，不加噪音。
+         */
+        (usage?.accounts || []).length > 1
+          ? h(Card, { title: '各账号消耗（同一份账本，按账号拆分）' },
+            h('p', { className: 'wb-note', style: { marginTop: 0 } }, '合计与上面的总数一致；各账号之和 = 总计。'),
+            h('div', { className: 'wb-scroll' },
+              h('table', { className: 'wb-table' },
+                h('thead', null, h('tr', null,
+                  h('th', null, '账号'),
+                  h('th', { className: 'num' }, '调用'),
+                  h('th', { className: 'num' }, '失败'),
+                  h('th', { className: 'num' }, 'tokens'),
+                  h('th', { className: 'num' }, '积分'))),
+                h('tbody', null, (usage.accounts || []).map((a) => h('tr', { key: a.account },
+                  h('td', null, a.account === 'unknown'
+                    ? h('span', { className: 'wb-note', style: { margin: 0 } }, '未标注账号（本次改动前的旧记录）')
+                    : a.account),
+                  h('td', { className: 'num' }, fmtInt(a.calls)),
+                  h('td', { className: 'num' }, fmtInt(a.failed || 0)),
+                  h('td', { className: 'num' }, fmtTokens((a.promptTokens || 0) + (a.completionTokens || 0))),
+                  h('td', { className: 'num' }, typeof a.credit === 'number' ? a.credit.toFixed(2) : '0')))))))
+          : null,
+        /**
+         * 按思考档位拆分：回答"开 high 比不开发多花多少 token / 积分" ——
+         * 这是用户调那个旋钮时唯一想知道的事。只有真的用过档位才渲染
+         * （全都没下发时不显示，避免给不用推理的人加噪音）。
+         */
+        (usage?.efforts || []).length > 1
+          ? h(Card, { title: '各思考档位消耗' },
+            h('p', { className: 'wb-note', style: { marginTop: 0 } },
+              '「默认」= 没下发 reasoning_effort，交给上游自己决定；与显式选 low 不是一回事。'),
+            h('div', { className: 'wb-scroll' },
+              h('table', { className: 'wb-table' },
+                h('thead', null, h('tr', null,
+                  h('th', null, '思考档位'),
+                  h('th', { className: 'num' }, '次数'),
+                  h('th', { className: 'num' }, '输入 tokens'),
+                  h('th', { className: 'num' }, '输出 tokens'),
+                  h('th', { className: 'num' }, '积分'))),
+                h('tbody', null, (usage.efforts || []).map((e) => h('tr', { key: e.effort },
+                  h('td', null, e.effort === '(默认)'
+                    ? h('span', { className: 'wb-note', style: { margin: 0 } }, '默认（未下发）')
+                    : e.effort),
+                  h('td', { className: 'num' }, fmtInt(e.calls)),
+                  h('td', { className: 'num' }, fmtTokens(e.promptTokens || 0)),
+                  h('td', { className: 'num' }, fmtTokens(e.completionTokens || 0)),
+                  h('td', { className: 'num' }, typeof e.credit === 'number' ? e.credit.toFixed(2) : '0')))))))
+          : null,
         h(Card, { title: '积分花在哪些模型上' },
           h('div', { className: 'wb-scroll' },
             h('table', { className: 'wb-table' },
@@ -2443,6 +2587,11 @@ body.dark .wb-root,
       const [limit, setLimit] = useState(40);
       const [onlyFailed, setOnlyFailed] = useState(false);
       const [modelFilter, setModelFilter] = useState('');
+      /**
+       * 账号筛选。多账号时两个桥写**同一个账本**，不筛就分不清某条记录是谁的
+       * —— 实测两个账号的汇总数字曾经完全一样（读的本来就是同一份文件）。
+       */
+      const [acctFilter, setAcctFilter] = useState('');
       const [paused, setPaused] = useState(false);
       const { data, error, reload, loading } = useJson(`/workbuddy/requests?limit=${limit}`, { interval: paused ? 0 : 5000 });
       // 筛选下拉要用**完整目录**，不能只用当前这页里出现过的模型 ——
@@ -2455,8 +2604,16 @@ body.dark .wb-root,
         for (const r of all) if (r.model && !seen.has(r.model)) { seen.add(r.model); fromDirectory.push(r.model); }
         return fromDirectory;
       }, [directory, all]);
+      /** 当前这页里出现过的账号（保持稳定顺序）。 */
+      const accounts = useMemo(() => {
+        const seen = new Set();
+        for (const r of all) if (r.acct) seen.add(r.acct);
+        return [...seen];
+      }, [all]);
       if (isInitialLoading(loading, data, error)) return h(Card, { title: '最近请求' }, h(Loading, { text: '正在读取请求记录…' }));
-      const rows = all.filter((r) => (!onlyFailed || !r.ok) && (!modelFilter || r.model === modelFilter));
+      const rows = all.filter((r) => (!onlyFailed || !r.ok)
+        && (!modelFilter || r.model === modelFilter)
+        && (!acctFilter || r.acct === acctFilter));
       const failLabel = (r) => `失败${r.status ? ' HTTP ' + r.status : ''}${r.code ? ' · code ' + r.code : ''}`;
       return h(Card, { title: '最近请求' },
         error ? h(Alert, { bad: true }, error) : null,
@@ -2472,6 +2629,17 @@ body.dark .wb-root,
               ],
             }),
             h('label', { className: 'wb-check' }, h('input', { type: 'checkbox', checked: onlyFailed, onChange: (e) => setOnlyFailed(e.target.checked) }), `仅看失败（${all.filter((r) => !r.ok).length}）`),
+            // 账号筛选只在真的有多账号时出现：单账号下多一个下拉纯属噪音
+            accounts.length > 1
+              ? h(DropdownSelect, {
+                value: acctFilter,
+                onChange: (e) => setAcctFilter(e.target.value),
+                options: [
+                  { value: '', label: `全部账号（${accounts.length}）` },
+                  ...accounts.map((a) => ({ value: a, label: a === 'unknown' ? '未标注账号（旧记录）' : a })),
+                ],
+              })
+              : null,
             h(Segmented, {
               value: String(limit),
               onChange: (e) => setLimit(Number(e.target.value)),
@@ -2485,17 +2653,35 @@ body.dark .wb-root,
           h('div', { className: 'wb-actions-group' },
             h(Btn, { onClick: reload }, '刷新'),
             h(Btn, { onClick: () => downloadCsv('workbuddy-requests.csv',
-              ['time', 'model', 'stream', 'ok', 'ms', 'promptTokens', 'completionTokens', 'credit', 'status', 'code', 'error'],
-              rows.map((r) => [new Date(r.t).toISOString(), r.model, r.stream ? 1 : 0, r.ok ? 1 : 0, r.ms, r.promptTokens || 0, r.completionTokens || 0, r.credit || 0, r.status || '', r.code || '', r.error || ''])) }, '导出当前筛选 CSV'))),
+              ['time', 'account', 'model', 'effort', 'stream', 'ok', 'ms', 'promptTokens', 'completionTokens', 'credit', 'status', 'code', 'error'],
+              rows.map((r) => [new Date(r.t).toISOString(), r.acct || 'unknown', r.model, r.effort || '', r.stream ? 1 : 0, r.ok ? 1 : 0, r.ms, r.promptTokens || 0, r.completionTokens || 0, r.credit || 0, r.status || '', r.code || '', r.error || ''])) }, '导出当前筛选 CSV'))),
         h('div', { className: 'wb-scroll' },
           h('table', { className: 'wb-table' },
             h('thead', null, h('tr', null,
-              h('th', null, '时间'), h('th', null, '模型'), h('th', null, '流式'), h('th', { className: 'num' }, '耗时'),
+              h('th', null, '时间'), h('th', null, '账号'), h('th', null, '模型'),
+              // 思考档位：用户唯一能调的"质量/成本"旋钮，原来完全看不到 ——
+              // 没法核对"我在选择器里选了 high，到底发出去了没有"。
+              h('th', { title: '本次请求下发给上游的 reasoning_effort（选择器里选的「推理等级」）' }, '思考档位'),
+              // 「流式」列已去掉：dsh 走这个桥时**恒为流式**，整列每行都一样，
+              // 是纯噪音（用户实拍指出）。真要看它在 CSV 导出里仍然保留 ——
+              // 那是给数据分析用的，多一列不影响阅读。
+              h('th', { className: 'num' }, '耗时'),
               h('th', { className: 'num' }, 'in'), h('th', { className: 'num' }, 'out'), h('th', { className: 'num' }, '积分'), h('th', null, '结果'))),
             h('tbody', null, rows.map((r, i) => h('tr', { key: i, className: r.ok ? '' : 'bad' },
               h('td', { title: fmtTime(r.t) }, fmtClock(r.t)),
+              // 旧记录没有账号标签：显示"未标注"而不是空白 —— 空白看着像渲染坏了，
+              // 而"未标注"明确告诉用户这是本次改动之前的历史。
+              h('td', { title: r.acct || 'unknown' },
+                (!r.acct || r.acct === 'unknown')
+                  ? h('span', { className: 'wb-note', style: { margin: 0 } }, '未标注')
+                  : r.acct),
               h('td', null, r.model),
-              h('td', null, r.stream ? '是' : '否'),
+              // 思考档位：空串 = 本次没下发 reasoning_effort（交给上游默认）。
+              // 与"显式选了 low"区分开显示 —— 两者语义不同，合并会误导。
+              h('td', { title: r.effort ? 'reasoning_effort=' + r.effort : '未下发 reasoning_effort（用上游默认）' },
+                r.effort
+                  ? h('span', { className: 'wb-pill' }, h('span', { className: 'wb-dot ok' }), r.effort)
+                  : h('span', { className: 'wb-note', style: { margin: 0 } }, '默认')),
               h('td', { className: 'num' }, fmtInt(r.ms) + ' ms'),
               h('td', { className: 'num' }, fmtTokens(r.promptTokens || 0)),
               h('td', { className: 'num' }, fmtTokens(r.completionTokens || 0)),
@@ -2794,62 +2980,208 @@ body.dark .wb-root,
       const consoleReady = probesApi.availability.state === 'ok';
       const resultOf = (id) => results[id];
 
-      // ── 图片能力覆盖 ────────────────────────────────────────────────────
+      // ── 布尔能力覆盖（图片输入 / 推理等级）──────────────────────────────
       /**
-       * 上游目录会漏报多模态能力（实测国际版账号下 deepseek-v4.1-flash 的
-       * supports_images 为空，但该模型确实能看图）。这里给一个手动声明入口，
-       * 否则用户在 DSH 里贴不了图。
+       * 上游目录**会漏报**模型能力，两个已知实例：
+       *   - `supports_images`：实测国际版 deepseek-v4.1-flash 为空（国内版 true），
+       *     但该模型确实能看图 —— 不声明，用户贴了图会被 dsh 静默降级成占位文字。
+       *   - `supports_reasoning`：实测国内版带该字段（true），国际版同一模型整个
+       *     字段都没有 —— 而实测国际版接受 reasoning_effort=high 并返回 200。
+       *     不声明，选择器就没有「推理等级」下拉。
+       *
+       * 形状完全一致（模型 id → true/false，按 provider 分桶），所以用**一个**
+       * 工厂产出两套状态与编辑器 —— 复制成两份迟早分叉（可见性/倍率上各踩过一次）。
+       *
+       * 按 provider 分开：能力是账号维度属性（国内版已声明、国际版漏报）。
+       * 切换分组时重新读该组自己的覆盖，否则会把上一组的声明显示到当前组
+       * （显示串味），保存时也会写错地方。
        */
-      const visionApi = useJson('/workbuddy/vision-overrides', { interval: 60000 });
-      const [visionOverrides, setVisionOverrides] = useState(null);
-      const [visionLoaded, setVisionLoaded] = useState(false);
-      const [visionSaving, setVisionSaving] = useState(false);
-      useEffect(() => {
-        if (!visionLoaded && visionApi.data && visionApi.data.ok) {
-          setVisionOverrides(visionApi.data.overrides || {});
-          setVisionLoaded(true);
-        }
-      }, [visionApi.data, visionLoaded]);
-      /** 生效的图片能力：覆盖优先，否则看目录。 */
-      const visionOf = (m) => {
-        const o = visionOverrides?.[m.id];
-        if (typeof o === 'boolean') return o;
-        return m.images === true;
+      const makeCapability = (kind, labels) => {
+        const api = useJson(`/workbuddy/${kind}-overrides${providerQuery}`, { interval: 60000 });
+        const [overrides, setOverrides] = useState(null);
+        const [loaded, setLoaded] = useState(false);
+        const [saving, setSaving] = useState(false);
+        useEffect(() => {
+          if (!loaded && api.data && api.data.ok && providerMatches(api.data)) {
+            setOverrides(api.data.overrides || {});
+            setLoaded(true);
+          }
+        }, [api.data, loaded]);
+        /** 切换分组：丢弃上一组的缓存，重新读当前组的。 */
+        useEffect(() => { setLoaded(false); setOverrides(null); }, [activeProvider]);
+        /** 生效值：覆盖优先，否则看目录。 */
+        const valueOf = (m) => {
+          const o = overrides?.[m.id];
+          if (typeof o === 'boolean') return o;
+          return m[labels.catalogField] === true;
+        };
+        const toggle = async (id) => {
+          const next = { ...(overrides || {}) };
+          const current = valueOf(models.find((x) => x.id === id) || { id });
+          /*
+           * 这里**曾经是** `if (current === true) next[id] = false; else delete next[id];`
+           * —— 那是个永久性死按钮：`next[id]` 只会被赋 `false` 或删除，**永远不会
+           * 变成 `true`**。而"目录漏报、还没有覆盖"正是本功能要解决的场景
+           * （`current === false`）→ 走 else → `delete` 一个本来就不存在的键 →
+           * POST 出去 `{}` → 后端毫无变化，但提示条照样说"已声明"。
+           *
+           * 也就是说：用户点"声明支持图片"永远无效，且被成功提示误导。实测过
+           * 端到端：点击后 payload=`{}`、`adapter.visionOverrides` 仍是 `{}`、
+           * `inputModalities` 仍是 `["text"]`。
+           *
+           * 正确语义是**二态切换**：当前生效为 true → 显式声明 false（压掉目录
+           * 误报）；否则 → 显式声明 true（补上目录漏报）。
+           */
+          if (current === true) next[id] = false; else next[id] = true;
+          setSaving(true);
+          // 带上 provider：多账号下必须写明改的是哪一组，否则会写到主 provider 上
+          const res = await postJson(`/workbuddy/${kind}-overrides${providerQuery}`, { overrides: next });
+          setSaving(false);
+          if (res.data?.ok) {
+            // 对账：确认写回的是**当前查看的这一组**（与 model-visibility 同一套判据）
+            const echoed = res.data.provider;
+            if (echoed !== undefined && echoed !== null && echoed !== '' && echoed !== activeProvider) {
+              setMessage(`保存异常：回显的是「${echoed}」，与当前分组「${activeProvider || '主'}」不一致，请刷新页面重试。`);
+              return;
+            }
+            setOverrides(res.data.overrides || {});
+            setMessage(`已${current === true ? '取消' : '声明'}「${id}」的${labels.noun}。`
+              + (res.data.applied ? ' dsh 已即时刷新。' : '（此 dsh 版本不支持即时刷新，重启一次后生效。）'));
+          } else {
+            setMessage(`保存${labels.noun}失败：` + (res.data?.error || res.status));
+          }
+        };
+        /**
+         * 单个模型的能力开关（放在详情区）。
+         * 只在"目录与覆盖不一致"或"目录没声明"时给提示 —— 目录已声明支持的
+         * 模型不需要用户操心。
+         */
+        const editorFor = (m) => {
+          const on = valueOf(m);
+          const overridden = typeof overrides?.[m.id] === 'boolean';
+          return h('div', { style: { marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--dsw-alias-border-l3, #e5e7eb)' } },
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
+              h('span', { className: 'wb-note', style: { margin: 0 } }, labels.title),
+              h(Pill, { tone: on ? 'ok' : 'warn', text: on ? '已声明支持' : '不支持' }),
+              h(Btn, { disabled: saving, onClick: () => toggle(m.id) }, on ? '取消声明' : labels.declare),
+              overridden ? h('span', { className: 'wb-note', style: { margin: 0 } }, '（手动指定，覆盖目录）') : null),
+            overridden || m[labels.catalogField]
+              ? null
+              : h('p', { className: 'wb-note', style: { margin: '6px 0 0' } }, labels.hint));
+        };
+        return { editorFor };
       };
-      const toggleVision = async (id) => {
-        const next = { ...(visionOverrides || {}) };
-        const current = visionOf(models.find((x) => x.id === id) || { id });
-        if (current === true) next[id] = false; else delete next[id];
-        setVisionSaving(true);
-        const res = await postJson('/workbuddy/vision-overrides', { overrides: next });
-        setVisionSaving(false);
+
+      const visionCap = makeCapability('vision', {
+        title: '图片输入：',
+        noun: '图片能力',
+        declare: '声明支持图片',
+        catalogField: 'images',
+        hint: '上游目录没声明这个模型支持图片。若你在 WorkBuddy 客户端里能贴图，点上面的按钮手动声明即可。',
+      });
+      const reasoningCap = makeCapability('reasoning', {
+        title: '推理等级：',
+        noun: '推理能力',
+        declare: '声明支持推理',
+        catalogField: 'reasoning',
+        hint: '上游目录没声明这个模型支持推理。实测国际版 deepseek-v4.1-flash 就是漏报'
+          + '（选 reasoning_effort=high 能正常返回）—— 点上面的按钮即可让选择器出现「推理等级」下拉。',
+      });
+      const visionEditorFor = visionCap.editorFor;
+      const reasoningEditorFor = reasoningCap.editorFor;
+
+      // ── 倍率覆盖 ────────────────────────────────────────────────────────
+      /**
+       * 上游目录会漏报倍率：实测国际版目录里 `deepseek-v4.1-flash` **连 `credits`
+       * 字段都没有**（国内版同一模型给 0.11），而它实际免费 —— 实测国际版调用
+       * 成功且余额恒为 0（0 分也能调通）。漏报的后果是展示名光秃秃没有价，
+       * 用户既怕贵不敢用、又不知道它免费。
+       *
+       * **按 provider 分开**：倍率是账号维度属性（国际版免费 ≠ 国内版 0.11×），
+       * 用一份全局覆盖会把国内版也标成免费 —— 那比不标更糟。
+       */
+      const creditApi = useJson(`/workbuddy/credit-overrides${providerQuery}`, { interval: 60000 });
+      const [creditOverrides, setCreditOverrides] = useState(null);
+      const [creditLoaded, setCreditLoaded] = useState(false);
+      const [creditSaving, setCreditSaving] = useState(false);
+      const [creditDraft, setCreditDraft] = useState({});
+      useEffect(() => {
+        if (!creditLoaded && creditApi.data && creditApi.data.ok && providerMatches(creditApi.data)) {
+          setCreditOverrides(creditApi.data.overrides || {});
+          setCreditLoaded(true);
+        }
+      }, [creditApi.data, creditLoaded]);
+      /** 切换分组：丢弃上一组的倍率缓存，重新读当前组的。 */
+      useEffect(() => { setCreditLoaded(false); setCreditOverrides(null); setCreditDraft({}); }, [activeProvider]);
+      /** 生效的倍率：覆盖优先，否则看目录。 */
+      const creditOf = (m) => {
+        const o = creditOverrides?.[m.id];
+        if (typeof o === 'number') return o;
+        return typeof m.credits === 'number' ? m.credits : null;
+      };
+      const saveCredit = async (id, raw) => {
+        const next = { ...(creditOverrides || {}) };
+        if (raw === '') delete next[id];
+        else {
+          const n = Number(raw);
+          // 只收非负数：0 = 免费。负数/NaN 一律拒绝（标错价比不标价更糟）
+          if (!Number.isFinite(n) || n < 0) {
+            setMessage('倍率只能填 0 或正数（0 = 免费）。');
+            return;
+          }
+          next[id] = n;
+        }
+        setCreditSaving(true);
+        const res = await postJson(`/workbuddy/credit-overrides${providerQuery}`, { overrides: next });
+        setCreditSaving(false);
         if (res.data?.ok) {
-          setVisionOverrides(res.data.overrides || {});
-          setMessage(`已${current === true ? '取消' : '声明'}「${id}」的图片能力。`
+          const echoed = res.data.provider;
+          if (echoed !== undefined && echoed !== null && echoed !== '' && echoed !== activeProvider) {
+            setMessage(`保存异常：回显的是「${echoed}」，与当前分组「${activeProvider || '主'}」不一致，请刷新页面重试。`);
+            return;
+          }
+          setCreditOverrides(res.data.overrides || {});
+          setCreditDraft((d) => { const c = { ...d }; delete c[id]; return c; });
+          setMessage(raw === '' ? `已恢复「${id}」的目录倍率。` : `已把「${id}」的倍率标为 ${raw === '0' ? '免费' : raw + '×'}。`
             + (res.data.applied ? ' dsh 已即时刷新。' : '（此 dsh 版本不支持即时刷新，重启一次后生效。）'));
         } else {
-          setMessage('保存图片能力失败：' + (res.data?.error || res.status));
+          setMessage('保存倍率失败：' + (res.data?.error || res.status));
         }
       };
       /**
-       * 单个模型的图片能力开关（放在详情区，在上下文编辑之上）。
+       * 单个模型的计费倍率编辑器（放在详情区，紧跟在图片能力之上）。
        *
-       * 只在"目录与覆盖不一致"或"目录没声明"时提示 —— 目录已声明支持的模型
-       * 不需要用户操心。
+       * 目录没给倍率（`m.credits === null`）时才强调"未知" —— 那是用户最需要
+       * 手动补的情况（国际版 deepseek-v4.1-flash 正是如此）。
        */
-      const visionEditorFor = (m) => {
-        const on = visionOf(m);
-        const overridden = typeof visionOverrides?.[m.id] === 'boolean';
+      const creditEditorFor = (m) => {
+        const effective = creditOf(m);
+        const overridden = typeof creditOverrides?.[m.id] === 'number';
+        const draft = creditDraft[m.id] !== undefined ? creditDraft[m.id] : '';
         return h('div', { style: { marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--dsw-alias-border-l3, #e5e7eb)' } },
           h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
-            h('span', { className: 'wb-note', style: { margin: 0 } }, '图片输入：'),
-            h(Pill, { tone: on ? 'ok' : 'warn', text: on ? '已声明支持' : '不支持' }),
-            h(Btn, { disabled: visionSaving, onClick: () => toggleVision(m.id) }, on ? '取消声明' : '声明支持图片'),
+            h('span', { className: 'wb-note', style: { margin: 0 } }, '计费倍率：'),
+            h(Pill, {
+              tone: effective === 0 ? 'ok' : (effective === null ? 'warn' : 'ok'),
+              text: effective === 0 ? '免费' : (effective === null ? '目录未报' : effective + '×'),
+            }),
+            h('input', {
+              className: 'wb-input',
+              style: { width: '90px' },
+              type: 'number', min: '0', step: '0.01',
+              placeholder: effective === null ? '如 0' : String(effective),
+              value: draft,
+              disabled: creditSaving,
+              onChange: (e) => setCreditDraft((d) => ({ ...d, [m.id]: e.target.value })),
+              onKeyDown: (e) => { if (e.key === 'Enter') saveCredit(m.id, draft); },
+            }),
+            h(Btn, { disabled: creditSaving, onClick: () => saveCredit(m.id, draft) }, '保存倍率'),
+            overridden ? h(Btn, { disabled: creditSaving, onClick: () => saveCredit(m.id, '') }, '恢复目录值') : null,
             overridden ? h('span', { className: 'wb-note', style: { margin: 0 } }, '（手动指定，覆盖目录）') : null),
-          overridden || m.images
-            ? null
-            : h('p', { className: 'wb-note', style: { margin: '6px 0 0' } },
-              '上游目录没声明这个模型支持图片。若你在 WorkBuddy 客户端里能贴图，点上面的按钮手动声明即可。'));
+          effective === null
+            ? h('p', { className: 'wb-note', style: { margin: '6px 0 0' } },
+              '上游目录没报这个模型的倍率。填 0 表示免费（适用国际版 deepseek-v4.1-flash：实测调用成功且不扣分）。')
+            : null);
       };
 
       // ── 上下文上限覆盖 ──────────────────────────────────────────────────
@@ -3061,10 +3393,17 @@ body.dark .wb-root,
                 options: providerChoices,
               })),
             h('div', { className: 'wb-actions-group' },
+              /*
+               * 这里必须**分别说明**：勾选（可见清单）是**按分组**存的
+               * （visibleByProvider），而上下文上限是**全局一份**（context 键，
+               * 所有分组共用）。原来一句话说"勾选与上限只作用于当前分组"，
+               * 对上限而言是假的 —— 用户以为给国际版单独压了上限，实际国内版
+               * 一起变了（或反之）。审计把这条列为"文案与实现不符"。
+               */
               h('span', { className: 'wb-note', style: { margin: 0 } },
-                '下面的勾选与上限只作用于「'
+                '勾选只作用于「'
                 + (providerChoices.find((p) => p.value === viewProvider)?.label || '当前分组')
-                + '」，其它分组互不影响')))
+                + '」；**上下文上限是全局的**（所有分组共用一份）')))
           : null,
         h('p', { className: 'wb-note', style: { marginTop: 0 } },
           '模型列表来自桥的动态目录，不需要勾选或保存：选模型时 provider 选 “WorkBuddy” 就能看到全部。体检结论存在 .state.json 的 probe 字段，与控制器共用一份。'),
@@ -3196,6 +3535,8 @@ body.dark .wb-root,
                       probe && probe.ok === false && probe.error ? h('p', { className: 'wb-note', style: { margin: '8px 0 0' } }, '体检错误：' + probe.error) : null,
                       m.description ? h('p', { className: 'wb-note', style: { margin: '8px 0 0' } }, m.description) : null,
                       visionEditorFor(m),
+                      reasoningEditorFor(m),
+                      creditEditorFor(m),
                       contextEditorFor(m),
                       h('div', { className: 'wb-actions', style: { marginTop: '10px' } },
                         h(Btn, { onClick: () => onUseModel(m.id) }, '用这个模型对话 →'),

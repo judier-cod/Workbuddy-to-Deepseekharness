@@ -51,6 +51,11 @@ export function createRouteTable(deps) {
   // onWritePrefs / writeXxxPrefs 一律经 deps 取用（它们要带 provider 参数），
   // 因此这里不解构 —— 解构出来只会是个未使用的变量（ESLint no-unused-vars）。
   const { snapshot, supervisor, consoleSupervisor, client, adapter, paths, provider, log, onUpstreamMutation = () => {}, notifyAdaptersUpdated = () => false } = deps;
+  /**
+   * 已注册的账号分组。restart / stop 要**连分组桥一起**处理：桥是 detached 的、
+   * 故意活过 dsh 重启，只管主桥会让分组继续跑旧代码（两边行为不一致）。
+   */
+  const accountGroups = Array.isArray(deps.accountGroups) ? deps.accountGroups : [];
 
   /** 写操作的准入检查。 */
   const guard = (req) => req.headers['x-workbuddy-panel'] === '1';
@@ -92,7 +97,17 @@ export function createRouteTable(deps) {
           if (req.method === 'POST') {
             if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-workbuddy-panel header' });
             const snap = await snapshot({ quota: true });
-            return sendJson(res, 200, { ok: snap.quota?.ok !== false, quota: snap.quota, quotaError: snap.quotaError, at: snap.quotaAt, refreshed: true });
+            // 一并回传分组账号的积分：面板靠它如实说明"这次刷了几个账号、
+            // 哪几个失败"。少了这个字段，前端只能含糊地报"已刷新"，
+            // 而分组可能一个都没读到（用户以为都刷新了）。
+            return sendJson(res, 200, {
+              ok: snap.quota?.ok !== false,
+              quota: snap.quota,
+              quotaError: snap.quotaError,
+              at: snap.quotaAt,
+              groupQuotas: snap.groupQuotas || [],
+              refreshed: true,
+            });
           }
           if (readOnly(req, res)) return;
           const snap = await snapshot({});
@@ -124,10 +139,17 @@ export function createRouteTable(deps) {
           // 返回**归一化后**的目录（contextWindow/maxTokens/images/free…），
           // 不退上游原始字段名（context_window/max_output_tokens）：
           // 面板与其它消费者只认一种形状，免得两处各说一套。
+          // images / credits 都必须带上该 provider 的覆盖 —— 否则面板显示的
+          // 能力与价格会和 dsh 实际收到的（inputModalities / 展示名）对不上
+          // （见 toDirectory 注释）。
           sendJson(res, 200, {
             ok: true,
             provider: target.id,
-            models: toDirectory(catalog),
+            models: toDirectory(catalog, {
+              visionOverrides: target.adapter.visionOverrides,
+              reasoningOverrides: target.adapter.reasoningOverrides,
+              creditOverrides: target.adapter.creditOverrides,
+            }),
             at: target.adapter.catalogCache.at,
             error: target.adapter.catalogError || '',
           });
@@ -204,12 +226,21 @@ export function createRouteTable(deps) {
              * 语义是**上限** —— 只压小、不放大，所以 "1M" 等于"不限制"
              * （目录里没有超过 1M 的模型）。0 / 缺省 = 不限。
              */
+            /*
+             * 上下文上限是**全局**设置（不按 provider 分桶），所以必须同时写进
+             * 主 adapter 与每个分组 adapter —— 否则面板上改完只对主账号生效，
+             * 分组要等 dsh 重启才跟上（启动时 index.js 会统一派发一次）。
+             * 审计把这条列为"文案说是当前分组、实现却是全局"的不一致。
+             *
+             * 目标集 = 主 adapter + 已注册分组里那些真的持有 adapter 的。
+             */
+            const targets = [adapter, ...accountGroups.filter((g) => g.adapter).map((g) => g.adapter)];
             if (body?.maxTokens !== undefined) {
-              adapter.setContextMaxTokens(body.maxTokens);
+              for (const a of targets) a.setContextMaxTokens(body.maxTokens);
             }
             // overrides 显式给了才动它 —— 只切档位时不该把逐模型覆盖抹掉
             const touchesOverrides = body?.overrides !== undefined;
-            if (touchesOverrides) adapter.setContextOverrides(raw);
+            if (touchesOverrides) for (const a of targets) a.setContextOverrides(raw);
             const applied = typeof deps.writeContextPrefs === 'function'
               ? deps.writeContextPrefs(
                 touchesOverrides ? adapter.contextOverrides : undefined,
@@ -221,6 +252,8 @@ export function createRouteTable(deps) {
               ok: true,
               overrides: adapter.contextOverrides,
               maxTokens: adapter.contextMaxTokens,
+              // 让前端/用户能看出这次改了哪几个（全局设置应当命中全部）
+              appliedTo: targets.length,
               persisted: applied,
               applied: broadcast,
             });
@@ -243,26 +276,85 @@ export function createRouteTable(deps) {
        * 为什么需要：上游目录会漏报多模态能力（实测国际版账号下
        * `deepseek-v4.1-flash` 的 supports_images 为空，但该模型确实能看图）。
        * 不手动声明，用户在这个模型下就贴不了图。
+       *
+       * **按 provider 分开**（与 /credit-overrides 同构）：图片能力是账号维度
+       * 属性 —— 国内版目录已声明 true、国际版漏报，一份全局覆盖会让两边互相
+       * 串味。缺省（不传 provider）落在主 provider 上。
        */
       kind: 'exact',
       path: '/workbuddy/vision-overrides',
       async handler(req, res) {
         try {
+          const url = new URL(req.url, 'http://127.0.0.1');
+          const asked = String(url.searchParams.get('provider') || '').trim();
+          const target = deps.resolveProvider ? deps.resolveProvider(asked) : null;
+          if (!target) {
+            return sendJson(res, 400, { ok: false, error: `未知 provider：${asked || '(空)'}` });
+          }
           if (req.method === 'POST') {
             if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-workbuddy-panel header' });
             const body = await readJsonBody(req);
             const raw = body?.overrides && typeof body.overrides === 'object' && !Array.isArray(body.overrides)
               ? body.overrides
               : {};
-            adapter.setVisionOverrides(raw);
+            target.adapter.setVisionOverrides(raw);
             const persisted = typeof deps.writeVisionPrefs === 'function'
-              ? deps.writeVisionPrefs(adapter.visionOverrides)
+              ? deps.writeVisionPrefs(target.id, target.adapter.visionOverrides)
               : false;
             const applied = notifyAdaptersUpdated();
-            return sendJson(res, 200, { ok: true, overrides: adapter.visionOverrides, persisted, applied });
+            return sendJson(res, 200, {
+              ok: true, provider: target.id, overrides: target.adapter.visionOverrides, persisted, applied,
+            });
           }
           if (readOnly(req, res)) return;
-          sendJson(res, 200, { ok: true, overrides: adapter.visionOverrides || {} });
+          sendJson(res, 200, {
+            ok: true, provider: target.id, overrides: target.adapter.visionOverrides || {},
+          });
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: String(error?.message || error) });
+        }
+      },
+    },
+    {
+      /**
+       * 推理能力覆盖：GET 读当前值，POST 写并即时生效。
+       *
+       * 与 /vision-overrides 完全同源的坑：上游目录会漏报 `supports_reasoning`。
+       * 实测国内版 `deepseek-v4.1-flash` 带该字段（true），国际版同一模型连
+       * 这个字段都没有 —— 而实测国际版接受 `reasoning_effort: "high"` 并返回
+       * 200。不手动声明，dsh 的选择器就没有「推理等级」下拉。
+       *
+       * **按 provider 分开**（与 vision / credit 同构）：能力是账号维度属性。
+       */
+      kind: 'exact',
+      path: '/workbuddy/reasoning-overrides',
+      async handler(req, res) {
+        try {
+          const url = new URL(req.url, 'http://127.0.0.1');
+          const asked = String(url.searchParams.get('provider') || '').trim();
+          const target = deps.resolveProvider ? deps.resolveProvider(asked) : null;
+          if (!target) {
+            return sendJson(res, 400, { ok: false, error: `未知 provider：${asked || '(空)'}` });
+          }
+          if (req.method === 'POST') {
+            if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-workbuddy-panel header' });
+            const body = await readJsonBody(req);
+            const raw = body?.overrides && typeof body.overrides === 'object' && !Array.isArray(body.overrides)
+              ? body.overrides
+              : {};
+            target.adapter.setReasoningOverrides(raw);
+            const persisted = typeof deps.writeReasoningPrefs === 'function'
+              ? deps.writeReasoningPrefs(target.id, target.adapter.reasoningOverrides)
+              : false;
+            const applied = notifyAdaptersUpdated();
+            return sendJson(res, 200, {
+              ok: true, provider: target.id, overrides: target.adapter.reasoningOverrides, persisted, applied,
+            });
+          }
+          if (readOnly(req, res)) return;
+          sendJson(res, 200, {
+            ok: true, provider: target.id, overrides: target.adapter.reasoningOverrides || {},
+          });
         } catch (error) {
           sendJson(res, 500, { ok: false, error: String(error?.message || error) });
         }
@@ -406,14 +498,39 @@ export function createRouteTable(deps) {
             return sendJson(res, 200, { ok: result.ok, action, result });
           }
           if (action === 'stop') {
+            // 主桥 + 全部分组桥：桥是 detached 的，只停主桥会留下每个分组桥
+            // 继续占端口/进程 —— 与 restart 的语义必须对称（审计发现的不一致）。
             const result = await supervisor.stop();
             adapter.invalidate();
-            return sendJson(res, 200, { ok: result.ok, action, result });
+            const groups = [];
+            for (const g of accountGroups) {
+              if (!g.supervisor) { groups.push({ provider: g.provider, ok: false, error: '未注册' }); continue; }
+              try {
+                const r = await g.supervisor.stop();
+                if (g.adapter) g.adapter.invalidate();
+                groups.push({ provider: g.provider, ok: r.ok, stopped: !!r.stopped, error: r.error || '' });
+              } catch (err) {
+                groups.push({ provider: g.provider, ok: false, error: String(err?.message || err) });
+              }
+            }
+            return sendJson(res, 200, { ok: result.ok, action, result, groups });
           }
           if (action === 'restart') {
+            // 主桥 + 全部分组桥：桥是 detached 的，重启 dsh 不会让它们换代码
             const result = await supervisor.ensure({ restart: true });
             adapter.invalidate();
-            return sendJson(res, 200, { ok: result.ok, action, result });
+            const groups = [];
+            for (const g of accountGroups) {
+              if (!g.supervisor) { groups.push({ provider: g.provider, ok: false, error: '未注册' }); continue; }
+              try {
+                const r = await g.supervisor.ensure({ restart: true });
+                if (g.adapter) g.adapter.invalidate();
+                groups.push({ provider: g.provider, ok: r.ok, pid: r.health?.pid, error: r.error || '' });
+              } catch (err) {
+                groups.push({ provider: g.provider, ok: false, error: String(err?.message || err) });
+              }
+            }
+            return sendJson(res, 200, { ok: result.ok, action, result, groups });
           }
           const probe = await supervisor.probe();
           return sendJson(res, 200, { ok: true, action: 'status', result: probe });
