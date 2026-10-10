@@ -19,6 +19,28 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **`imageRequestPricing is not a function` —— workbuddy 路由在计量环节崩溃**
+  （`dsh-plugin/lib/adapter.mjs`）。dsh 的 token meter 对每条注册路由**无条件**调用
+  `adapter.imageRequestPricing(provider, model)`：
+
+  ```js
+  return this.adapters.get(provider)?.adapter.imageRequestPricing(provider, model);
+  ```
+
+  `?.` 只保护了路由查不到的情况，没保护「适配器对象缺这个方法」。基类 `LlmAdapter`
+  本来用空默认实现兜底（契约见 `docs/dsh-llm-adapter-contract.md` 第 53 行，
+  dsh-llm/lib/index.js:1697），但 `WorkBuddyAdapter` 是普通 class、按设计**不继承基类**
+  （宿主端不 import 任何 `@deepseek-ai/*` 包），兜底不生效，于是抛
+  `TypeError`，整条 workbuddy 路由只要走到计量就挂。
+
+  补上该方法返回 `undefined`，即契约定义的「本路由不声明图片计价」语义：调用方回退到
+  自己的中立估算，桥不做 vision token 精算，上报的真实 usage 仍是权威值。
+  已逐条核对 dsh 对 `adapter.*` 的 7 处调用点，其余 5 个方法本就齐全，只缺这一个。
+  补回归测试锁住契约（缺方法会先变红），并在 README「实现要点」记下这条 ——
+  原先那段只提 `providerInfo` / `providerRetryPolicy`，正是本bug 的认知盲区。
+
 ## [1.4.5] - 2026-10-09
 
 ### Fixed
