@@ -19,6 +19,8 @@
 
 ## [Unreleased]
 
+## [1.4.6] - 2026-10-11
+
 ### Fixed
 
 - **`imageRequestPricing is not a function` —— workbuddy 路由在计量环节崩溃**
