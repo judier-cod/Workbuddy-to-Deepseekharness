@@ -1841,6 +1841,61 @@ test('分组标签会重算并刷新展示名（回归：创建时的标签被�
 });
 
 /**
+ * 快照里的 `label` 必须是**字符串**，不能是内部缓存对象。
+ *
+ * 回归（用户实测："插件打不开了"）：缓存里存的是 `{mtime, label}`，而快照那行
+ * 直接读了缓存对象塞进响应 —— 面板把它当 React 子节点渲染时抛错，**整个面板
+ * 白屏**。React 的渲染期异常不进 `window.onerror`，所以界面上连一句错误都
+ * 看不到，只有"打不开"。
+ *
+ * 这条断言所有对外字段的类型：它们是**跨进程契约**，一个对象的形状错了就会在
+ * 完全无关的地方炸。
+ */
+test('快照的账号标签必须是字符串（回归：把缓存对象当 label 返回 → 面板白屏）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wb-labeltype-'));
+  try {
+    // 手写分组：authFile 指向一个**真实存在**的登录文件，好让 resolveGroupLabel 走完
+    const authPath = join(dir, 'custom.info');
+    writeFileSync(authPath, JSON.stringify({
+      account: { uin: '450702377403', phoneNumber: '19900001111' },
+      auth: { domain: 'www.workbuddy.ai', expiresAt: Date.now() + 864e5 },
+    }), 'utf8');
+
+    const { ctx } = fakeCtx();
+    const result = apply(ctx, {
+      projectRoot: dir, dshHome: dir, accountWatchMs: 0,
+      autoStart: false, consoleAutoStart: false, migrateLegacy: false,
+      tools: false, commands: false, routes: false,
+      accounts: [{ id: 'custom', displayName: 'Custom', authFile: authPath, port: 8791 }],
+      accountProviderPrefix: 'workbuddy-',
+    });
+    result.supervisor.probe = async () => ({ state: 'stopped' });
+
+    // 连打两次：第二次会命中缓存 —— 缓存路径正是当初出错的地方
+    const first = await result.snapshot({});
+    const second = await result.snapshot({});
+
+    for (const [tag, snap] of [['首次', first], ['缓存命中', second]]) {
+      for (const g of snap.accountGroups) {
+        assert.equal(typeof g.label, 'string',
+          `${tag}：分组 ${g.provider} 的 label 必须是字符串，实际 ${typeof g.label}（${JSON.stringify(g.label)}）`);
+        assert.equal(typeof g.uin, 'string', `${tag}：uin 必须是字符串`);
+        assert.equal(typeof g.displayName, 'string', `${tag}：displayName 必须是字符串`);
+      }
+      if (snap.bridgeIdentity) {
+        assert.equal(typeof snap.bridgeIdentity.label, 'string',
+          `${tag}：bridgeIdentity.label 必须是字符串，实际 ${typeof snap.bridgeIdentity.label}`);
+      }
+    }
+    // 缓存命中时也要拿到**具体的标签**（而不是空串或对象）
+    const custom = second.accountGroups.find((g) => g.provider === 'workbuddy-custom');
+    assert.equal(custom.label, '199****1111', '缓存命中时标签必须仍是脱敏字符串');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
  * 账号"升格"为主账号时，它的分组必须被撤销。
  *
  * 回归（用户实测）：在客户端切走 A、再切回 A 之后，面板显示 4 行而实际只有 3 个

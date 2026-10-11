@@ -1975,7 +1975,7 @@ export function apply(ctx, rawConfig = {}) {
          * 它们的凭据在**客户端**登录目录，不经过纳管流程，所以原先那一行只有
          * uin。用 `readAuthIdentity()` 读它自己的 authFile 拿到标签。
          */
-        label: g.label || (g.authFile ? (identityCache.get(g.authFile) ?? resolveGroupLabel(g)) : ''),
+        label: g.label || (g.authFile ? resolveGroupLabel(g) : ''),
         registered: g.registered,
         error: g.error,
       })),
