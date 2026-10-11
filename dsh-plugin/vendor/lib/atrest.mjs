@@ -12,7 +12,7 @@
  * the app that wrote the file.
  */
 import { execFile } from 'node:child_process';
-import { createDecipheriv, createHash } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { probeSystemSignalsExe, workBuddyExeCandidates } from './find-workbuddy.mjs';
 
@@ -65,6 +65,43 @@ export function isEncryptedFieldWrapper(value) {
 function envelopeKeyId(field) {
   const record = JSON.parse(Buffer.from(field.envelope, 'base64').toString('utf8'));
   return typeof record.keyId === 'string' ? record.keyId : undefined;
+}
+
+/**
+ * Seal one field into the same at-rest envelope format the desktop app writes.
+ *
+ * Why this exists: the account-login module obtains tokens through the official
+ * CLI OAuth flow and must persist them. The project's red line forbids writing
+ * **plaintext** credentials (that is what corrupts the client's store), so the
+ * tokens are sealed with the very same AES-256-GCM field envelope the client
+ * uses. The bridge then opens them with its existing `openEncryptedField()`
+ * path — no bridge change, and no plaintext ever touches disk.
+ *
+ * The key still comes from `fetchKeyPayload()` at runtime; no key material is
+ * bundled here, so a machine without the client installed cannot seal (and
+ * therefore cannot use the login module). See the design doc's risk section.
+ *
+ * @param {string} plaintext value to seal
+ * @param {Buffer} key 32-byte field key from {@link deriveAtRestKey}
+ * @param {number} [suite] envelope suite byte; 1 matches observed client files
+ * @returns {{ $wbEncrypted: 1, envelope: string }}
+ */
+export function sealEncryptedField(plaintext, key, suite = 1) {
+  const keyId = deriveAtRestKeyId(key);
+  const nonce = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, nonce, { authTagLength: 16 });
+  cipher.setAAD(fieldAad(keyId, suite));
+  const ciphertext = Buffer.concat([cipher.update(Buffer.from(String(plaintext), 'utf8')), cipher.final()]);
+  return {
+    $wbEncrypted: 1,
+    envelope: Buffer.from(JSON.stringify({
+      suite,
+      keyId,
+      nonce: nonce.toString('base64'),
+      authTag: cipher.getAuthTag().toString('base64'),
+      ciphertext: ciphertext.toString('base64'),
+    })).toString('base64'),
+  };
 }
 
 /** 32-byte field key derived from the app's key payload JSON. */

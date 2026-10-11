@@ -134,6 +134,49 @@ export async function probeModel(model, timeoutMs = 20000) {
 }
 
 /**
+ * 列出插件**自己纳管**的账号（`$DSH_HOME/workbuddy-accounts/*.info`）。
+ *
+ * 与 {@link listAccounts} 的区别：那份是客户端登录目录里的快照，这份是插件走
+ * 官方 OAuth 自己拿到并加密保存的凭据。来源与寿命都不同（纳管的约 30 天），
+ * 所以分开列，不混进同一张表。
+ *
+ * 只返回非敏感元数据（uid / 域 / 有效期），不含任何凭据内容。
+ *
+ * @param {string} [dshHome] 默认取 config.dsh.home
+ * @returns {Array<{uid: string, path: string, domain: string, expiresAt: number, remainingMs: number, expired: boolean}>}
+ */
+export function listManagedAccounts(dshHome = config.dsh.home) {
+  const dir = join(dshHome, 'workbuddy-accounts');
+  let names = [];
+  try {
+    names = readdirSync(dir).filter((f) => f.endsWith('.info'));
+  } catch {
+    return []; // 目录还没建：等于没有纳管账号
+  }
+  const out = [];
+  for (const name of names) {
+    const path = join(dir, name);
+    try {
+      const raw = JSON.parse(readFileSync(path, 'utf8'));
+      // 只认插件自己纳管的（`managed: true`），不碰该目录下任何别的东西
+      if (!raw.managed) continue;
+      const expiresAt = Number(raw.auth?.expiresAt || 0);
+      out.push({
+        uid: name.replace(/\.info$/i, ''),
+        path,
+        domain: raw.auth?.domain || '',
+        expiresAt,
+        remainingMs: expiresAt - Date.now(),
+        expired: expiresAt > 0 && expiresAt < Date.now(),
+      });
+    } catch {
+      /* 单个文件坏了不影响列其它 */
+    }
+  }
+  return out;
+}
+
+/**
  * 列出登录目录下的**全部**账号快照及其可用性。
  *
  * 与 {@link credentialStatus} 的区别：后者只看当前生效的那一个，这里会逐个

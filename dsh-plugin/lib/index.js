@@ -36,6 +36,7 @@ import { WorkBuddyAdapter } from './adapter.mjs';
 import { toDirectory, pickDefaultModel } from './models.mjs';
 import { createTools } from './tools.mjs';
 import { createRouteTable, mountRoutes } from './routes.mjs';
+import { listManagedAccounts } from './login.mjs';
 import { cleanLegacyRoutes, detectLegacyRoutes } from './legacy.mjs';
 
 export const name = 'workbuddy';
@@ -1107,6 +1108,28 @@ export function apply(ctx, rawConfig = {}) {
    */
   const accountGroups = [];
   state.accountGroups = accountGroups;
+
+  // 插件自己纳管的账号（设置页「添加账号」走 OAuth 拿到的）与 cordis.patch.yml
+  // 里手写的 accounts 合并 —— 用户不必为了用纳管账号再去改配置文件。
+  //
+  // 合并而非替换：手写的配置是**显式意图**，纳管的是**运行时新增**，两者可以
+  // 共存。asAccounts() 会去重 id 与端口，所以重复配置不会撞车。
+  try {
+    const managed = listManagedAccounts(dshPaths.home);
+    if (managed.length) {
+      config.accounts = asAccounts([
+        ...config.accounts.map((a) => ({ id: a.id, displayName: a.displayName, authFile: a.authFile, port: a.port, token: a.token })),
+        ...managed.map((a) => ({
+          id: `m${a.uid.slice(0, 8)}`,
+          displayName: `纳管账号 ${a.uid.slice(0, 8)}`,
+          authFile: a.path,
+        })),
+      ], config.accountProviderPrefix, config.bridgePort);
+      log(`并入 ${managed.length} 个纳管账号`);
+    }
+  } catch (error) {
+    log('读取纳管账号失败（不影响手写配置）', error);
+  }
 
   for (const account of config.accounts) {
     const group = {

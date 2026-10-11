@@ -15,6 +15,7 @@ import { writeFileSync } from 'node:fs';
 import { cleanLegacyRoutes, detectLegacyRoutes } from './legacy.mjs';
 import { toDirectory } from './models.mjs';
 import { createConsoleApiHandler, CONSOLE_API_PREFIX } from './consoleApi.mjs';
+import { cancelLogin, listManagedAccounts, pollLogin, REGIONS, removeManagedAccount, startLogin } from './login.mjs';
 
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
 
@@ -592,6 +593,56 @@ export function createRouteTable(deps) {
       kind: 'prefix',
       path: CONSOLE_API_PREFIX,
       handler: createConsoleApiHandler({ consoleSupervisor, log, onUpstreamMutation }),
+    },
+    // ── 账号登录（官方 CLI OAuth） ──────────────────────────────────────
+    // 令牌只在宿主端进程内存里走一趟，封成 AtRest 信封后落盘；**任何接口都不
+    // 回传令牌**，返回的只有账号标识与有效期等非敏感元数据。
+    {
+      kind: 'exact',
+      path: '/workbuddy/login',
+      async handler(req, res) {
+        try {
+          if (req.method === 'GET') {
+            if (readOnly(req, res)) return;
+            // 只读：列出已纳管账号 + 受支持的区域，供面板渲染
+            return sendJson(res, 200, {
+              ok: true,
+              regions: Object.values(REGIONS).map((r) => ({ id: r.id, label: r.label })),
+              accounts: listManagedAccounts(paths.home),
+            });
+          }
+          if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'GET or POST only' });
+          if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-workbuddy-panel header' });
+          const body = await readJsonBody(req);
+          const action = String(body?.action || '');
+          if (action === 'start') {
+            const result = await startLogin({ dshHome: paths.home, region: body?.region });
+            if (!result.ok) return sendJson(res, 200, { ok: false, error: result.error });
+            return sendJson(res, 200, { ok: true, id: result.id, authUrl: result.authUrl });
+          }
+          if (action === 'poll') {
+            const result = await pollLogin(String(body?.id || ''));
+            return sendJson(res, 200, { ok: result.status !== 'error', ...result });
+          }
+          if (action === 'cancel') {
+            cancelLogin(String(body?.id || ''));
+            return sendJson(res, 200, { ok: true, cancelled: true });
+          }
+          if (action === 'remove') {
+            const result = removeManagedAccount(paths.home, String(body?.uid || ''));
+            if (result.ok) {
+              log('已移除纳管账号', String(body?.uid || ''));
+              // 拓扑变了：让模型选择器重拉（分组数量可能随之变化）
+              notifyAdaptersUpdated();
+            }
+            return sendJson(res, 200, result);
+          }
+          return sendJson(res, 400, { ok: false, error: `未知动作：${action || '(空)'}` });
+        } catch (error) {
+          log('login action failed', error);
+          sendJson(res, 500, { ok: false, error: String(error?.message || error) });
+        }
+      },
     },
   ];
 }

@@ -587,9 +587,32 @@ body.dark .wb-root,
       '未被任何分组使用的账号：': 'Accounts not used by any group: ',
       '多个账号**同时可用**，各自一组模型，不需要切换。模型选择器里 provider 选对应分组即可。':
         'Multiple accounts are **available at the same time**, each with its own model group — no switching needed. Pick the matching group as the provider in the model selector.',
-      '想同时用它：在 cordis.patch.yml 的 workbuddy 条目里加一条 accounts（id / displayName / authFile / port），重启一次 dsh 即可。':
-        'To use it as well: add an accounts entry (id / displayName / authFile / port) under the workbuddy section of cordis.patch.yml, then restart dsh once.',
+      '想同时用它：在 cordis.patch.yml 的 workbuddy 条目里加一条 accounts（id / displayName / authFile / port），重启一次 dsh 即可；也可以在下面的「纳管账号」里直接登录一个新账号。':
+        'To use it as well: add an accounts entry (id / displayName / authFile / port) under the workbuddy section of cordis.patch.yml and restart dsh once — or simply sign in a new account under "Managed accounts" below.',
       '复制项目路径': 'Copy project path',
+
+      // ── 纳管账号（插件自己走 OAuth 登录） ──────────────────────────────
+      '纳管账号': 'Managed accounts',
+      '正在读取纳管账号…': 'Loading managed accounts…',
+      '客户端登录目录里的账号由**客户端**写入，登第二个国内版账号会覆盖同一个文件。这里可以再登录一个账号：插件自己走官方授权拿到令牌，存成独立的加密凭据，与客户端的互不影响。':
+        'Accounts in the client login directory are written **by the client**, and signing in a second domestic account overwrites the same file. You can sign in another account here: the plugin completes the official authorization itself and stores an independent encrypted credential that does not interfere with the client.',
+      '凭据为 AtRest 加密信封、权限 0600，存在 dsh 目录下（不在仓库里）。受上游令牌有效期限制，约 **30 天**需重新登录一次。':
+        'Credentials are stored as at-rest encrypted envelopes with mode 0600 under the dsh directory (never inside the repo). Upstream token lifetime requires re-signing in roughly every **30 days**.',
+      '添加账号（国内版）': 'Add account (domestic)',
+      '正在发起…': 'Starting…',
+      '取消登录': 'Cancel sign-in',
+      '请在浏览器里完成授权，完成后本页会自动更新。': 'Complete the authorization in your browser; this page updates automatically once done.',
+      '已取消登录。': 'Sign-in cancelled.',
+      '登录成功。新账号已注册为独立分组，**重启一次 dsh** 后出现在模型选择器里。':
+        'Signed in. The new account is registered as its own group — **restart dsh once** for it to appear in the model selector.',
+      '已纳管账号：': 'Managed accounts: ',
+      '确认移除该账号的登录凭据？该账号的分组将不再可用（客户端的登录不受影响）。':
+        'Remove this account’s stored credential? Its group will stop working (the desktop client sign-in is unaffected).',
+      '移除中…': 'Removing…',
+      '移除': 'Remove',
+      '发起登录失败': 'Failed to start sign-in',
+      '登录未完成': 'Sign-in did not complete',
+      '移除失败': 'Failed to remove',
       '上下文上限': 'Context limit',
       '上下文上限：': 'Context limit: ',
       '不限': 'Unlimited',
@@ -2280,6 +2303,130 @@ body.dark .wb-root,
      * （提示可以去配置里加一条 accounts）。切换入口仍保留在控制台网页里
      * （那是单账号视角的旧功能，不在这条多账号路径上）。
      */
+    /**
+     * 纳管账号 —— 插件自己走官方 OAuth 登录拿到的账号。
+     *
+     * 为什么要单独一块：客户端登录目录里的快照是**客户端写的**，登第二个国内版
+     * 账号会覆盖同一个文件；纳管账号是插件自己登录、自己持有的凭据，两者来源
+     * 不同、寿命不同（纳管的有 30 天上限），混在一张列表里说不清楚。
+     */
+    function ManagedAccountsPanel({ reloadAll }) {
+      const { data, error, loading, reload } = useJson('/workbuddy/login', { interval: 60000 });
+      const [busy, setBusy] = useState(false);
+      const [phase, setPhase] = useState('idle'); // idle | waiting | done
+      const [loginId, setLoginId] = useState('');
+      const [authUrl, setAuthUrl] = useState('');
+      const [message, setMessage] = useState('');
+      const [removing, setRemoving] = useState('');
+
+      const accounts = data?.accounts || [];
+      const regions = data?.regions || [];
+
+      const post = async (body) => {
+        const res = await fetch('/workbuddy/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-workbuddy-panel': '1' },
+          body: JSON.stringify(body),
+        });
+        return res.json().catch(() => ({ ok: false, error: '宿主返回了非 JSON 响应' }));
+      };
+
+      /** 轮询：真正打上游的节流在宿主端，这里只管按节奏问。 */
+      const startPolling = (id) => {
+        setPhase('waiting');
+        const timer = setInterval(async () => {
+          const r = await post({ action: 'poll', id });
+          if (r.status === 'done') {
+            clearInterval(timer);
+            setPhase('done');
+            setMessage('登录成功。新账号已注册为独立分组，**重启一次 dsh** 后出现在模型选择器里。');
+            reload();
+            reloadAll?.();
+          } else if (r.status === 'error' || r.status === 'expired') {
+            clearInterval(timer);
+            setPhase('idle');
+            setMessage(r.error || '登录未完成');
+          }
+        }, 3000);
+      };
+
+      const begin = async () => {
+        setBusy(true);
+        setMessage('');
+        const r = await post({ action: 'start', region: 'cn' });
+        setBusy(false);
+        if (!r.ok) { setMessage(r.error || '发起登录失败'); return; }
+        setLoginId(r.id);
+        setAuthUrl(r.authUrl);
+        if (r.authUrl && typeof window !== 'undefined') window.open(r.authUrl, '_blank', 'noopener');
+        startPolling(r.id);
+      };
+
+      const cancel = async () => {
+        if (loginId) await post({ action: 'cancel', id: loginId });
+        setPhase('idle');
+        setMessage('已取消登录。');
+      };
+
+      const remove = async (uid) => {
+        setRemoving(uid);
+        const r = await post({ action: 'remove', uid });
+        setRemoving('');
+        setMessage(r.ok ? `已移除账号 ${uid.slice(0, 8)}…。重启 dsh 后分组消失。` : (r.error || '移除失败'));
+        if (r.ok) { reload(); reloadAll?.(); }
+      };
+
+      if (isInitialLoading(loading, data, error)) {
+        return h(Card, { title: '纳管账号' }, h(Loading, { text: '正在读取纳管账号…' }));
+      }
+
+      return h(Card, { title: '纳管账号' },
+        error ? h(Alert, { bad: true }, error) : null,
+        h('p', { className: 'wb-note', style: { marginTop: 0 } },
+          '客户端登录目录里的账号由**客户端**写入，登第二个国内版账号会覆盖同一个文件。'
+          + '这里可以再登录一个账号：插件自己走官方授权拿到令牌，存成独立的加密凭据，'
+          + '与客户端的互不影响。'),
+        h('p', { className: 'wb-note' },
+          '凭据为 AtRest 加密信封、权限 0600，存在 dsh 目录下（不在仓库里）。'
+          + '受上游令牌有效期限制，约 **30 天**需重新登录一次。'),
+
+        // ── 添加账号 ────────────────────────────────────────────────────
+        h('div', { className: 'wb-actions', style: { marginTop: '10px' } },
+          phase === 'waiting'
+            ? h(Btn, { onClick: cancel }, '取消登录')
+            : h(Btn, { primary: true, disabled: busy || !regions.length, onClick: begin },
+              busy ? '正在发起…' : '添加账号（国内版）')),
+
+        phase === 'waiting' ? h('div', { style: { marginTop: '8px' } },
+          h(Alert, null, '请在浏览器里完成授权，完成后本页会自动更新。'),
+          authUrl ? h('p', { className: 'wb-note', style: { wordBreak: 'break-all' } },
+            h('a', { href: authUrl, target: '_blank', rel: 'noopener' }, authUrl)) : null) : null,
+
+        message ? h(Alert, { bad: /失败|错误|超时/.test(message) }, message) : null,
+
+        // ── 已纳管账号 ──────────────────────────────────────────────────
+        accounts.length
+          ? h('div', { style: { marginTop: '12px' } },
+            h('p', { className: 'wb-note', style: { margin: '0 0 4px' } }, '已纳管账号：'),
+            ...accounts.map((a) => h('div', { key: a.uid, className: 'wb-account' + (a.expired ? ' bad' : '') },
+              h('div', { className: 'wb-account-head' },
+                h('b', { title: a.path }, a.uid.slice(0, 8) + '…'),
+                h(Pill, { tone: a.expired ? 'bad' : 'ok', text: a.expired ? '已过期' : '可用' })),
+              h('div', { className: 'wb-note', style: { margin: '4px 0 0' } },
+                (a.domain || '(未知域)') + ' · 剩余 '
+                + (a.expiresAt ? fmtRemaining(a.expiresAt) : '未知')),
+              h('div', { className: 'wb-actions', style: { marginTop: '4px' } },
+                h(Btn, {
+                  disabled: removing === a.uid,
+                  onClick: () => {
+                    // 危险动作二次确认：删掉的是这个账号的登录凭据
+                    if (typeof window !== 'undefined' && !window.confirm('确认移除该账号的登录凭据？该账号的分组将不再可用（客户端的登录不受影响）。')) return;
+                    remove(a.uid);
+                  },
+                }, removing === a.uid ? '移除中…' : '移除')))))
+          : null);
+    }
+
     function AccountsPanel({ onStartConsole, busy, reloadStatus, status: pluginStatus }) {
       const api = useConsoleApi(CONSOLE_API + '/accounts', { interval: 30000 });
       const { data, error, status, reload } = api;
@@ -2354,10 +2501,13 @@ body.dark .wb-root,
                 '剩余 ' + (a.expiresAt ? fmtRemaining(a.expiresAt) : '未知')
                 + ' · 凭据 ' + (a.encrypted ? 'AtRest 信封' : '明文')))) ,
             h('p', { className: 'wb-note', style: { margin: '6px 0 0' } },
-              '想同时用它：在 cordis.patch.yml 的 workbuddy 条目里加一条 accounts（id / displayName / authFile / port），重启一次 dsh 即可。'),
+              '想同时用它：在 cordis.patch.yml 的 workbuddy 条目里加一条 accounts（id / displayName / authFile / port），重启一次 dsh 即可；'
+              + '也可以在下面的「纳管账号」里直接登录一个新账号。'),
             h('div', { className: 'wb-actions', style: { marginTop: '6px' } },
               h(Btn, { onClick: openConfig }, '复制项目路径')))
           : null,
+
+        h(ManagedAccountsPanel, { reloadAll: () => { reload(); reloadStatus?.(); } }),
 
         // 不可用的账号把原因**写在页面上**，不要只藏在 tooltip 里
         accounts.some((a) => !a.usable)

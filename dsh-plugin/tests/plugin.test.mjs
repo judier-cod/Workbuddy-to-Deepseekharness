@@ -414,12 +414,12 @@ test('apply() 装配：注册 llm 路由、5 个工具、命令、HTTP 路由', 
     }
     assert.equal(calls.commands.length, 1);
     assert.equal(calls.commands[0].name, 'workbuddy');
-    assert.equal(calls.routes.length, 16, 'HTTP 数据面应有 16 条路由（15 条 exact + 1 条 console-api 前缀）');
+    assert.equal(calls.routes.length, 17, 'HTTP 数据面应有 17 条路由（16 条 exact + 1 条 console-api 前缀）');
     assert.deepEqual(calls.routes.map((r) => r.path).sort(), [
       '/workbuddy/bridge', '/workbuddy/checkin', '/workbuddy/console', '/workbuddy/console-api', '/workbuddy/context-overrides',
-      '/workbuddy/credit-overrides', '/workbuddy/log', '/workbuddy/migrate', '/workbuddy/model-visibility', '/workbuddy/models',
-      '/workbuddy/quota', '/workbuddy/reasoning-overrides', '/workbuddy/requests', '/workbuddy/status', '/workbuddy/usage',
-      '/workbuddy/vision-overrides',
+      '/workbuddy/credit-overrides', '/workbuddy/log', '/workbuddy/login', '/workbuddy/migrate', '/workbuddy/model-visibility',
+      '/workbuddy/models', '/workbuddy/quota', '/workbuddy/reasoning-overrides', '/workbuddy/requests', '/workbuddy/status',
+      '/workbuddy/usage', '/workbuddy/vision-overrides',
     ]);
     const prefix = calls.routes.find((r) => r.path === '/workbuddy/console-api');
     assert.equal(prefix.kind, 'prefix', 'console-api 必须挂成前缀路由');

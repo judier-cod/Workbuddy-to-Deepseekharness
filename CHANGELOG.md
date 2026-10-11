@@ -19,6 +19,46 @@
 
 ## [Unreleased]
 
+### Added
+
+- **账号登录模块：在设置页直接登录第二个国内版账号**
+  （设计文档 `docs/2026-10-11-account-login-module-design.md`）。
+
+  起因：国内版客户端把登录态写死在
+  `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`，
+  文件名是常量 —— **登第二个国内版账号会覆盖第一个**，所以「同时用两个不同的
+  国内版账号」在只读客户端快照的旧设计下做不到（只能靠"登录 → 复制 → 再登录"
+  的变通，且副本不会自刷新）。
+
+  现在设置页 → 账号 → **添加账号（国内版）** 走官方 CLI OAuth 自己拿令牌：
+
+  ```
+  POST /v2/plugin/auth/state?platform=CLI&nonce=   → { state, authUrl }
+  浏览器打开 authUrl 授权
+  GET  /v2/plugin/auth/token?state=   →  11217 等待 / code 0 成功
+  ```
+
+  成功后令牌封成 **AtRest 加密信封**写入 `$DSH_HOME/workbuddy-accounts/<uid>.info`
+  （权限 `0600`，与客户端登录文件同款格式），并自动注册成独立账号分组。
+
+  **桥零改动**：产出的是它本来就认的加密信封。已端到端验证——用真实令牌封装的
+  纳管文件起桥，`/health` 正确读出 `userId` 与 `endpoint`。
+
+  关键取舍与边界：
+  - **不是明文落盘**。项目红线禁的是明文（明文会破坏客户端加密存储），这里用的
+    是与客户端同款的 AES-256-GCM 字段信封，新增 `sealEncryptedField()` 实现。
+  - **约 30 天需重新登录一次**。桥的 `persistRefreshed()` 是故意的 no-op，
+    刷新只留内存，因此纳管副本不会自刷新（access 28 天 / refresh 30 天）。
+  - **只做国内版**。国际版成功态响应未实测，不做没验证过的东西。
+  - **不做账号池化 / 轮换 / 限流跳过**（项目红线）。
+  - 密钥仍向客户端**现取**、不内置副本，因此本机未装 WorkBuddy 客户端时该模块
+    不可用（会如实报错而不是写出解不开的文件）。
+
+### Changed
+
+- 账号页文案：原先只提示「去 `cordis.patch.yml` 加一条 accounts」，现在如实说明
+  也可以直接用下面的「纳管账号」登录一个新账号。
+
 ## [1.4.6] - 2026-10-11
 
 ### Fixed
