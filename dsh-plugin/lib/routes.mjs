@@ -15,7 +15,7 @@ import { writeFileSync } from 'node:fs';
 import { cleanLegacyRoutes, detectLegacyRoutes } from './legacy.mjs';
 import { toDirectory } from './models.mjs';
 import { createConsoleApiHandler, CONSOLE_API_PREFIX } from './consoleApi.mjs';
-import { cancelLogin, listManagedAccounts, pollLogin, REGIONS, removeManagedAccount, startLogin } from './login.mjs';
+import { cancelLogin, createIdentityDecoder, listManagedAccounts, pollLogin, REGIONS, removeManagedAccount, startLogin } from './login.mjs';
 
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
 
@@ -60,6 +60,14 @@ export function createRouteTable(deps) {
 
   /** 写操作的准入检查。 */
   const guard = (req) => req.headers['x-workbuddy-panel'] === '1';
+
+  /**
+   * 账号标签解密的惰性单例（见 `/workbuddy/login` 的 GET）。
+   *
+   * 为什么是单例而不是每次新建：内部的密钥要**现取并常驻缓存**（取一次要拉起
+   * 一次客户端二进制）。每次新建等于每次都重新取钥。
+   */
+  let decodeOnce = null;
 
   /**
    * 只读路由的方法守门：只允许 GET/HEAD。
@@ -604,11 +612,21 @@ export function createRouteTable(deps) {
         try {
           if (req.method === 'GET') {
             if (readOnly(req, res)) return;
-            // 只读：列出已纳管账号 + 受支持的区域，供面板渲染
+            /*
+             * 只读：列出已纳管账号 + 受支持的区域，供面板渲染。
+             *
+             * 账号标签（手机号/邮箱）在文件里是**加密信封**，要解密才能显示 ——
+             * 密钥现取自客户端，首次可能要等一次 client 拉起。因此这里先
+             * `warmup()`（不阻塞），本轮先用明文 uin 兜底，下一轮就是完整标签：
+             * 打开面板时不该为 340ms 的客户端拉起卡住首帧。
+             */
+            decodeOnce = decodeOnce || createIdentityDecoder();
+            const decoder = await decodeOnce;
+            void decoder.warmup();
             return sendJson(res, 200, {
               ok: true,
               regions: Object.values(REGIONS).map((r) => ({ id: r.id, label: r.label })),
-              accounts: listManagedAccounts(paths.home),
+              accounts: listManagedAccounts(paths.home, { decrypt: decoder.decrypt }),
             });
           }
           if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'GET or POST only' });

@@ -18,9 +18,13 @@ import {
   archiveSnapshot,
   cancelLogin,
   listManagedAccounts,
+  maskEmail,
+  maskIdentity,
+  maskPhone,
   pollLogin,
   REGIONS,
   removeManagedAccount,
+  resolveAccountLabel,
   startLogin,
 } from '../lib/login.mjs';
 
@@ -339,4 +343,125 @@ test('自动存档：原子写，不留临时文件', () => {
   assert.deepEqual(readdirSync(adir), [`${uid}.info`]);
   // 内容必须是**完整** JSON（原子写的目的就是读者永远看到完整文件）
   assert.ok(JSON.parse(readFileSync(join(adir, `${uid}.info`), 'utf8')).managed);
+});
+
+// ── 账号标签脱敏 ────────────────────────────────────────────────────────
+/*
+ * 这些字段会进**截图**（docs/*.png，公开仓库）、日志与诊断报告，所以脱敏是安全
+ * 相关代码，不是显示偏好。用户的要求是"一眼认出是哪个账号"，所以可见位数不能
+ * 太少（都显示成 `1***0` 就分不清了），但也不能泄露完整号码。
+ */
+
+test('maskPhone：保留前 3 后 4，中间固定星号', () => {
+  assert.equal(maskPhone('19157621006'), '191****1006');
+  assert.equal(maskPhone('18505580760'), '185****0760');
+  // 太短的不掩（没什么可掩的，原样更好认）
+  assert.equal(maskPhone('123'), '123');
+  assert.equal(maskPhone(''), '');
+});
+
+test('maskEmail：本地部分前 2 后 2，域名保留，星号数固定', () => {
+  assert.equal(maskEmail('a3236792972@gmail.com'), 'a3****72@gmail.com');
+  assert.equal(maskEmail('ab@x.com'), 'a*@x.com');
+  // 域名必须保留 —— 用户靠它区分国内版/国际版
+  assert.ok(maskEmail('someone@workbuddy.ai').endsWith('@workbuddy.ai'));
+  // 星号数固定（不随长度增长），否则窄列会被撑宽
+  const longLocal = maskEmail('aaaaaaaaaaaaaaaaaaaaaaa@x.com').split('@')[0];
+  assert.equal((longLocal.match(/\*/g) || []).length, 4, `星号数必须固定：${longLocal}`);
+});
+
+test('maskIdentity：按形状判，不按字段名（昵称里可能就是手机号/邮箱）', () => {
+  assert.equal(maskIdentity('19157621006'), '191****1006');
+  assert.equal(maskIdentity('a3236792972@gmail.com'), 'a3****72@gmail.com');
+  // 真昵称不是 PII，原样保留（打码反而更难认）
+  assert.equal(maskIdentity('局第二'), '局第二');
+  assert.equal(maskIdentity('jiale'), 'jiale');
+  assert.equal(maskIdentity(''), '');
+});
+
+test('resolveAccountLabel：手机号 → 邮箱 → 昵称 → uin', () => {
+  // ① 手机号优先（明文形式）
+  assert.deepEqual(
+    resolveAccountLabel({ account: { phoneNumber: '19157621006', nickname: '局第二', uin: '3301' } }, null),
+    { label: '191****1006', full: '19157621006', kind: 'phone' });
+  // ② 没手机号 → 昵称当邮箱（国际版就是这样，昵称字段里是邮箱）
+  assert.deepEqual(
+    resolveAccountLabel({ account: { nickname: 'a3236792972@gmail.com', uin: '4507' } }, null),
+    { label: 'a3****72@gmail.com', full: 'a3236792972@gmail.com', kind: 'email' });
+  // ③ 昵称是普通人名 → 原样
+  assert.deepEqual(
+    resolveAccountLabel({ account: { nickname: '局第二', uin: '3301' } }, null),
+    { label: '局第二', full: '局第二', kind: 'nickname' });
+  // ④ 什么都解不出 → 退回明文 uin（**绝不返回空**）
+  assert.deepEqual(
+    resolveAccountLabel({ account: { uin: '330125158554' } }, null),
+    { label: '330125158554', full: '330125158554', kind: 'uin' });
+});
+
+test('resolveAccountLabel：加密信封解出后要脱敏', () => {
+  const env = { $wbEncrypted: 1, envelope: 'x' };
+  const decrypt = (v) => (v === env ? '19157621006' : null);
+  const r = resolveAccountLabel({ account: { phoneNumber: env, uin: '3301' } }, decrypt);
+  assert.equal(r.label, '191****1006', '信封解开后要脱敏');
+  assert.equal(r.full, '19157621006');
+});
+
+test('resolveAccountLabel：解不开就退回 uin，绝不抛', () => {
+  const env = { $wbEncrypted: 1, envelope: 'x' };
+  // 解密函数抛错
+  const throwing = () => { throw new Error('key fetch failed'); };
+  const r1 = resolveAccountLabel({ account: { phoneNumber: env, uin: '330125158554' } }, throwing);
+  assert.equal(r1.label, '330125158554', '解不开要退回明文 uin，不能让账号变成无名');
+  assert.equal(r1.kind, 'uin');
+  // 没有解密函数（密钥没就绪）
+  const r2 = resolveAccountLabel({ account: { phoneNumber: env, uin: '330125158554' } }, null);
+  assert.equal(r2.label, '330125158554');
+  // 完全没有账户信息
+  assert.equal(resolveAccountLabel({}, null).label, '');
+  assert.equal(resolveAccountLabel(null, null).label, '');
+});
+
+test('listManagedAccounts：默认只回脱敏标签，不含完整 PII', () => {
+  const adir = join(dir, 'workbuddy-accounts');
+  mkdirSync(adir, { recursive: true });
+  writeFileSync(join(adir, 'aaaa-bbbb.info'), JSON.stringify({
+    account: { uin: '330125158554', nickname: '局第二', phoneNumber: { $wbEncrypted: 1, envelope: 'x' } },
+    auth: { accessToken: { $wbEncrypted: 1, envelope: 'x' }, domain: 'www.workbuddy.cn', expiresAt: Date.now() + 864e5 },
+    managed: true,
+  }), 'utf8');
+
+  const decrypt = (v) => (v && v.$wbEncrypted === 1 && v.envelope === 'x' ? '18505580760' : null);
+  const list = listManagedAccounts(dir, { decrypt });
+  assert.equal(list.length, 1);
+  assert.equal(list[0].label, '185****0760', '面板显示的是脱敏值');
+  assert.equal(list[0].labelKind, 'phone');
+  assert.equal(list[0].uin, '330125158554');
+
+  /*
+   * **关键隐私断言**：默认返回值里不能出现完整手机号。
+   * 这个对象会被序列化后发给浏览器、也会出现在截图与诊断报告里 ——
+   * 一旦带出完整 PII，就等于把它写进了公开仓库。
+   */
+  const serialized = JSON.stringify(list);
+  assert.ok(!serialized.includes('18505580760'), `默认返回值泄漏了完整手机号：${serialized}`);
+  assert.ok(!list[0].fullLabel, '默认不返回 fullLabel');
+
+  // 明确要求时才给完整值（供"显示完整账号"这类主动操作）
+  const withFull = listManagedAccounts(dir, { decrypt, full: true });
+  assert.equal(withFull[0].fullLabel, '18505580760');
+});
+
+test('listManagedAccounts：拿不到解密函数时退回 uin（面板不能空白）', () => {
+  const adir = join(dir, 'workbuddy-accounts');
+  mkdirSync(adir, { recursive: true });
+  writeFileSync(join(adir, 'cccc-dddd.info'), JSON.stringify({
+    account: { uin: '330125158554', phoneNumber: { $wbEncrypted: 1, envelope: 'x' } },
+    auth: { accessToken: { $wbEncrypted: 1, envelope: 'x' }, expiresAt: Date.now() + 864e5 },
+    managed: true,
+  }), 'utf8');
+
+  const list = listManagedAccounts(dir); // 不传 decrypt
+  assert.equal(list.length, 1);
+  assert.equal(list[0].label, '330125158554', '解不开要显示 uin，不能是空');
+  assert.equal(list[0].labelKind, 'uin');
 });

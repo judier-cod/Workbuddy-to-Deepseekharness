@@ -69,6 +69,11 @@ export const FIXTURES = {
         id: 'm7ffbd7f5', provider: 'workbuddy-m7ffbd7f5', displayName: '纳管账号 330125158554',
         port: 8793, authFile: '7ffbd7f5-36e2-4eed-b911-8cc6a14e0d2b.info', account: '7ffbd7f5-36e2-4eed-b911-8cc6a14e0d2b',
         uin: '330125158554', domain: 'www.codebuddy.cn',
+        /*
+         * 脱敏后的手机号 —— 面板显示这个（用户一眼认得出，又不泄露完整号码）。
+         * 夹具里必须是**脱敏值**：截图会进公开仓库，塞真号码就等于泄漏。
+         */
+        label: '185****0760',
         registered: true, error: '',
       },
     ],
@@ -209,6 +214,13 @@ FIXTURES.managedAccounts = {
       uid: '7ffbd7f5-36e2-4eed-b911-8cc6a14e0d2b',
       path: 'C:\\Users\\demo\\.dsh\\workbuddy-accounts\\7ffbd7f5-36e2-4eed-b911-8cc6a14e0d2b.info',
       domain: 'www.codebuddy.cn',
+      /*
+       * 面板显示的是**脱敏后的标签**（手机号/邮箱），不是 uuid 或纯 uin ——
+       * 用户反馈"不知道哪个是哪个账号"。夹具里必须用脱敏值：截图进公开仓库。
+       */
+      uin: '330125158554',
+      label: '185****0760',
+      labelKind: 'phone',
       expiresAt: now + 27 * 86400000,
       remainingMs: 27 * 86400000,
       expired: false,

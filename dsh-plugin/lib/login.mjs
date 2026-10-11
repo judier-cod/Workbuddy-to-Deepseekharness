@@ -221,6 +221,70 @@ async function loadAtRest() {
 }
 
 /**
+ * 造一个「解开信封字段」的函数，供 {@link listManagedAccounts} 解析账号标签用。
+ *
+ * 为什么要单独抽出来：`nickname` / `phoneNumber` 在登录文件里是 AtRest 加密信封，
+ * 而取密钥会**拉起一次客户端二进制**（约 340ms）。面板每 60 秒轮询一次账号，
+ * 每次都现取等于每分钟拉起一个客户端进程 —— 显然不行。
+ *
+ * 因此这里：
+ *   1. **密钥在进程内缓存**（`atrest.mjs` 的 `fetchKeyPayload` 本来就按 exe 缓存）；
+ *   2. 首次调用时密钥可能还没取到 —— 那就先返回 null（标签退化到 uin），
+ *      同时后台把钥匙取回来，下一轮轮询就是完整的；
+ *   3. 任何失败都返回 `null`（调用方退回到明文的 uin），**绝不抛**：
+ *      客户端没装、密钥换了、信封格式变了，都不该让面板的账号页打不开。
+ *
+ * @returns {Promise<{decrypt: (v: unknown) => string|null, warmup: () => Promise<void>}>}
+ */
+export async function createIdentityDecoder() {
+  let atrest = null;
+  let key = null;
+  let keyTried = false;
+
+  const ensureKey = async () => {
+    if (key || keyTried) return key;
+    keyTried = true;
+    try {
+      atrest = await loadAtRest();
+      const { existsSync } = await import('node:fs');
+      const cands = atrest.defaultExecutableCandidates().filter((p) => { try { return existsSync(p); } catch { return false; } });
+      if (!cands.length) return null;
+      key = (await atrest.fetchKeyFor(cands, '')).key;
+    } catch {
+      key = null; // 取不到就退化成"不解密"
+    }
+    return key;
+  };
+
+  return {
+    /**
+     * @param {unknown} value 文件里的字段值（信封或明文）
+     * @returns {string|null} 解不开返回 null
+     */
+    decrypt: (value) => {
+      if (value === undefined || value === null || value === '') return '';
+      if (typeof value === 'string') return value; // 明文（旧版客户端）
+      /*
+       * 同步接口但内部需要异步取密钥：密钥没就绪时**返回 null**（这一轮标签
+       * 退化到 uin），并在后台把密钥取回来 —— 下一轮轮询（60 秒）就有完整标签。
+       * 这样"首次打开面板"不会被 340ms 的客户端拉起阻塞，取密钥失败也不会空白。
+       */
+      if (!key || !atrest) {
+        void ensureKey().catch(() => {});
+        return null;
+      }
+      try {
+        return atrest.openEncryptedField(value, key) || null;
+      } catch {
+        return null; // 信封坏了 / 不属于这把钥：当作没有
+      }
+    },
+    /** 预热密钥（可在后台调用，不阻塞渲染）。 */
+    warmup: () => ensureKey().then(() => undefined).catch(() => undefined),
+  };
+}
+
+/**
  * 把令牌封成 AtRest 信封并写入纳管目录。
  *
  * 密钥**现取**（`fetchKeyFor`），不内置任何副本 —— 因此客户端不在场时这里会
@@ -357,12 +421,118 @@ export function archiveSnapshot({ dshHome, uid, sourcePath }) {
 }
 
 /**
+ * 手机号脱敏：保留前 3 位与后 4 位，中间固定 4 个星号。
+ *
+ * 例：`19157621006` → `191****1006`。
+ *
+ * 为什么留 7 位可见：用户的诉求是"一眼认出是哪个账号"。只留前 2 后 2（某些
+ * 实现的做法）在 11 位号码上只剩 4 位，同一人的两个号很容易看着一样 —— 那就没
+ * 达到目的。前 3 后 4 足以区分，又不至于把完整号码暴露在截图里。
+ *
+ * @param {string} phone
+ * @returns {string}
+ */
+export function maskPhone(phone) {
+  const s = String(phone || '').trim();
+  // 只有"看起来像手机号"才脱敏：不足 8 位没什么可掩的，原样返回更好认
+  if (s.length < 8) return s;
+  return `${s.slice(0, 3)}****${s.slice(-4)}`;
+}
+
+/**
+ * 邮箱脱敏：本地部分保留前 2 位与末 2 位，中间固定一个星号；域名保留。
+ *
+ * 例：`a3236792972@gmail.com` → `a3****72@gmail.com`（见下）。
+ *
+ * 星号数**固定**而不是"按长度打"，否则星号数随地址长度增长，会把整列撑宽
+ * （窄列下面板会被挤坏）。域名原样保留 —— 用户靠它区分国内版 / 国际版。
+ *
+ * @param {string} email
+ * @returns {string}
+ */
+export function maskEmail(email) {
+  const s = String(email || '').trim();
+  const at = s.lastIndexOf('@');
+  if (at <= 0) return s; // 不像邮箱：原样（可能是昵称）
+  const local = s.slice(0, at);
+  const domain = s.slice(at);
+  if (local.length <= 2) return `${local[0] || ''}*${domain}`;
+  const head = local.slice(0, 2);
+  const tail = local.length > 4 ? local.slice(-2) : '';
+  return `${head}****${tail}${domain}`;
+}
+
+/**
+ * 把任意账号标识（手机号 / 邮箱 / 昵称）脱敏成"能认出来但不泄露"的形式。
+ *
+ * 判据只看形状，不看字段名 —— 因为 WorkBuddy 把手机号放在 `phoneNumber`，
+ * 而**昵称字段里可能直接就是手机号或邮箱**（实测：一个账号的 nickname 是
+ * `19157621006`，国际版那个是 `a3236792972@gmail.com`）。按字段名判断会漏。
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+export function maskIdentity(value) {
+  const s = String(value || '').trim();
+  if (!s) return '';
+  if (s.includes('@')) return maskEmail(s);
+  // 纯数字且长度像手机号（11 位）或像 QQ 号之类：按手机号规则脱敏
+  if (/^\d{6,}$/.test(s)) return maskPhone(s);
+  // 其它（真昵称、英文名）：原样 —— 昵称不是 PII，打码反而更难认
+  return s;
+}
+
+/**
+ * 从登录文件里解析出**用户认得出的账号标签**（已脱敏）。
+ *
+ * 取值优先级：手机号 → 邮箱 → 昵称 → uin。
+ *
+ * ⚠️ `nickname` / `phoneNumber` 在文件里是 **AtRest 加密信封**（实测），解密要
+ * 现取客户端密钥（会拉起一次客户端二进制）。因此这里的 `decrypt` 是**可选注入**
+ * 的：调用方拿不到密钥就传 null，本函数退回到只用明文的 `uin` —— 面板照常
+ * 工作，只是标签退化成数字。**绝不因为解不开就报错**。
+ *
+ * @param {object} raw 登录文件解析后的对象
+ * @param {(value: unknown) => string|null} [decrypt] 信封解密函数（null = 不解密）
+ * @param {(value: string) => string} [mask] 脱敏函数
+ * @returns {{label: string, full: string, kind: 'phone'|'email'|'nickname'|'uin'|''}}
+ *   `label` 是可直接显示的脱敏值；`full` 只在用户主动要求时才用
+ */
+export function resolveAccountLabel(raw, decrypt = null, mask = maskIdentity) {
+  const acc = raw?.account || {};
+  const read = (v) => {
+    if (v === undefined || v === null || v === '') return '';
+    if (typeof v === 'string') return v;
+    if (decrypt) {
+      try { return decrypt(v) || ''; } catch { return ''; } // 解不开就当没有
+    }
+    return '';
+  };
+  const phone = read(acc.phoneNumber);
+  if (phone) return { label: mask(phone), full: phone, kind: 'phone' };
+  const nick = read(acc.nickname);
+  if (nick) {
+    // 昵称字段里可能就是邮箱或手机号（实测），按形状脱敏
+    const kind = nick.includes('@') ? 'email' : (/^\d{6,}$/.test(nick) ? 'phone' : 'nickname');
+    return { label: mask(nick), full: nick, kind };
+  }
+  const uin = read(acc.uin);
+  if (uin) return { label: uin, full: uin, kind: 'uin' };
+  return { label: '', full: '', kind: '' };
+}
+
+/**
  * 列出已纳管的账号（不含任何凭据内容）。
  *
  * @param {string} dshHome
- * @returns {Array<{uid: string, path: string, domain: string, expiresAt: number, remainingMs: number, expired: boolean}>}
+ * @param {object} [options]
+ * @param {(value: unknown) => string|null} [options.decrypt] 信封解密（见 resolveAccountLabel）
+ * @param {boolean} [options.full] true = 额外返回未脱敏的 `fullLabel`
+ *   （仅当调用方明确要"显示完整账号"时才用；默认**不返回**，免得它出现在
+ *    截图、日志或诊断报告里）
+ * @returns {Array<{uid: string, path: string, uin: string, label: string, labelKind: string, domain: string, expiresAt: number, remainingMs: number, expired: boolean}>}
  */
-export function listManagedAccounts(dshHome) {
+export function listManagedAccounts(dshHome, { decrypt = null, full = false } = {}) {
   const dir = accountDir(dshHome);
   let names = [];
   try {
@@ -377,6 +547,8 @@ export function listManagedAccounts(dshHome) {
       const raw = JSON.parse(readFileSync(path, 'utf8'));
       if (!raw.managed) continue; // 只认自己纳管的，不碰别的东西
       const expiresAt = Number(raw.auth?.expiresAt || 0);
+      // 解析"用户认得出的标签"。解密失败/拿不到密钥时内部会退回 uin，不抛。
+      const resolved = resolveAccountLabel(raw, decrypt);
       out.push({
         uid: name.replace(/\.info$/i, ''),
         path,
@@ -388,6 +560,14 @@ export function listManagedAccounts(dshHome) {
          * （实测反馈："我现在不知道哪个是哪个账号了"）。不是凭据，可以外传。
          */
         uin: raw.account?.uin ? String(raw.account.uin) : '',
+        /**
+         * 用户认得出的账号标签（**已脱敏**）：手机号 / 邮箱 / 昵称，退回到 uin。
+         * 这是面板显示的那一列 —— 光给 uuid 或纯数字 uin 都对不上"这是哪个账号"。
+         * 完整值**默认不返回**（见函数注释：它会进截图与诊断报告）。
+         */
+        label: resolved.label,
+        labelKind: resolved.kind,
+        ...(full && resolved.full ? { fullLabel: resolved.full } : {}),
         domain: raw.auth?.domain || '',
         expiresAt,
         remainingMs: expiresAt - Date.now(),

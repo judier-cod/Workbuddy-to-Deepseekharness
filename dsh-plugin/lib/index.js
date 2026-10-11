@@ -36,7 +36,7 @@ import { WorkBuddyAdapter } from './adapter.mjs';
 import { toDirectory, pickDefaultModel } from './models.mjs';
 import { createTools } from './tools.mjs';
 import { createRouteTable, mountRoutes } from './routes.mjs';
-import { archiveSnapshot, listManagedAccounts } from './login.mjs';
+import { archiveSnapshot, createIdentityDecoder, listManagedAccounts } from './login.mjs';
 import { cleanLegacyRoutes, detectLegacyRoutes } from './legacy.mjs';
 
 export const name = 'workbuddy';
@@ -797,6 +797,15 @@ export function apply(ctx, rawConfig = {}) {
 
   const projectRoot = detectProjectRoot(config.projectRoot);
   const dshPaths = resolveDshPaths(config.dshHome);
+
+  /**
+   * 账号标签的惰性解密器（见 login.mjs 的 `createIdentityDecoder`）。
+   *
+   * 惰性 + 单例：取密钥要拉起一次客户端二进制（约 340ms），所以只在真正要用
+   * 标签时才创建、且整个插件周期只创建一次。`decrypt` 是同步的 —— 密钥没就绪
+   * 时返回 null，调用方退回到明文 uin，绝不阻塞也不报错。
+   */
+  const identityDecoder = createIdentityDecoder();
 
   // 项目根 `.env` 补默认值：优先级 = 插件 config（显式）> .env > 进程环境变量 > 内置默认。
   // 只在用户**没有显式**在 config 里写这一项时才补，避免覆盖用户意图。
@@ -1627,7 +1636,14 @@ export function apply(ctx, rawConfig = {}) {
     /** 本次新注册的分组：循环结束后**并行**起桥（见下方说明）。 */
     const pending = [];
     try {
-      managed = listManagedAccounts(dshPaths.home);
+      /*
+       * 账号标签要解密（手机号/邮箱在文件里是加密信封）。密钥现取自客户端，
+       * 首次可能还没就绪 —— 那时 `decrypt` 返回 null，标签退化成 uin，
+       * 下一次巡检（15 秒后）补上；`warmup()` 让它在后台把钥取回来。
+       */
+      const decoder = await identityDecoder;
+      void decoder.warmup();
+      managed = listManagedAccounts(dshPaths.home, { decrypt: decoder.decrypt });
     } catch (error) {
       log('读取纳管账号失败（跳过激活）', error);
       return 0;
@@ -1662,16 +1678,21 @@ export function apply(ctx, rawConfig = {}) {
       const group = registerAccountGroup({
         id,
         provider,
-        // 展示名用 **uin**（如 `纳管账号 330125158554`）—— 那是用户在客户端里
-        // 认得出的标识；uuid 前 8 位对不上（实测反馈"不知道哪个是哪个账号"）。
-        displayName: `纳管账号 ${account.uin || account.uid.slice(0, 8)}`,
+        /*
+         * 展示名用**用户认得出的账号标签**（脱敏后的手机号/邮箱，退回到 uin）。
+         * uuid 前 8 位对不上客户端界面上的任何东西（实测反馈"不知道哪个是哪个
+         * 账号"）；uin 虽然是真标识，但一串 12 位数字也不如手机号好认。
+         * 标签已脱敏 —— 它会进截图与诊断报告（见 login.mjs 的 maskIdentity）。
+         */
+        displayName: `纳管账号 ${account.label || account.uin || account.uid.slice(0, 8)}`,
         authFile: account.path,
         port,
         token: '',
       });
       if (!group) continue;
       group.uin = account.uin || '';
-      log(`检测到新账号 ${account.uin || account.uid.slice(0, 8)}…，已注册为分组 ${provider}（端口 ${port}）`);
+      group.label = account.label || '';
+      log(`检测到新账号 ${account.label || account.uin || account.uid.slice(0, 8)}…，已注册为分组 ${provider}（端口 ${port}）`);
       added += 1;
       pending.push(group);
     }
@@ -1863,11 +1884,14 @@ export function apply(ctx, rawConfig = {}) {
          */
         account: g.account || null,
         /**
-         * 账号的 uin（如 `330125158554`）—— **用户认得出的那个标识**。
-         * 客户端界面上显示的就是它；uid 是 36 字符 UUID，取前 8 位对不上
-         * （实测反馈"不知道哪个是哪个账号"）。不是凭据，可以外传。
+         * 账号的 uin（如 `330125158554`）—— 明文、一定可读的兜底标识。
          */
         uin: g.uin || '',
+        /**
+         * 用户认得出的账号标签（**已脱敏**的手机号/邮箱，退回 uin）。
+         * 面板优先显示它 —— 一串 12 位 uin 不如手机号好认。
+         */
+        label: g.label || '',
         registered: g.registered,
         error: g.error,
       })),

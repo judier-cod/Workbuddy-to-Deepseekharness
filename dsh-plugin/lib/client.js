@@ -2452,8 +2452,14 @@ body.dark .wb-root,
             h('p', { className: 'wb-note', style: { margin: '0 0 4px' } }, '已纳管账号：'),
             ...accounts.map((a) => h('div', { key: a.uid, className: 'wb-account' + (a.expired ? ' bad' : '') },
               h('div', { className: 'wb-account-head' },
-                // 显示 uin（用户认得出的账号）；拿不到才退到 uuid 前 8 位
-                h('b', { title: a.path }, a.uin || (a.uid.slice(0, 8) + '…')),
+                /*
+                 * 显示**脱敏后的手机号/邮箱**（`191****1006`）—— 用户一眼认得出是
+                 * 哪个账号，又不至于把完整号码留在截图里。退回 uin，最后退 uuid 前 8 位。
+                 *
+                 * title 里放 uin 而不是完整值：**完整 PII 根本不发给浏览器**（宿主
+                 * 默认只回脱敏值），这样连截图 hover 都不可能泄露。
+                 */
+                h('b', { title: a.uin || a.path }, a.label || a.uin || (a.uid.slice(0, 8) + '…')),
                 h(Pill, { tone: a.expired ? 'bad' : 'ok', text: a.expired ? '已过期' : '可用' })),
               h('div', { className: 'wb-note', style: { margin: '4px 0 0' } },
                 (a.domain || '(未知域)') + ' · 剩余 '
@@ -2519,16 +2525,23 @@ body.dark .wb-root,
           displayName: pluginStatus?.config?.displayName || 'WorkBuddy',
           authFile: (pluginStatus?.bridge?.health?.authFile || '').split(/[\\/]/).pop(),
           account: pluginStatus?.bridge?.health?.auth?.userId || '',
-          // 当前账号的存档（滚动更新那份）里有 uin，用它把 uuid 换成用户认得出的标识
+          /*
+           * 当前账号的标识：优先用**脱敏后的手机号/邮箱**（从纳管目录那份滚动
+           * 存档里解出来），退回 uin。`label` 已经是脱敏值 —— 可以直接进截图。
+           */
           uin: (() => {
             const uid = pluginStatus?.bridge?.health?.auth?.userId || '';
             return uid ? (managed.find((a) => a.uid === uid)?.uin || '') : '';
+          })(),
+          label: (() => {
+            const uid = pluginStatus?.bridge?.health?.auth?.userId || '';
+            return uid ? (managed.find((a) => a.uid === uid)?.label || '') : '';
           })(),
           port: pluginStatus?.config?.bridgeUrl ? String(pluginStatus.config.bridgeUrl).split(':').pop() : '',
         },
         ...(pluginStatus?.accountGroups || []).map((g) => ({
           provider: g.provider, displayName: g.displayName, authFile: g.authFile, port: g.port, error: g.error,
-          account: g.account || '', uin: g.uin || '',
+          account: g.account || '', uin: g.uin || '', label: g.label || '',
         })),
       ];
       /** 账号快照 → 被哪个分组使用（按文件名匹配）。 */
@@ -2546,17 +2559,16 @@ body.dark .wb-root,
         h('div', { style: { marginTop: '4px' } },
           groups.map((g) => {
             const snap = accounts.find((a) => a.name === g.authFile);
-            // 账号标识优先级：宿主给的 uin > 客户端快照的 uin > 快照的 userId > 桥的 uid
-            const ident = g.uin || snap?.account || snap?.userId || g.account || '';
+            /*
+             * 账号标识优先级：
+             *   label（脱敏手机号/邮箱）> uin > 客户端快照的 uin/userId > 桥的 uid。
+             * 用户要的是"一眼认出是哪个账号"，手机号/邮箱最直观；uin 只是一串
+             * 12 位数字，认起来费劲（但仍比 uuid 好）。全部拿不到才退回展示名。
+             */
+            const ident = g.label || g.uin || snap?.account || snap?.userId || g.account || '';
             const domain = g.domain || snap?.domain || '';
             return h('div', { key: g.provider, className: 'wb-account' + (g.error ? ' bad' : '') },
               h('div', { className: 'wb-account-head' },
-                /*
-                 * 标题显示**账号标识**（uin，如 `330125158554`），不是 provider 名。
-                 * 用户的问题是"不知道哪个是哪个账号" —— provider 名
-                 * （`workbuddy-m6d2b5f6b`）是模型选择器用的路由键，认不出是哪个账号；
-                 * uin 才是客户端界面上的那个标识。缺 uin 时退回展示名。
-                 */
                 h('b', { title: g.provider }, ident || g.displayName),
                 h(Pill, { tone: g.error ? 'bad' : 'ok', text: g.error ? '异常' : '使用中' })),
               h('div', { className: 'wb-pick' },
