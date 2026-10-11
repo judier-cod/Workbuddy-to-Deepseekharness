@@ -1843,6 +1843,64 @@ test('密钥未就绪时不许把组名刷成 uin（回归：首轮巡检把名�
 });
 
 /**
+ * 同一个账号**不该被注册两次**（手写配置 + 自动纳管撞车）。
+ *
+ * 回归（用户实测）：模型选择器里出现 **5 组**，而账号只有 4 个 ——
+ * `workbuddy-ai`（手写，读客户端文件）与 `workbuddy-m3c8d1aca`（自动纳管，
+ * 读存档副本）的 uin 都是 `450702377403`。文件名不同，所以只看文件名发现不了。
+ *
+ * 后果不只是"多一行"：两条桥服务同一账号会**并发刷新同一会话**，上游每次刷新
+ * 都轮换 refresh token —— 用旧令牌那个请求可能被判异常、吊销会话。
+ *
+ * 规则：**手写配置优先**（那是用户的显式意图，端口与名字都是他定的），
+ * 自动纳管那条要撤掉。
+ */
+test('同一账号不被注册两次：手写配置优先，自动纳管的重复项要撤掉', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wb-dup-'));
+  try {
+    const UIN = '450702377403';
+    // 手写分组指向的"客户端文件"
+    const clientFile = join(dir, 'workbuddy-desktop-ai.info');
+    writeFileSync(clientFile, JSON.stringify({
+      account: { uin: UIN, nickname: 'a@x.com' },
+      auth: { accessToken: { $wbEncrypted: 1, envelope: 'x' }, domain: 'www.workbuddy.ai', expiresAt: Date.now() + 864e5 },
+    }), 'utf8');
+    // 纳管目录里**同一个账号**的存档副本（文件名是 uid，与上面完全不同）
+    const UID = '3c8d1aca-5106-43df-a8aa-d6c06b5d1b29';
+    const adir = join(dir, 'workbuddy-accounts');
+    mkdirSync(adir, { recursive: true });
+    writeFileSync(join(adir, `${UID}.info`), JSON.stringify({
+      account: { uin: UIN, nickname: 'a@x.com' },
+      auth: { accessToken: { $wbEncrypted: 1, envelope: 'x' }, domain: 'www.workbuddy.ai', expiresAt: Date.now() + 864e5 },
+      managed: true,
+    }), 'utf8');
+
+    const { ctx } = fakeCtx();
+    const result = apply(ctx, {
+      projectRoot: dir, dshHome: dir, accountWatchMs: 0,
+      autoStart: false, consoleAutoStart: false, migrateLegacy: false,
+      tools: false, commands: false, routes: false,
+      accounts: [{ id: 'ai', displayName: 'WorkBuddy 国际版', authFile: clientFile, port: 8791 }],
+      accountProviderPrefix: 'workbuddy-',
+    });
+    result.supervisor.probe = async () => ({ state: 'stopped' });
+
+    // 两轮：第一轮建、第二轮才有机会撤销
+    await result.activateManagedGroups();
+    await result.activateManagedGroups();
+
+    const autoProvider = `workbuddy-m${UID.slice(0, 8)}`;
+    assert.ok(!result.state.accountGroups.some((g) => g.provider === autoProvider),
+      `${autoProvider} 与手写分组是同一个账号（uin ${UIN}），必须被撤销 —— 否则同一账号两条桥`);
+    // 手写那条必须留着（它是用户的显式配置）
+    assert.ok(result.state.accountGroups.some((g) => g.provider === 'workbuddy-ai'),
+      '手写分组必须保留');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
  * 所有路由的展示名统一成**账号标签**（手机号/邮箱）。
  *
  * 用户要求"模型选择器里直接用手机号或者邮箱分组"。原先三处口径不一：

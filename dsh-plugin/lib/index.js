@@ -1253,6 +1253,15 @@ export function apply(ctx, rawConfig = {}) {
       displayName: account.displayName,
       authFile: account.authFile,
       port: account.port,
+      /**
+       * 这个分组是**手写配置**来的（`cordis.patch.yml` 的 `accounts`），
+       * 还是**自动纳管**来的（存档 + 自动激活）？
+       *
+       * 用于去重：同一个账号两边都出现时，**手写配置优先**（那是用户的显式意图，
+       * 端口和名字都是他定的），自动那条要撤掉。否则同一账号会起两条桥 —— 它们
+       * 并发刷新同一会话，上游轮换 refresh token 时可能吊销会话。
+       */
+      fromConfig: account.fromConfig === true,
       registered: false,
       error: '',
       supervisor: null,
@@ -1390,8 +1399,8 @@ export function apply(ctx, rawConfig = {}) {
     return group;
   }
 
-  /** 启动时把配置里（含已纳管）的账号都注册成分组。 */
-  for (const account of config.accounts) registerAccountGroup(account);
+  /** 启动时把**手写配置**里的账号注册成分组（`accounts` 列表）。 */
+  for (const account of config.accounts) registerAccountGroup({ ...account, fromConfig: true });
 
   // ── 3. 运行态快照（入口页 / 工具共用） ─────────────────────────────────
   const CHECKIN_TTL_MS = 30 * 60 * 1000;
@@ -1438,17 +1447,25 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   /**
-   * **分组**桥的账号对账。
+   * **分组**桥的对账：先核对"我这个端口上是不是我的桥"，再谈账号。
    *
-   * 与 {@link reconcileAccount} 同一类问题，但分组原先只在桥启动时记一次账号
-   * （见 7b 段的 `group.account = …`），之后**永不复查** —— 于是在客户端里换掉
-   * 某个分组的账号后：分组 adapter 的目录缓存停在旧账号的清单上，面板还会把新
-   * 账号的余额标成旧账号（`groupQuotas[].account` 取的就是这个字段）。
+   * 为什么要核对端口归属：桥是 detached 的、活过 dsh 重启，而分组端口是每轮启动
+   * 时"算"出来的 —— 算出来的端口可能正坐着**别账号**的桥。实测：
+   *
+   *   插件记录 m3c8d1aca @8794  →  8794 上实际跑的是 m6d2b5f6b 的桥
+   *   插件记录 m6d2b5f6b @8796  →  8796 空着，8794 才是它
+   *
+   * 那时若直接把探测到的 `account` 认作"我的账号"，面板就会把 A 的额度显示在 B
+   * 名下（用户看到的正是"两个账号一样"），而且**同账号两条桥**会并发刷新同一
+   * 会话 —— 上游轮换 refresh token，用旧令牌的那个请求可能被判异常、吊销会话。
+   *
+   * 自愈：发现端口上不是自己的 authFile → 按身份找自己的桥，找到就改用它；
+   * 找不到就如实标 error（**绝不把别人的账号当成自己的**）。
    *
    * 探测**限时 2 秒**：分组桥可能没起来，而这里可能在轮询路径上被调用 —— 不能
    * 让一个挂掉的桥把状态页拖住（client 默认超时是 8 秒）。单个分组失败不影响其它。
    *
-   * @returns {Promise<boolean>} 是否有分组换了账号（调用方据此决定要不要广播事件）
+   * @returns {Promise<boolean>} 是否有分组换了账号或换了端口（调用方据此广播事件）
    */
   async function reconcileGroupAccounts() {
     let changed = false;
@@ -1456,6 +1473,27 @@ export function apply(ctx, rawConfig = {}) {
       if (!group.registered || !group.supervisor) return;
       try {
         const probe = await group.supervisor.probe(AbortSignal.timeout(2000));
+
+        // ① 端口归属：桥报的 authFile 必须是本分组配的那个
+        if (probe.foreignAccount) {
+          const mine = await findMyBridgePort(group);
+          if (mine && mine !== group.port) {
+            log(`分组「${group.displayName}」的端口 ${group.port} 上是别账号的桥，改用属于它的端口 ${mine}`);
+            replaceGroupSupervisor(group, mine);
+            group.error = '';
+            group.account = null; // 交给下一轮探测填入
+            changed = true;
+            return;
+          }
+          const msg = `端口 ${group.port} 上的桥服务的是另一个账号`;
+          if (group.error !== msg) log(`分组「${group.displayName}」${msg}`);
+          group.error = msg;
+          group.account = null; // 关键：不把別人的账号当成自己的
+          changed = true;
+          return;
+        }
+
+        // ② 通过归属核对之后，才谈"账号有没有变"
         const account = bridgeAccountOf(probe);
         if (account === null) return; // 桥没起来 / 旧桥没有 userId：保留现状
         if (group.account && group.account !== account) {
@@ -1465,9 +1503,38 @@ export function apply(ctx, rawConfig = {}) {
           changed = true;
         }
         group.account = account;
+        if (group.error) { group.error = ''; changed = true; }
       } catch { /* 单个分组探测失败：不影响其它，也不影响主流程 */ }
     }));
     return changed;
+  }
+
+  /**
+   * 在候选端口里找**属于本分组**的桥（按 authFile 身份）。
+   *
+   * 与 `claimExistingBridges()` 的分工：那个是启动时**一次**全量扫描（按账号归类
+   * 所有桥，带缓存）；这个是运行时**单个分组**的定点复核 —— 端口漂移是逐条桥的
+   * 事，用全量扫描太贵，按需只探相关的那几个端口。
+   *
+   * @param {object} group
+   * @returns {Promise<number|null>} 找到的端口；没有返回 null
+   */
+  async function findMyBridgePort(group) {
+    try {
+      if (!group.authFile || !existsSync(group.authFile)) return null;
+      const lo = config.bridgePort + 1;
+      const ports = [group.port]; // 本分组当前端口优先（桥可能只是还没换过来）
+      for (let p = lo; p <= lo + 24; p += 1) if (p !== group.port) ports.push(p);
+      const byKey = await scanBridges({
+        host: config.bridgeHost, token: config.localToken, ports, timeoutMs: 700,
+      });
+      const hits = byKey.get(authFileKey(group.authFile));
+      if (!hits || !hits.length) return null;
+      hits.sort((a, b) => a.port - b.port); // 确定性的选择：端口最小的那条
+      return hits[0].port;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -1838,8 +1905,41 @@ export function apply(ctx, rawConfig = {}) {
      * 认领也会顺带停掉同账号的多余桥（并把这件事写进日志）。
      */
     const claimedBridges = await claimExistingBridges();
+    /*
+     * 已经**被手写分组服务**的账号（按 uin 判）。
+     *
+     * 为什么必须去重：`cordis.patch.yml` 的 `accounts` 里可能已经配了某个账号
+     * （例如国际版 `workbuddy-ai` 指向客户端那份 `workbuddy-desktop-ai.info`），
+     * 而自动存档又会把它存成 `<uid>.info` —— 于是同一个账号被注册成**两条分组**、
+     * 起**两条桥**。实测：`workbuddy-ai` 与 `workbuddy-m3c8d1aca` 的 uin 都是
+     * `450702377403`（用户看到模型选择器里出现 5 组、而账号只有 4 个）。
+     *
+     * 后果不只是"多一行"：两条桥服务同一账号会**并发刷新同一会话**，而上游每次
+     * 刷新都轮换 refresh token —— 用旧令牌的那个请求可能被判异常、吊销会话。
+     *
+     * 判据用 **uin**（账号身份）而不是文件名：手写分组读客户端文件、纳管分组读
+     * 存档副本，文件名必然不同，只有 uin 能证明"这是同一个账号"。
+     */
+    const handWrittenUins = new Set();
+    for (const g of accountGroups) {
+      if (!g.fromConfig || !g.authFile) continue;
+      const ident = readAuthIdentity(g.authFile, decoderRef.value ? (v) => decoderRef.value.decrypt(v) : null);
+      if (ident?.uin) handWrittenUins.add(ident.uin);
+    }
     for (const account of managed) {
       if (account.expired) continue;                                  // 过期的不起桥，面板会标红
+      if (account.uin && handWrittenUins.has(account.uin)) {
+        /*
+         * 这个账号已经由**手写分组**服务了 —— 不再为它自动起一条。
+         * 手写配置是用户的显式意图，优先尊重它（它的端口/名字都是用户定的）。
+         */
+        const dup = accountGroups.find((g) => g.provider.includes(account.uid.slice(0, 8)));
+        if (dup) {
+          log(`账号 ${account.label || account.uin} 已由手写分组 ${dup.provider} 服务，撤销自动创建的同账号分组`);
+          if (await retirePromotedGroup(account.uid)) retired += 1;
+        }
+        continue;
+      }
       if (account.uid === state.bridgeAccount) {
         /*
          * 这个账号**已经是主桥在服务的**。
