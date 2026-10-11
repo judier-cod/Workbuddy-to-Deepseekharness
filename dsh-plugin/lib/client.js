@@ -181,6 +181,10 @@ body.dark .wb-root,
 .wb-account.bad b{color:light-dark(#a40e26,#ffb3ad)}
 .wb-account-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;min-width:0}
 .wb-account-head b{min-width:0;overflow-wrap:anywhere}
+/* 「模型选择器里选 xxx」：本页最重要的一行 —— provider 名要一眼能看到、能选、
+   能复制，所以用等宽字体 + 浅底，且允许在**词/连字符**处换行而不是逐字折断 */
+.wb-pick{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:5px 0 0;min-width:0}
+.wb-pick-code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;padding:1px 6px;border-radius:6px;background:var(--dsw-alias-bg-module-platform,light-dark(#00000008,#ffffff12));overflow-wrap:anywhere;min-width:0;user-select:all}
 .wb-input,.wb-select{background:transparent;border:0;border-bottom:.5px solid var(--dsw-alias-border-l2,light-dark(#0000001a,#ffffff1f));color:inherit;font:inherit;font-size:12.5px;padding:4px 4px;min-width:0;max-width:100%;transition:border-color var(--wb-anim-fast)}
 .wb-input:focus{outline:none;border-bottom-color:var(--dsw-alias-brand-primary,light-dark(#0f1115,#f9fafb))}
 .wb-input{width:200px}
@@ -584,12 +588,25 @@ body.dark .wb-root,
 
       // ── 账号页 / 上下文覆盖（这些是**既有**的漏翻，i18n 门禁一直红着）──
       '账号分组（同时在用）：': 'Account groups (in use): ',
+      // 模型页 provider 选择器的标签（多账号时才渲染出来）
+      '账号分组': 'Account group',
       '未被任何分组使用的账号：': 'Accounts not used by any group: ',
       '多个账号**同时可用**，各自一组模型，不需要切换。模型选择器里 provider 选对应分组即可。':
         'Multiple accounts are **available at the same time**, each with its own model group — no switching needed. Pick the matching group as the provider in the model selector.',
       '想同时用它：在 cordis.patch.yml 的 workbuddy 条目里加一条 accounts（id / displayName / authFile / port），重启一次 dsh 即可；也可以在下面的「纳管账号」里直接登录一个新账号。':
         'To use it as well: add an accounts entry (id / displayName / authFile / port) under the workbuddy section of cordis.patch.yml and restart dsh once — or simply sign in a new account under "Managed accounts" below.',
       '复制项目路径': 'Copy project path',
+
+      // ── 账号页（窄列：每账号一行，"我该选哪个 provider"最重要）────────
+      // `剩余 ` / `端口 ` 是**拼接片段**（值由代码插进来），只能按子串译。
+      '模型选择器里选': 'Pick in the model selector',
+      '剩余 ': 'Left ',
+      '端口 ': 'port ',
+      '已扫描到、尚未启用：': 'Discovered, not active yet: ',
+      '详细信息': 'Details',
+      '收起详细信息': 'Hide details',
+      '多个账号**同时可用**，各自一组模型，不需要切换。':
+        'Multiple accounts are **available at once**, each with its own model group — no switching needed.',
 
       // ── 纳管账号（插件自己走 OAuth 登录） ──────────────────────────────
       '纳管账号': 'Managed accounts',
@@ -905,6 +922,20 @@ body.dark .wb-root,
       [/^(.+)（(auto|manual|\?)）$/, '$1 ($2)'],
 
       /*
+       * 账号页那两行的拼接串（值由代码插进来，整串在词条表里查不到）：
+       *   3301… · www.workbuddy.cn · 端口 8790   →  … · port 8790
+       * `(未识别账号)` 会**嵌在串中间**（不是整串），所以必须单独兜一条 ——
+       * applyTerms() 只管专有名词，不会去查词条表，指望它会翻译是错的。
+       *
+       * 注意：`剩余` 的规则**不能放这里**。下面「环境诊断」段有一条更专用的
+       * `^账号 X · 剩余 Y$`（它会把时长递归译一遍），通用规则排前面会把它遮蔽掉，
+       * 结果是 `账号 300… · Left 44 天 9 小时` 这种半中半英（验收脚本抓到过）。
+       * 通用规则统一排在那一组之后。
+       */
+      [/^\(未识别账号\) · 端口 (.+)$/, '(unknown account) · port $1'],
+      [/^(.+) · 端口 (.+)$/, '$1 · port $2'],
+
+      /*
        * ── 环境诊断的 detail / hint ──────────────────────────────────────
        * 由共用的 `lib/diagnostics.mjs` 生成，值里带动态内容（路径、账号、keyId…）。
        * 规则与控制台那组对齐 —— 两边渲染同一份库的输出，口径必须一致。
@@ -975,6 +1006,14 @@ body.dark .wb-root,
       [/^登录目录：(.+)$/, 'Login directory: $1'],
       [/^剩余 (.+) · 凭据 (.+)$/, (m, dur, kind) => 'Remaining ' + translateText(dur) + ' · credential ' + translateText(kind)],
       [/^剩余 (.+)$/, (m, rest) => 'Remaining ' + translateText(rest)],
+      /*
+       * 账号页的 `标签 · 剩余 约 43 天 23 小时`：必须排在上面那条**专用的**
+       * `^账号 X · 剩余 Y$` 之后，否则会把它的递归翻译遮蔽掉。
+       * `约` 前缀也要单独兜 —— 上游给的是"约 N 天 M 小时"这种口语化时长。
+       */
+      [/^约 (\d+) 天 (\d+) 小时$/, '~$1d $2h'],
+      [/^约 (\d+) 天$/, '~$1d'],
+      [/^(.+) · 剩余 (.+)$/, (m, label, rest) => label + ' · ' + translateText(rest) + ' left'],
       [/^可用模型（(\d+)）$/, 'Available models ($1)'],
       [/^(\d+) 条$/, '$1 rows'],
       // 「体检结论更新于 …（本轮…）」必须排在通用的「…（本轮…）」之前
@@ -2431,93 +2470,120 @@ body.dark .wb-root,
       const api = useConsoleApi(CONSOLE_API + '/accounts', { interval: 30000 });
       const { data, error, status, reload } = api;
       // Hooks 必须在任何条件 return 之前调用（React 规则）
-      const [messageTip, setMessageTip] = useState('');
+      const [showDetail, setShowDetail] = useState(false);
       if (api.availability.state !== 'ok' && (status === 503 || status === 404)) {
-        return h(ConsoleGate, { availability: api.availability, onStartConsole, onProbe: api.probeConsole, busy, feature: '账号' });
+        /*
+         * 控制台没跑 / 宿主是旧构建时，**只把"客户端账号快照"这块换成门控提示**，
+         * 不能整页 return —— 纳管账号是插件**自己的**功能（凭据在 dsh 目录下，
+         * 走宿主路由，完全不经过控制台），整页挡住就等于"控制台没开就用不了
+         * 添加/移除账号"（实测：控制台停着时连入口都看不到）。
+         */
+        return h(Card, { title: '账号' },
+          h(ConsoleGate, { availability: api.availability, onStartConsole, onProbe: api.probeConsole, busy, feature: '账号' }),
+          h(ManagedAccountsPanel, { reloadAll: () => { reload(); reloadStatus?.(); } }));
       }
       const accounts = data?.accounts || [];
       if (api.loading && data === null) return h(Card, { title: '账号' }, h(Loading, { text: '正在读取登录账号…' }));
 
-      /** 分组列表：主 provider + 已注册的分组。 */
+      /**
+       * 分组列表：主 provider + 已注册的分组。
+       *
+       * `account` 由宿主端从桥的 `/health` 取（`auth.userId`），**不能只靠
+       * authFile 去客户端快照里对照**：纳管账号的凭据在 `$DSH_HOME/workbuddy-accounts/`
+       * 下，不在客户端登录目录里，按文件名永远匹配不上（实测会显示「(未识别账号)」）。
+       */
       const groups = [
         {
           provider: pluginStatus?.route?.provider || 'workbuddy',
           displayName: pluginStatus?.config?.displayName || 'WorkBuddy',
           authFile: (pluginStatus?.bridge?.health?.authFile || '').split(/[\\/]/).pop(),
+          account: pluginStatus?.bridge?.health?.auth?.userId || '',
           port: pluginStatus?.config?.bridgeUrl ? String(pluginStatus.config.bridgeUrl).split(':').pop() : '',
         },
         ...(pluginStatus?.accountGroups || []).map((g) => ({
           provider: g.provider, displayName: g.displayName, authFile: g.authFile, port: g.port, error: g.error,
+          account: g.account || '',
         })),
       ];
       /** 账号快照 → 被哪个分组使用（按文件名匹配）。 */
       const usedBy = (name) => groups.filter((g) => g.authFile === name);
       const unused = accounts.filter((a) => usedBy(a.name).length === 0);
 
-      const openConfig = () => {
-        // 打不开配置文件不算致命：把路径给出来让用户自己去编辑
-        const p = pluginStatus?.config?.projectRoot;
-        if (p) copyText(String(p) + '\\dsh-plugin\\lib\\index.js');
-        setMessageTip(p
-          ? '配置在 cordis.patch.yml 的 workbuddy 条目（accounts 列表）。已复制项目路径：' + p
-          : '配置在 cordis.patch.yml 的 workbuddy 条目（accounts 列表）。');
-      };
-
       return h(Card, { title: '账号' },
         error ? h(Alert, { bad: true }, error) : null,
-        messageTip ? h(Alert, null, messageTip) : null,
         data?.keyError ? h(Alert, null, 'AtRest 密钥获取失败：' + data.keyError + '（无法逐个验证账号可用性）') : null,
-        h('p', { className: 'wb-note', style: { marginTop: 0 } },
-          '多个账号**同时可用**，各自一组模型，不需要切换。模型选择器里 provider 选对应分组即可。'),
-        data?.dir ? h('p', { className: 'wb-note' }, '登录目录：' + data.dir) : null,
 
-        // ── 分组 → 账号 映射（这是本页的主内容）──────────────────────────
-        h('div', { style: { marginTop: '10px' } },
-          h('p', { className: 'wb-note', style: { margin: '0 0 4px' } }, '账号分组（同时在用）：'),
+        // ── 在用账号（本页主内容）────────────────────────────────────────
+        // 窄列下的呈现原则：**每账号一行**，一行只讲一件事 ——
+        // "在模型选择器里该选哪个"。原始文件名之类的细节收进折叠，
+        // 它们是排障用的，不该和"我该选什么"抢注意力。
+        h('div', { style: { marginTop: '4px' } },
           groups.map((g) => h('div', { key: g.provider, className: 'wb-account' + (g.error ? ' bad' : '') },
             h('div', { className: 'wb-account-head' },
-              h('b', { title: g.provider }, g.displayName),
-              h('span', { className: 'wb-status-cell' },
-                h(Pill, { tone: 'ok', text: '使用中' }),
-                h('span', { className: 'wb-note', style: { margin: 0 } }, g.provider))),
+              h('b', { title: g.displayName }, g.displayName),
+              h(Pill, { tone: g.error ? 'bad' : 'ok', text: g.error ? '异常' : '使用中' })),
+            h('div', { className: 'wb-pick' },
+              h('span', { className: 'wb-note', style: { margin: 0 } }, '模型选择器里选'),
+              h('code', { className: 'wb-pick-code', title: g.provider }, g.provider)),
             h('div', { className: 'wb-note', style: { margin: '4px 0 0' } },
-              (accounts.find((a) => a.name === g.authFile)?.account || '(未识别账号)')
-              + (accounts.find((a) => a.name === g.authFile)?.domain ? ' · ' + accounts.find((a) => a.name === g.authFile).domain : '')),
-            h('div', { className: 'wb-note', style: { margin: '2px 0 0' } },
-              '登录文件 ' + (g.authFile || '(未知)') + ' · 端口 ' + (g.port || '—')
-              + (g.error ? ' · 错误：' + g.error : ''))))),
+              pickAccountLabel(accounts, g)
+              + (g.port ? ' · 端口 ' + g.port : '')
+              + (g.error ? ' · ' + g.error : ''))))),
 
-        // ── 未被使用的账号：如实提示，并给出加分组的方法 ──────────────────
+        // 未被任何分组使用的账号：**会自动启用**（插件扫描到就注册），
+        // 这里如实列出它们的状态，不需要用户去改配置文件。
         unused.length
           ? h('div', { style: { marginTop: '12px' } },
-            h('p', { className: 'wb-note', style: { margin: '0 0 4px' } }, '未被任何分组使用的账号：'),
+            h('p', { className: 'wb-note', style: { margin: '0 0 4px' } }, '已扫描到、尚未启用：'),
             ...unused.map((a) => h('div', { key: a.name, className: 'wb-account' },
               h('div', { className: 'wb-account-head' },
-                h('b', { title: a.path || a.name }, a.name),
+                h('b', null, a.account || a.userId || '(未识别账号)'),
                 h(Pill, { tone: a.usable ? '' : 'bad', text: a.usable ? '可用' : '不可用' })),
               h('div', { className: 'wb-note', style: { margin: '4px 0 0' } },
-                (a.account || a.userId || '(未识别账号)') + (a.domain ? ' · ' + a.domain : '')),
-              h('div', { className: 'wb-note', style: { margin: '2px 0 0' } },
-                '剩余 ' + (a.expiresAt ? fmtRemaining(a.expiresAt) : '未知')
-                + ' · 凭据 ' + (a.encrypted ? 'AtRest 信封' : '明文')))) ,
-            h('p', { className: 'wb-note', style: { margin: '6px 0 0' } },
-              '想同时用它：在 cordis.patch.yml 的 workbuddy 条目里加一条 accounts（id / displayName / authFile / port），重启一次 dsh 即可；'
-              + '也可以在下面的「纳管账号」里直接登录一个新账号。'),
-            h('div', { className: 'wb-actions', style: { marginTop: '6px' } },
-              h(Btn, { onClick: openConfig }, '复制项目路径')))
+                (a.domain || '') + ' · 剩余 ' + (a.expiresAt ? fmtRemaining(a.expiresAt) : '未知')))))
           : null,
 
-        h(ManagedAccountsPanel, { reloadAll: () => { reload(); reloadStatus?.(); } }),
-
-        // 不可用的账号把原因**写在页面上**，不要只藏在 tooltip 里
         accounts.some((a) => !a.usable)
           ? h('div', { style: { marginTop: '10px' } },
             h('p', { className: 'wb-note', style: { marginTop: 0 } }, '不可用的账号及原因：'),
             ...accounts.filter((a) => !a.usable).map((a) => h('p', { key: a.name, className: 'wb-note', style: { margin: '2px 0 0' } },
-              '· ' + a.name + '：' + (a.error || '未能解开凭据（可能是另一个 build 写入的）'))))
+              '· ' + (a.account || a.name) + '：' + (a.error || '未能解开凭据（可能是另一个 build 写入的）'))))
           : null,
+
+        h(ManagedAccountsPanel, { reloadAll: () => { reload(); reloadStatus?.(); } }),
+
+        // 细节收进折叠：排障时才需要，平时不该占视线
+        h('div', { style: { marginTop: '10px' } },
+          h(Btn, { onClick: () => setShowDetail((v) => !v) }, showDetail ? '收起详细信息' : '详细信息'),
+          showDetail ? h('div', { style: { marginTop: '6px' } },
+            data?.dir ? h('p', { className: 'wb-note', style: { margin: '2px 0' } }, '登录目录：' + data.dir) : null,
+            ...groups.filter((g) => g.authFile).map((g) => h('p', { key: 'f' + g.provider, className: 'wb-note', style: { margin: '2px 0' } },
+              g.provider + ' → ' + g.authFile)),
+            h('p', { className: 'wb-note', style: { margin: '2px 0' } }, '多个账号**同时可用**，各自一组模型，不需要切换。')) : null),
+
         h('div', { className: 'wb-actions', style: { marginTop: '10px' } },
           h(Btn, { onClick: () => { reload(); reloadStatus?.(); } }, '刷新')));
+    }
+
+    /**
+     * 分组 → 账号显示名的取值顺序。
+     *
+     *   1. **桥报的 userId**（`group.account`）—— 唯一对纳管账号也成立的来源；
+     *   2. 客户端快照里按登录文件名对照，取其中的 uin / userId 与域名
+     *      （客户端快照有 uin，比 uuid 好认）；
+     *   3. 都拿不到才说「(未识别账号)」。
+     *
+     * 顺序不能反：纳管凭据不在客户端登录目录里，先查快照的话纳管分组永远落到
+     * 第 3 档，页面就会出现「(未识别账号)」（实测）。
+     */
+    function pickAccountLabel(accounts, group) {
+      const hit = accounts.find((a) => a.name === group.authFile);
+      if (hit) {
+        return (hit.account || hit.userId || group.account || '(未识别账号)')
+          + (hit.domain ? ' · ' + hit.domain : '');
+      }
+      if (group.account) return String(group.account).slice(0, 8) + '…';
+      return '(未识别账号)';
     }
 
     // ─────────────────────────── 用量 ───────────────────────────

@@ -120,7 +120,7 @@ try {
   // 逐个标签页走一遍：每个面板都要真的渲染出内容（不是只挂个空壳）
   const EXPECT = {
     概览: ['本地桥', 'dsh 原生路由', '积分余额', '启动桥', '复制诊断报告'],
-    账号: ['workbuddy-desktop.info', '330000000000', '使用中', '切换', 'CodeBuddyExtension'],
+    账号: ['使用中', '模型选择器里选', '330000000000'],
     用量: ['消耗积分', '积分花在哪些模型上', '导出 CSV', 'deepseek-v4.1-flash'],
     请求: ['最近请求', '仅看失败', '导出当前筛选 CSV'],
     签到: ['每日签到', '连续天数', '自动签到', '上次尝试'],
@@ -230,6 +230,43 @@ try {
     }
   }
   console.log(`标签页：${tabList.join(' / ')}`);
+
+  /*
+   * 账号页：原始登录文件名与登录目录属于**排障细节**，默认收起
+   * （用户反馈"面板看着也不方便"：这些细节和"我该选哪个 provider"抢注意力）。
+   * 但折叠**不能变成信息消失** —— 展开后必须能看到，否则排障时会找不到。
+   */
+  await page.cdp.evaluate(`(() => { const b=[...document.querySelectorAll('.wb-tab')].find(x=>x.textContent==='账号'); if(b) b.click(); return !!b; })()`);
+  await sleep(500);
+  const beforeExpand = await page.cdp.evaluate("document.querySelector('.wb-root') ? document.querySelector('.wb-root').innerText : ''");
+  if (beforeExpand.includes('CodeBuddyExtension')) {
+    problems.push('账号页默认就显示了登录目录 —— 细节应收起（这正是"看着不方便"的来源）');
+  }
+  await page.cdp.evaluate(`(() => { const b=[...document.querySelectorAll('.wb-btn')].find(x=>x.textContent==='详细信息'); if(b) b.click(); return !!b; })()`);
+  await sleep(400);
+  const afterExpand = await page.cdp.evaluate("document.querySelector('.wb-root') ? document.querySelector('.wb-root').innerText : ''");
+  for (const needle of ['workbuddy-desktop.info', 'CodeBuddyExtension']) {
+    if (!afterExpand.includes(needle)) problems.push(`账号页展开「详细信息」后仍缺少「${needle}」`);
+  }
+
+  /*
+   * 纳管分组必须显示**真实账号标识**。
+   *
+   * 回归：面板原来只拿登录文件 basename 去客户端快照里对照，而纳管凭据在
+   * `$DSH_HOME/workbuddy-accounts/` 下、不在那份快照里 —— 于是纳管分组那行
+   * 显示成「(未识别账号)」（用户实际看到的就是这个）。修复靠宿主在分组快照里
+   * 带上桥 /health 的 userId；这里钉住"不许再退化成未识别"。
+   */
+  if (beforeExpand.includes('(未识别账号)')) {
+    problems.push('账号页把分组显示成了「(未识别账号)」—— 纳管分组必须显示真实账号标识');
+  }
+  if (!beforeExpand.includes('7ffbd7f5')) {
+    problems.push('账号页没有显示纳管分组的账号标识（夹具里有 workbuddy-m7ffbd7f5，它靠 group.account 显示）');
+  }
+  // provider 名必须出现 —— 那是"我该在模型选择器里选什么"，本页最重要的一行
+  for (const provider of ['workbuddy-ai', 'workbuddy-m7ffbd7f5']) {
+    if (!beforeExpand.includes(provider)) problems.push(`账号页缺少 provider 名「${provider}」（用户要照它去模型选择器里选）`);
+  }
 
   // 用量页要有真的图表（内联 SVG），模型页要有表格行；再各截一页做人工确认
   await page.cdp.evaluate(`(() => { const b=[...document.querySelectorAll('.wb-tab')].find(x=>x.textContent==='用量'); b && b.click(); })()`);
@@ -363,17 +400,24 @@ try {
 
   // 破坏性操作必须二次确认，且确认后才真的发请求：
   //   清空账本（用量）/ 清空日志（日志）/ 清除体检结论（模型）
+  //
+  // 断言只关心"取消有没有引发 DELETE"，所以**按方法比 DELETE 的条数**，
+  // 而不是比 calls 总条数：面板各页在途的轮询（8~120 秒一次）随时可能落地，
+  // 用总条数判定会把无关的后台请求算成"取消也发了请求"（实测踩过，报错指向
+  // 完全无关的清空账本）。等页面稳定再取基线，进一步减少噪声。
   await page.cdp.evaluate("window.__dialogs = []; window.__confirmAnswer = false;");
   await page.cdp.evaluate(`(() => { const b=[...document.querySelectorAll('.wb-tab')].find(x=>x.textContent==='用量'); b && b.click(); })()`);
   await sleep(500);
-  const beforeClear = await inspect(page.cdp);
+  await waitFor(page.cdp, "!!document.querySelector('.wb-table') || true", 2000, '用量页渲染');
+  const deletesBefore = () => page.cdp.evaluate("(window.__calls || []).filter(c => String(c[0]).includes('/workbuddy/usage') && c[1] === 'DELETE').length");
+  const beforeDelete = await deletesBefore();
   await page.cdp.evaluate(`(() => { const b=[...document.querySelectorAll('.wb-btn')].find(x=>x.textContent.includes('清空账本')); b && b.click(); })()`);
   await sleep(400);
   const declined = await page.cdp.evaluate("JSON.stringify(window.__dialogs)");
   const declinedDialogs = JSON.parse(declined || '[]');
   if (!declinedDialogs.length) problems.push('「清空账本」没有二次确认');
-  const afterDecline = await inspect(page.cdp);
-  if (afterDecline.calls.length !== beforeClear.calls.length) problems.push('在确认框里点了「取消」，却仍然发出了请求');
+  const afterDelete = await deletesBefore();
+  if (afterDelete !== beforeDelete) problems.push('在确认框里点了「取消」，却仍然发出了 DELETE 请求');
   // 这次点「确定」，应当真的发出 DELETE
   await page.cdp.evaluate("window.__confirmAnswer = true;");
   await page.cdp.evaluate(`(() => { const b=[...document.querySelectorAll('.wb-btn')].find(x=>x.textContent.includes('清空账本')); b && b.click(); })()`);

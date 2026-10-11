@@ -34,6 +34,10 @@ export const FIXTURES = {
         // （曾经误写成 `.../v2/chat/completions`，于是 README 截图里显示的"上游端点"
         //  是个接口路径，与真实面板对不上）
         auth: { userId: 'wb-8f2c1a4e', endpoint: 'https://copilot.tencent.com', expiresAt: new Date(now + 44 * 86_400_000).toISOString(), expired: false },
+        // 真实桥的 /health 会回传它正在读的登录文件 —— 面板靠它把"分组"对上
+        // "账号快照"。少了它，账号页只能显示「(未识别账号)」（截图里就会出现
+        // 这个占位符，像没做完）。
+        authFile: 'C:\\Users\\demo\\AppData\\Local\\CodeBuddyExtension\\Data\\Public\\auth\\workbuddy-desktop.info',
         catalogSize: 30, catalogAt: new Date(now - 300_000).toISOString(),
       },
       error: '',
@@ -43,6 +47,26 @@ export const FIXTURES = {
     /** 控制台状态：这一页的主入口。 */
     console: { state: 'running', url: 'http://127.0.0.1:8792', error: '', managed: false, autoStart: true },
     route: { registered: true, provider: 'workbuddy', error: '', fallback: false },
+    /**
+     * 账号分组：一个手写分组 + 一个**纳管分组**。
+     *
+     * 纳管分组是刻意的回归夹具：它的 authFile（`7ffbd7f5-….info`）**不在**
+     * 客户端登录目录的快照里 —— 凭据在 `$DSH_HOME/workbuddy-accounts/` 下。
+     * 面板若只按 authFile 去客户端快照里找，这一行就会显示「(未识别账号)」
+     * （曾经的实现就是这样）。`account` 字段是修复的关键（宿主从桥 /health 取）。
+     */
+    accountGroups: [
+      {
+        id: 'ai', provider: 'workbuddy-ai', displayName: 'WorkBuddy 国际版',
+        port: 8791, authFile: 'workbuddy-desktop-ai.info', account: '450000000000',
+        registered: true, error: '',
+      },
+      {
+        id: 'm7ffbd7f5', provider: 'workbuddy-m7ffbd7f5', displayName: '纳管账号 7ffbd7f5',
+        port: 8793, authFile: '7ffbd7f5-36e2-4eed-b911-8cc6a14e0d2b.info', account: '7ffbd7f5-36e2-4eed-b911-8cc6a14e0d2b',
+        registered: true, error: '',
+      },
+    ],
     directory: [
       { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1000000, maxTokens: 128000, images: true, credits: 0.11, free: false, vendor: 'f', tags: ['craft'], badges: [] },
       { id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1000000, maxTokens: 48000, images: true, credits: 0.79, free: false, vendor: 'e', tags: ['craft'], badges: [] },
@@ -162,6 +186,29 @@ FIXTURES.consoleCheckin = {
   ok: true,
   status: { todayCheckedIn: true, todayCredit: 18, streakDays: 6 },
   checkin: { auto: true, lastAt: now - 3600000, lastResult: 'ok', lastError: null, lastSource: 'manual' },
+};
+/**
+ * 纳管账号（插件自己存档 / OAuth 登录拿到的凭据）。
+ *
+ * **这个桩是必须的**：`/workbuddy/login` 不在桩清单里时，未命中的 fetch 会
+ * `return original.apply(...)` 走**真实网络** → 404 → 触发 `useJson` 的三次
+ * 退避重试（0.5+1+1.5 秒）。那些在途重试会漏进后面的断言窗口，把"取消时不该
+ * 发请求"这类时序断言弄红（实测踩过：报错指向完全无关的清空账本按钮）。
+ * 顺带让纳管区在渲染测试与 i18n 扫描里有内容可查。
+ */
+FIXTURES.managedAccounts = {
+  ok: true,
+  regions: [{ id: 'cn', label: '国内版' }],
+  accounts: [
+    {
+      uid: '7ffbd7f5-36e2-4eed-b911-8cc6a14e0d2b',
+      path: 'C:\\Users\\demo\\.dsh\\workbuddy-accounts\\7ffbd7f5-36e2-4eed-b911-8cc6a14e0d2b.info',
+      domain: 'www.codebuddy.cn',
+      expiresAt: now + 27 * 86400000,
+      remainingMs: 27 * 86400000,
+      expired: false,
+    },
+  ],
 };
 
 /** 尽量抓真实数据；任一接口失败就整体退回样例（保持自洽）。 */
@@ -362,6 +409,9 @@ export function buildRoutes(data) {
     '/workbuddy/migrate': { ok: true, found: false, files: [], changed: false },
     // 积分刷新（POST）的桩：返回一份"刷新后"的形状
     '/workbuddy/quota': { ok: true, quota: FIXTURES.status.quota, quotaError: '', at: new Date().toISOString(), refreshed: true },
+    // 纳管账号列表（GET）+ 登录动作（POST）。
+    // 必须给桩：未命中会透传真实网络（见 FIXTURES.managedAccounts 的说明）。
+    '/workbuddy/login': FIXTURES.managedAccounts,
     // 控制台域功能（插件透传）。这些**不依赖**实时抓取，始终用内置样例，
     // 形状与控制台一致。
     '/workbuddy/console-api/overview': FIXTURES.consoleOverview,

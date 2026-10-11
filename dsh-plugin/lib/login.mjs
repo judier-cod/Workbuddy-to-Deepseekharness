@@ -17,8 +17,8 @@
  *
  * 设计文档：docs/2026-10-11-account-login-module-design.md
  */
-import { chmodSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { chmodSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 
 /**
  * 上游 pending 码：授权还没完成。
@@ -59,6 +59,29 @@ export function accountDir(dshHome) {
 /** 文件名用 uid：同一账号重复登录覆盖同一文件，不会攒出一堆重复凭据。 */
 function fileFor(dir, uid) {
   return join(dir, `${String(uid).replace(/[^A-Za-z0-9_-]+/g, '') || 'unknown'}.info`);
+}
+
+/**
+ * 原子写一个凭据文件（临时文件 + rename，权限 0600）。
+ *
+ * 为什么不能用 `writeFileSync` 直接覆盖：**分组桥每次请求都在读这个文件**。
+ * 巡检每 15 秒重写一次存档，写到一半被桥读到就是半个 JSON → 凭据读取失败 →
+ * 桥 `/health` 回 503（表现为"账号突然不可用"，而文件其实完好）。
+ * `rename` 在同目录内是原子的，读者要么看到旧版本、要么看到新版本。
+ *
+ * 与仓库既有做法一致：`lib/dsh.mjs` 写 dsh 配置、桥截断用量账本都是这一套。
+ */
+function atomicWrite(dest, text) {
+  const tmp = `${dest}.tmp-${process.pid}`;
+  try {
+    writeFileSync(tmp, text, 'utf8');
+    try { chmodSync(tmp, 0o600); } catch { /* 非 POSIX 上无意义 */ }
+    renameSync(tmp, dest);
+  } catch (error) {
+    // 失败要清掉临时文件，否则纳管目录会攒一堆 .tmp-<pid>
+    try { rmSync(tmp, { force: true }); } catch { /* 忽略 */ }
+    throw error;
+  }
 }
 
 function decodeJwtSub(token) {
@@ -238,8 +261,8 @@ async function persist(dir, data) {
 
   mkdirSync(dir, { recursive: true });
   const path = fileFor(dir, uid);
-  writeFileSync(path, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
-  try { chmodSync(path, 0o600); } catch { /* 非 POSIX 上无意义，忽略 */ }
+  // 与存档走同一个原子写：分组桥随时在读这个文件（见 atomicWrite 的说明）
+  atomicWrite(path, `${JSON.stringify(payload, null, 2)}\n`);
 
   return {
     uid,
@@ -248,6 +271,87 @@ async function persist(dir, data) {
     expiresAt: payload.auth.expiresAt,
     refreshExpiresAt: payload.auth.refreshExpiresAt,
   };
+}
+
+/**
+ * 把客户端**当前**的登录快照存档一份到纳管目录（原样复制，不重新加密）。
+ *
+ * 为什么必须有这一步：客户端切账号时会**覆盖** `workbuddy-desktop.info`，
+ * 旧账号就不再存在于磁盘上（实测：切走的那个账号在磁盘上彻底没了）。所以
+ * "切账号后旧账号还能用"这件事，只能在切换**发生之前**就把快照存下来。
+ * 我们已经有 15 秒一次的账号巡检在读客户端快照，顺手存档即可，不需要用户做
+ * 任何事，也不需要走 OAuth。
+ *
+ * 为什么是**原样复制**而不是重新封装：客户端写的本来就是同一套 AtRest 信封、
+ * 同一把 build 密钥，桥原样就能解开 —— 复制比重新加密更简单，也不可能引入
+ * "封装格式与客户端不一致"这类新故障。只在文件里加一个 `managed` 标记，
+ * 让 `listManagedAccounts()` 认得出这是插件纳管的。
+ *
+ * **滚动存档**：每次都按源文件是否更新决定要不要重写，因此**当前正在用的账号**
+ * 会跟着客户端一起刷新（不会 30 天过期）；只有不再活跃的账号才会随令牌自然过期。
+ *
+ * @param {object} options
+ * @param {string} options.dshHome
+ * @param {string} options.uid 目标账号标识（取自桥 /health 的 auth.userId）
+ * @param {string} options.sourcePath 客户端登录文件路径（桥 /health 的 authFile）
+ * @returns {{ok: boolean, changed?: boolean, path?: string, reason?: string}}
+ */
+export function archiveSnapshot({ dshHome, uid, sourcePath }) {
+  const id = String(uid || '').replace(/[^A-Za-z0-9_-]+/g, '');
+  if (!id) return { ok: false, reason: '缺少账号标识' };
+  const src = String(sourcePath || '');
+  if (!src) return { ok: false, reason: '缺少来源登录文件' };
+
+  const dir = accountDir(dshHome);
+  const dest = fileFor(dir, id);
+
+  // 来源就在纳管目录里（桥正读着我们自己的存档）：不要自己复制自己，
+  // 否则下一次存档会把 managed 标记与来源信息覆盖掉，且毫无意义。
+  if (resolve(src) === resolve(dest)) return { ok: true, changed: false, path: dest, reason: '来源即存档' };
+
+  let raw;
+  let srcMtime;
+  try {
+    raw = readFileSync(src, 'utf8');
+    srcMtime = statSync(src).mtimeMs;
+  } catch (error) {
+    return { ok: false, reason: `读不到来源登录文件：${String(error?.message || error)}` };
+  }
+
+  // 已有存档且来源没更新过 → 什么都不用做（秒级巡检的常态路径）
+  try {
+    const existing = JSON.parse(readFileSync(dest, 'utf8'));
+    if (existing?.managed && Number(existing.sourceMtime || 0) === srcMtime) {
+      return { ok: true, changed: false, path: dest };
+    }
+  } catch { /* 没有 / 坏了：下面重写 */ }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    return { ok: false, reason: `来源不是合法 JSON：${String(error?.message || error)}` };
+  }
+  if (!parsed?.auth) return { ok: false, reason: '来源里没有 auth 段（不是登录文件？）' };
+
+  // 原样保留 auth（AtRest 信封照旧），只加标记与来源信息。
+  // **不写任何明文令牌**：这里全程没有解密动作。
+  const payload = {
+    ...parsed,
+    managed: true,
+    /** 存档来源（排障用）：哪个文件、存于何时、当时的 mtime */
+    archivedFrom: src,
+    archivedAt: Date.now(),
+    sourceMtime: srcMtime,
+  };
+
+  try {
+    mkdirSync(dir, { recursive: true });
+    atomicWrite(dest, `${JSON.stringify(payload, null, 2)}\n`);
+  } catch (error) {
+    return { ok: false, reason: `写入存档失败：${String(error?.message || error)}` };
+  }
+  return { ok: true, changed: true, path: dest };
 }
 
 /**

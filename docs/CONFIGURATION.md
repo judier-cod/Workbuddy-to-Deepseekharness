@@ -82,6 +82,29 @@ copy .env.example .env
 > `workbuddy-desktop-ai.info`）。仅按目录顺序取第一个会**选错账号**，
 > 因此本项目的默认值是固定的 `workbuddy-desktop.info`。
 
+### 多账号（插件侧）
+
+插件（`dsh-plugin/`）在 profile 的 `cordis.patch.yml` 里配置。多账号相关的键：
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `accounts` | `[]` | **手写**的账号分组：`[{ id, displayName, authFile, port }]`。每组一条独立桥、独立 provider（`<前缀><id>`） |
+| `accountProviderPrefix` | `workbuddy-` | 分组的 provider 前缀。`id: ai` → provider 名 `workbuddy-ai` |
+| `accountWatchMs` | `15000` | **账号巡检间隔**（毫秒），`0` = 关闭 |
+
+`accountWatchMs` 的巡检做三件事（独立于面板，不需要打开设置页）：
+
+1. **自动存档**：把客户端当前账号的快照存到 `$DSH_HOME/workbuddy-accounts/<uid>.info`，
+   并注册成独立分组 —— 于是"在客户端里切账号"会自动积累成多个账号。
+   滚动更新：当前活跃的账号跟着客户端刷新，不会过期。
+2. **对账**：发现某个桥换了账号就作废该账号的目录/积分缓存，并广播
+   `llm/adapters-updated`（否则 dsh 的模型选择器不会重拉模型列表）。
+3. 记录各分组服务的账号（面板上"这一组是哪个账号"）。
+
+> 存档文件是**原样复制**的客户端加密快照（AtRest 信封、原子写、权限 `0600`），
+> 不含明文凭据，也**不是**由 OAuth 重新加密的 —— 桥原样就能读，因此不需要改桥。
+> 只有不再活跃的账号才会随令牌自然过期（约 30 天），那时重登一次即可。
+
 ### DeepSeek Harness
 
 | 变量 | 默认值 | 说明 |

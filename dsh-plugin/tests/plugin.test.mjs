@@ -456,10 +456,12 @@ test('账号巡检：没人开设置页也能发现换账号并广播（回归�
       health: { auth: { userId: currentAccount, expiresAt: new Date(Date.now() + 864e5).toISOString() } },
     });
 
-    // 先让巡检看到账号 A（这一步只记录身份，不广播）
+    // 先让巡检看到账号 A。
+    // 注意：**不能断言"此刻广播次数为 0"** —— 插件加载时会做一次激活探测
+    // （要探明主账号才能排除它），那次探测可能先于本测试的打桩落到真实桥上，
+    // 于是首次观察到 A 就是一次"变化"。所以基线要在 A 稳定之后再取。
     await waitFor(() => result.state.bridgeAccount === 'A', 2000);
     const baseline = calls.adaptersUpdated;
-    assert.equal(baseline, 0, '首次观察身份不该广播（没有变化）');
 
     // 预置一份目录，用来断言"换号后目录被作废"
     result.adapter.catalogCache = { at: Date.now(), models: [{ id: 'm-from-A' }] };
@@ -1657,10 +1659,10 @@ test('上下文覆盖：分组 adapter 必须拿到面板保存的上限（回�
  * （bridgePort 8790 + accounts[ai]=8791 + consolePort 8792）复现过：纳管分组会
  * 与控制台抢同一个端口，起桥直接失败。
  */
-test('纳管账号分配端口：必须避开控制台端口（回归：抢 8792 起不来）', () => {
+test('纳管账号分配端口：必须避开控制台端口（回归：抢 8792 起不来）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wb-managed-port-'));
   try {
-    // 造一个纳管凭据，让 apply() 把并入逻辑跑起来
+    // 造一个纳管凭据，让激活逻辑有东西可注册
     const adir = join(dir, 'workbuddy-accounts');
     mkdirSync(adir, { recursive: true });
     writeFileSync(join(adir, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.info'), JSON.stringify({
@@ -1684,6 +1686,16 @@ test('纳管账号分配端口：必须避开控制台端口（回归：抢 8792
       accounts: [{ id: 'ai', displayName: '国际版', authFile: 'C:/a/ai.info', port: 8791 }],
       accountProviderPrefix: 'workbuddy-',
     });
+
+    // 主桥打桩成**别的**账号，这样纳管账号不会被"与主账号相同"排除掉。
+    // （不打桩会去打真实 8790，测试就依赖本机环境了。）
+    result.supervisor.probe = async () => ({
+      state: 'running',
+      health: { auth: { userId: 'some-other-account' }, authFile: 'C:/x/other.info' },
+    });
+    // 激活是异步的（加载时那次是 fire-and-forget）：这里确定性地驱动一次。
+    // 幂等，重复调用安全。
+    await result.activateManagedGroups();
 
     const groups = result.state.accountGroups || [];
     assert.equal(groups.length, 2, '手写分组 + 纳管分组都应在册');

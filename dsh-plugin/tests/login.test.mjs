@@ -9,12 +9,13 @@
  * 误判成成功/失败"的关键分支。
  */
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
 
 import {
+  archiveSnapshot,
   cancelLogin,
   listManagedAccounts,
   pollLogin,
@@ -206,4 +207,115 @@ test('纳管目录：不在仓库内（防凭据被 git 提交）', () => {
   const repoRoot = join(process.cwd(), '..');
   assert.equal(existsSync(join(repoRoot, 'workbuddy-accounts')), false,
     '纳管目录不能落在仓库根');
+});
+
+// ── 自动存档 ────────────────────────────────────────────────────────────
+// 这是"切账号后旧账号还在"的唯一实现方式：客户端切账号会覆盖
+// workbuddy-desktop.info，切走的账号在磁盘上就没了。必须在切换前持续存档。
+
+/** 造一个"客户端登录文件"（内容是 AtRest 信封占位，存档不需要解密）。 */
+function writeClientAuth(dir, { uid = 'cafe0000-1111-2222-3333-444455556666', mark = 'v1' } = {}) {
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, 'workbuddy-desktop.info');
+  writeFileSync(path, JSON.stringify({
+    account: { uin: '330125158554', nickname: '' },
+    auth: { accessToken: { $wbEncrypted: 1, envelope: mark }, domain: 'www.codebuddy.cn', expiresAt: Date.now() + 864e5 },
+    accounts: [], allAccounts: [],
+  }, null, 2), 'utf8');
+  return { path, uid };
+}
+
+test('自动存档：原样复制客户端快照，并打上纳管标记', () => {
+  const clientDir = join(dir, 'client-auth');
+  const { path: src, uid } = writeClientAuth(clientDir);
+  const r = archiveSnapshot({ dshHome: dir, uid, sourcePath: src });
+  assert.equal(r.ok, true);
+  assert.equal(r.changed, true, '首次存档必须写入');
+
+  const saved = JSON.parse(readFileSync(r.path, 'utf8'));
+  assert.equal(saved.managed, true, '必须打上 managed 标记，否则 listManagedAccounts 认不出');
+  assert.equal(saved.archivedFrom, src, '要记下来源，便于排障');
+  // **原样**：auth 段一个字节都不改（不重新加密，也就不会引入格式差异）
+  const original = JSON.parse(readFileSync(src, 'utf8'));
+  assert.deepEqual(saved.auth, original.auth, 'auth 段必须原样保留（不重新封装）');
+  // 存档后它就该出现在纳管列表里
+  assert.equal(listManagedAccounts(dir).length, 1);
+});
+
+test('自动存档：来源没变就不重写（巡检每 15 秒跑，不能反复写盘）', () => {
+  const clientDir = join(dir, 'client-auth');
+  const { path: src, uid } = writeClientAuth(clientDir);
+  assert.equal(archiveSnapshot({ dshHome: dir, uid, sourcePath: src }).changed, true);
+  const again = archiveSnapshot({ dshHome: dir, uid, sourcePath: src });
+  assert.equal(again.ok, true);
+  assert.equal(again.changed, false, '来源 mtime 没变 → 不该重复写盘');
+});
+
+test('自动存档：来源更新后滚动覆盖（活跃账号跟着客户端刷新，不会 30 天过期）', async () => {
+  const clientDir = join(dir, 'client-auth');
+  const { path: src, uid } = writeClientAuth(clientDir, { mark: 'v1' });
+  assert.equal(archiveSnapshot({ dshHome: dir, uid, sourcePath: src }).changed, true);
+
+  // 客户端刷新了令牌（mtime 变化）→ 存档必须跟上
+  await new Promise((r) => setTimeout(r, 20));
+  writeClientAuth(clientDir, { mark: 'v2' });
+  const r = archiveSnapshot({ dshHome: dir, uid, sourcePath: src });
+  assert.equal(r.changed, true, '来源更新后必须重写存档');
+  const saved = JSON.parse(readFileSync(r.path, 'utf8'));
+  assert.equal(saved.auth.accessToken.envelope, 'v2', '存档必须反映客户端的最新令牌');
+});
+
+test('自动存档：来源就在纳管目录里时不自复制（否则会覆盖掉标记）', () => {
+  const adir = join(dir, 'workbuddy-accounts');
+  const path = writeManaged(adir, 'self0000000000');
+  const r = archiveSnapshot({ dshHome: dir, uid: 'self0000000000', sourcePath: path });
+  assert.equal(r.ok, true);
+  assert.equal(r.changed, false, '来源即存档：不该自我复制');
+  // 标记必须还在
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).managed, true);
+});
+
+test('自动存档：来源不存在 / 非法 JSON / 缺少 auth 段都如实报错，不写坏文件', () => {
+  const missing = archiveSnapshot({ dshHome: dir, uid: 'a11111111111', sourcePath: join(dir, 'nope.info') });
+  assert.equal(missing.ok, false);
+  assert.match(missing.reason, /读不到来源/);
+
+  mkdirSync(dir, { recursive: true });
+  const bad = join(dir, 'bad.info');
+  writeFileSync(bad, '{不是 JSON', 'utf8');
+  const r1 = archiveSnapshot({ dshHome: dir, uid: 'a22222222222', sourcePath: bad });
+  assert.equal(r1.ok, false);
+  assert.match(r1.reason, /不是合法 JSON/);
+
+  const noAuth = join(dir, 'noauth.info');
+  writeFileSync(noAuth, JSON.stringify({ account: {} }), 'utf8');
+  const r2 = archiveSnapshot({ dshHome: dir, uid: 'a33333333333', sourcePath: noAuth });
+  assert.equal(r2.ok, false);
+  assert.match(r2.reason, /没有 auth 段/);
+
+  // 三次失败都不该留下纳管文件
+  assert.equal(listManagedAccounts(dir).length, 0, '失败不能留下半个存档');
+});
+
+test('自动存档：缺少 uid / 来源路径时拒绝', () => {
+  assert.equal(archiveSnapshot({ dshHome: dir, uid: '', sourcePath: 'C:/x.info' }).ok, false);
+  assert.equal(archiveSnapshot({ dshHome: dir, uid: 'abc', sourcePath: '' }).ok, false);
+});
+
+/**
+ * 原子写：分组桥随时在读凭据文件，写到一半被读到 = 半个 JSON = 桥 503。
+ * 这条钉住"写完之后目录里只剩目标文件"——临时文件必须被 rename 掉，不能残留。
+ */
+test('自动存档：原子写，不留临时文件', () => {
+  const clientDir = join(dir, 'client-auth');
+  const { path: src, uid } = writeClientAuth(clientDir);
+  assert.equal(archiveSnapshot({ dshHome: dir, uid, sourcePath: src }).ok, true);
+
+  const adir = join(dir, 'workbuddy-accounts');
+  const leftover = readdirSync(adir).filter((f) => f.includes('.tmp'));
+  assert.deepEqual(leftover, [], `不该留下临时文件：${leftover.join(', ')}`);
+  // 目录里只有那一个凭据文件
+  assert.deepEqual(readdirSync(adir), [`${uid}.info`]);
+  // 内容必须是**完整** JSON（原子写的目的就是读者永远看到完整文件）
+  assert.ok(JSON.parse(readFileSync(join(adir, `${uid}.info`), 'utf8')).managed);
 });

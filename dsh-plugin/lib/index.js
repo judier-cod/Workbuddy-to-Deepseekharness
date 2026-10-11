@@ -36,7 +36,7 @@ import { WorkBuddyAdapter } from './adapter.mjs';
 import { toDirectory, pickDefaultModel } from './models.mjs';
 import { createTools } from './tools.mjs';
 import { createRouteTable, mountRoutes } from './routes.mjs';
-import { listManagedAccounts } from './login.mjs';
+import { archiveSnapshot, listManagedAccounts } from './login.mjs';
 import { cleanLegacyRoutes, detectLegacyRoutes } from './legacy.mjs';
 
 export const name = 'workbuddy';
@@ -1137,36 +1137,30 @@ export function apply(ctx, rawConfig = {}) {
   const accountGroups = [];
   state.accountGroups = accountGroups;
 
-  // 插件自己纳管的账号（设置页「添加账号」走 OAuth 拿到的）与 cordis.patch.yml
-  // 里手写的 accounts 合并 —— 用户不必为了用纳管账号再去改配置文件。
-  //
-  // 合并而非替换：手写的配置是**显式意图**，纳管的是**运行时新增**，两者可以
-  // 共存。id 由 asAccounts() 去重；端口必须**这里显式算**，不能交给 asAccounts
-  // 的自动分配 —— 那套逻辑是 `basePort + 已处理条数 + 1`，只看列表位置不看
-  // 实际占用，手写分组占过 8791、控制台占着 8792 时，纳管账号会被分到 8792
-  // 撞上控制台（真实配置复现过）。取「已知最高端口 + 1」从根上避开。
-  try {
-    const managed = listManagedAccounts(dshPaths.home);
-    if (managed.length) {
-      const consolePort = Number(config.consolePort) || 0;
-      let nextPort = Math.max(config.bridgePort, consolePort, ...config.accounts.map((a) => Number(a.port) || 0));
-      const merged = [
-        ...config.accounts.map((a) => ({ id: a.id, displayName: a.displayName, authFile: a.authFile, port: a.port, token: a.token })),
-        ...managed.map((a) => ({
-          id: `m${a.uid.slice(0, 8)}`,
-          displayName: `纳管账号 ${a.uid.slice(0, 8)}`,
-          authFile: a.path,
-          port: (nextPort += 1),
-        })),
-      ];
-      config.accounts = asAccounts(merged, config.accountProviderPrefix, config.bridgePort);
-      log(`并入 ${managed.length} 个纳管账号`);
-    }
-  } catch (error) {
-    log('读取纳管账号失败（不影响手写配置）', error);
-  }
+  /**
+   * 纳管账号（插件存档的 + 设置页 OAuth 登录的）**不在这里**并进 `config.accounts`。
+   *
+   * 原因：分组注册必须**排除主桥当前服务的那个账号**（同一账号起两条桥既浪费，
+   * 又会让两个进程并发刷新同一会话 —— 上游会轮换 refresh token，并发刷新可能
+   * 把会话吊销）。而主桥的账号要异步探测才知道，这个函数是同步的。
+   *
+   * 所以纳管账号统一交给 {@link activateManagedGroups} 处理：它会先探明主账号、
+   * 排除掉它，再把其余的注册成分组。手写配置仍然在这里同步注册，保持启动即就绪。
+   */
 
-  for (const account of config.accounts) {
+  /**
+   * 注册一个账号分组：独立桥 + 独立 provider + 独立适配器。
+   *
+   * 抽成函数是为了**运行时也能加**：客户端切账号后，旧账号要被自动变成一个
+   * 分组（见 7c 的巡检），不能等到下次重启 dsh。
+   *
+   * 幂等：同一个 provider 已存在就直接返回（巡检每秒级跑，不能重复注册）。
+   *
+   * @param {{id: string, provider: string, displayName: string, authFile: string, port: number, token?: string}} account
+   * @returns {object|null} 分组对象（已存在时返回 null）
+   */
+  function registerAccountGroup(account) {
+    if (accountGroups.some((g) => g.provider === account.provider)) return null;
     const group = {
       id: account.id,
       provider: account.provider,
@@ -1302,7 +1296,11 @@ export function apply(ctx, rawConfig = {}) {
       group.error = String(error?.message || error);
       log(`分组 "${account.id}" 注册失败（不影响其它分组）：`, group.error);
     }
+    return group;
   }
+
+  /** 启动时把配置里（含已纳管）的账号都注册成分组。 */
+  for (const account of config.accounts) registerAccountGroup(account);
 
   // ── 3. 运行态快照（入口页 / 工具共用） ─────────────────────────────────
   const CHECKIN_TTL_MS = 30 * 60 * 1000;
@@ -1379,6 +1377,102 @@ export function apply(ctx, rawConfig = {}) {
       } catch { /* 单个分组探测失败：不影响其它，也不影响主流程 */ }
     }));
     return changed;
+  }
+
+  /** 下一个空闲分组端口：从所有已知占用的最大值 +1 起找（控制台端口也算已知占用）。 */
+  function nextFreeGroupPort() {
+    const used = new Set([config.bridgePort || 0, config.consolePort || 0]);
+    for (const g of accountGroups) used.add(Number(g.port) || 0);
+    let port = Math.max(...used) + 1;
+    // 端口可能被别的东西占着（最大值之后一般不会，但仍要保证不撞车）
+    while (used.has(port) && port <= 65535) port += 1;
+    return port > 65535 ? 0 : port;
+  }
+
+  /**
+   * 拉起一个分组的桥并记下它的账号（启动路径与运行时激活共用）。
+   *
+   * 失败只记在 group 上，不抛 —— 一个账号起不来不能让别的账号或主流程受影响。
+   */
+  async function startGroupBridge(group) {
+    if (!group?.supervisor) return null;
+    try {
+      const result = await group.supervisor.ensure({ readyTimeoutMs: config.autoStartTimeoutMs });
+      group.lastEnsure = { at: Date.now(), ...result };
+      if (result.ok) {
+        group.adapter?.invalidate();
+        group.account = result.health?.auth?.userId || null;
+        log(`分组「${group.displayName}」桥已就绪：${group.supervisor.baseUrl}/v1（端口 ${group.port}，账号 ${String(group.account || '?').slice(0, 8)}…）`);
+      } else {
+        group.error = result.error || '';
+        log(`分组「${group.displayName}」桥未能就绪：${result.error}`);
+      }
+      return result;
+    } catch (error) {
+      group.error = String(error?.message || error);
+      log(`分组「${group.displayName}」启动桥失败`, error);
+      return null;
+    }
+  }
+
+  /**
+   * 把纳管目录里**尚未成为分组**的账号激活成分组。
+   *
+   * 排除当前主桥服务的那个账号：它已经由主 provider（`workbuddy`）提供，再起一条
+   * 桥会是同一账号的两个进程 —— 既浪费，也会让两条桥并发刷新同一会话（上游会
+   * 轮换 refresh token，并发刷新可能把会话吊销）。
+   *
+   * @returns {Promise<number>} 本次新激活的分组数
+   */
+  async function activateManagedGroups() {
+    // 主账号未知时先探一次（限时 2 秒）：排除它靠的就是这个身份。
+    // 首次调用发生在插件加载后不久，此时桥可能还没起来 —— 探不到就先注册不了，
+    // 下一次巡检（15 秒后）会补上。
+    if (state.bridgeAccount === null) {
+      try {
+        reconcileAccount(await supervisor.probe(AbortSignal.timeout(2000)));
+      } catch (error) {
+        log('激活纳管账号前探测主桥失败（下次巡检重试）', error);
+      }
+    }
+    let added = 0;
+    let managed = [];
+    /** 本次新注册的分组：循环结束后**并行**起桥（见下方说明）。 */
+    const pending = [];
+    try {
+      managed = listManagedAccounts(dshPaths.home);
+    } catch (error) {
+      log('读取纳管账号失败（跳过激活）', error);
+      return 0;
+    }
+    for (const account of managed) {
+      if (account.expired) continue;                                  // 过期的不起桥，面板会标红
+      if (account.uid === state.bridgeAccount) continue;              // 主账号：主桥已经在服务
+      const id = `m${account.uid.slice(0, 8)}`;
+      const provider = `${config.accountProviderPrefix}${id}`;
+      if (accountGroups.some((g) => g.provider === provider)) continue;
+      const port = nextFreeGroupPort();
+      if (!port) { log('没有空闲端口，无法为新账号起桥'); continue; }
+      const group = registerAccountGroup({
+        id,
+        provider,
+        displayName: `纳管账号 ${account.uid.slice(0, 8)}`,
+        authFile: account.path,
+        port,
+        token: '',
+      });
+      if (!group) continue;
+      log(`检测到新账号 ${account.uid.slice(0, 8)}…，已注册为分组 ${provider}（端口 ${port}）`);
+      added += 1;
+      pending.push(group);
+    }
+    /*
+     * 起桥**并行**：串行时 N 个账号最坏要等 N × 30 秒（每个 readyTimeoutMs），
+     * 而它们之间没有任何依赖（各自的端口、登录文件、日志都隔离）。失败的仍然
+     * 只记在自己的 group 上 —— startGroupBridge 自己 catch，不会拖累别的分组。
+     */
+    if (config.autoStart && pending.length) await Promise.all(pending.map((g) => startGroupBridge(g)));
+    return added;
   }
 
   /**
@@ -1546,6 +1640,15 @@ export function apply(ctx, rawConfig = {}) {
         displayName: g.displayName,
         port: g.port,
         authFile: g.authFile ? g.authFile.split(/[\\/]/).pop() : '',
+        /**
+         * 该分组服务的账号（桥 /health 报的 userId）。
+         *
+         * 面板靠它显示"这一组是哪个账号"：**不能**只按 authFile 去客户端快照里
+         * 对照 —— 纳管账号的凭据在 `$DSH_HOME/workbuddy-accounts/` 下，而那份
+         * 快照是客户端登录目录的清单，永远匹配不上，于是纳管分组会显示成
+         * 「(未识别账号)」（实测就是这个现象）。
+         */
+        account: g.account || null,
         registered: g.registered,
         error: g.error,
       })),
@@ -1787,24 +1890,20 @@ export function apply(ctx, rawConfig = {}) {
   if (config.autoStart) {
     for (const group of accountGroups) {
       if (!group.registered || !group.supervisor) continue;
-      void (async () => {
-        try {
-          const result = await group.supervisor.ensure({ readyTimeoutMs: config.autoStartTimeoutMs });
-          group.lastEnsure = { at: Date.now(), ...result };
-          if (result.ok) {
-            group.adapter?.invalidate();
-            // 记下该分组服务的账号（仅用于展示 "哪个分组是哪个账号"）
-            group.account = result.health?.auth?.userId || null;
-            log(`分组「${group.displayName}」桥已就绪：${group.supervisor.baseUrl}/v1（端口 ${group.port}，账号 ${String(group.account || '?').slice(0, 8)}…）`);
-          } else {
-            log(`分组「${group.displayName}」桥未能就绪：${result.error}`);
-          }
-        } catch (error) {
-          log(`分组「${group.displayName}」自动启动桥失败`, error);
-        }
-      })();
+      void startGroupBridge(group);
     }
   }
+
+  /**
+   * 纳管账号（自动存档 / OAuth 登录拿到的）激活成分组。
+   *
+   * **不受 autoStart 限制**：这里只负责"注册成分组"，起不起桥由 autoStart 决定
+   * （与手写分组同一套语义）。不放在同步的注册阶段，是因为**必须排除主桥当前
+   * 服务的账号**才知道该给谁起桥，而那个身份要异步探测（见
+   * {@link activateManagedGroups} 的说明）。加载后立刻跑一次让分组尽快可用，
+   * 之后由 7c 的巡检持续补新账号。
+   */
+  void activateManagedGroups().catch((error) => log('激活纳管账号失败（不影响手写分组）', error));
 
   // ── 7c. 账号巡检：换账号后主动让 dsh 的模型选择器跟上 ──────────────────
   /**
@@ -1829,10 +1928,38 @@ export function apply(ctx, rawConfig = {}) {
         try {
           const probe = await supervisor.probe();
           const main = reconcileAccount(probe);
+
+          /**
+           * 把客户端当前账号**存档**成纳管凭据。
+           *
+           * 这是"切账号后旧账号还在"的唯一实现方式：客户端切账号会**覆盖**
+           * `workbuddy-desktop.info`，切走的账号在磁盘上就没了（实测确认过）。
+           * 所以必须在切换**发生之前**持续存档 —— 巡检每 15 秒读一次快照，顺手
+           * 存一份即可，用户什么都不用做，也不需要 OAuth。
+           *
+           * 滚动更新：源文件没变就不重写，因此**当前活跃的账号**会跟着客户端一起
+           * 刷新（不会 30 天过期）；只有不再活跃的账号才会自然过期。
+           */
+          if (probe.state === 'running') {
+            const uid = bridgeAccountOf(probe);
+            const src = probe.health?.authFile;
+            if (uid && src) {
+              const archived = archiveSnapshot({ dshHome: dshPaths.home, uid, sourcePath: src });
+              if (archived.ok && archived.changed) {
+                log(`已存档账号 ${uid.slice(0, 8)}…（来源 ${String(src).split(/[\\/]/).pop()}）`);
+              } else if (!archived.ok) {
+                log(`存档账号失败（忽略）：${archived.reason}`);
+              }
+            }
+          }
+
           const groups = await reconcileGroupAccounts();
-          if (main.changed || groups) {
+          // 存档之后再看有没有"还没成为分组"的账号 —— 换账号后旧账号会在这里
+          // 自动变成独立分组，**不需要重启 dsh**。
+          const activated = await activateManagedGroups();
+          if (main.changed || groups || activated) {
             notifyAdaptersUpdated();
-            log(`账号巡检：身份变化（主桥=${main.changed ? '是' : '否'}，分组=${groups ? '是' : '否'}），已广播模型拓扑变更`);
+            log(`账号巡检：身份变化（主桥=${main.changed ? '是' : '否'}，分组=${groups ? '是' : '否'}，新分组=${activated}），已广播模型拓扑变更`);
           }
         } catch (error) {
           log('账号巡检失败（忽略，不影响其它功能）', error);
@@ -1848,7 +1975,9 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   log(`插件已加载：projectRoot=${projectRoot || '(未找到)'} bridge=${supervisor.baseUrl} console=${consoleSupervisor.url} provider=${state.route.provider}`);
-  return { supervisor, consoleSupervisor, client, adapter, state, snapshot };
+  // activateManagedGroups 一并返回：测试要能确定性地驱动它（它是异步的，
+  // 加载时那次是 fire-and-forget，断言不能靠等）。
+  return { supervisor, consoleSupervisor, client, adapter, state, snapshot, activateManagedGroups };
 }
 
 export default { name, inject, apply, DEFAULTS, resolveConfig, detectProjectRoot };
