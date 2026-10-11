@@ -30,7 +30,7 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { BridgeClient, BridgeSupervisor, BRIDGE_SCRIPT_REL } from './bridge.mjs';
+import { BridgeClient, BridgeSupervisor, BRIDGE_SCRIPT_REL, authFileKey, scanBridges } from './bridge.mjs';
 import { ConsoleSupervisor } from './console.mjs';
 import { WorkBuddyAdapter } from './adapter.mjs';
 import { toDirectory, pickDefaultModel } from './models.mjs';
@@ -1384,7 +1384,17 @@ export function apply(ctx, rawConfig = {}) {
     return changed;
   }
 
-  /** 下一个空闲分组端口：从所有已知占用的最大值 +1 起找（控制台端口也算已知占用）。 */
+  /**
+   * 下一个空闲分组端口：从所有已知占用的最大值 +1 起找。
+   *
+   * 已知占用 = 主桥端口 + 控制台端口 + 内存里每个分组的端口。
+   *
+   * **注意它不知道磁盘上残留的桥**：桥是 detached 的、活过 dsh 重启，所以
+   * 上一轮留下的桥仍占着端口，而这一轮的 `accountGroups` 是空的 —— 算出来的
+   * "空闲端口"可能正被它占着。这不需要在这里探测：`startGroupBridge` 拉起时
+   * 会发现"端口上是另一个账号的桥"并换端口重试（见 `portConflict`）。
+   * 探测在这里反而会更慢（每个候选都要一次 HTTP）。
+   */
   function nextFreeGroupPort() {
     const used = new Set([config.bridgePort || 0, config.consolePort || 0]);
     for (const g of accountGroups) used.add(Number(g.port) || 0);
@@ -1395,29 +1405,151 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   /**
+   * 扫描一段端口把**已经在跑的**桥按账号认领回来。
+   *
+   * 为什么必须做：桥是 detached 的、故意活过 dsh 重启。重启后插件内存里没有
+   * 任何分组记录，于是会为每个纳管账号重新分配端口、重新起桥 —— 而上一轮的桥
+   * 还在跑。结果同一账号起两三条（实测：8793 与 8794 都是 `6d2b5f6b`），它们
+   * 并发刷新同一会话，上游每次刷新都轮换 refresh token，用旧令牌的那个可能被
+   * 判异常、吊销会话。
+   *
+   * 端口靠猜不行（上一轮用哪个没有任何记录），所以**按身份认领**：扫一段候选
+   * 端口，谁报的 authFile 匹配就是谁。同账号扫出多条时**只留一条**（保留数字
+   * 最小的那个端口，行为确定），其余停掉 —— 它们正是"重复桥"本身。
+   *
+   * @returns {Promise<Map<string, {port: number, health: object}>>} key = authFileKey
+   */
+  let claimCache = { at: 0, value: null };
+  async function claimExistingBridges() {
+    /*
+     * 缓存 30 秒：启动路径（7b）与纳管激活都会调它，每次要并行探几十个端口。
+     * 复用同一份结果既省探测，也避免对同一批"多余桥"重复发 stop。
+     */
+    if (claimCache.value && Date.now() - claimCache.at < 30_000) return claimCache.value;
+    const claimed = new Map();
+    const lo = config.bridgePort + 1;
+    const ports = [];
+    for (let p = lo; p <= lo + 24; p += 1) ports.push(p);
+    try {
+      const byKey = await scanBridges({
+        host: config.bridgeHost, token: config.localToken, ports,
+      });
+      for (const [key, hits] of byKey) {
+        // 同账号多条：留端口最小的（确定性的选择），其余停掉
+        hits.sort((a, b) => a.port - b.port);
+        const keep = hits[0];
+        claimed.set(key, { port: keep.port, health: keep.health });
+        for (const extra of hits.slice(1)) {
+          log(`发现账号有重复的桥：端口 ${extra.port}（pid ${extra.pid}）与 ${keep.port} 同属一个登录文件，停掉多余的`);
+          try {
+            const sup = new BridgeSupervisor({
+              host: config.bridgeHost, port: extra.port, token: config.localToken,
+              projectRoot: projectRoot || process.cwd(), logPath: join(projectRoot || process.cwd(), 'bridge', 'bridge.log'),
+            });
+            await sup.stop();
+          } catch (error) {
+            log(`停掉重复的桥（端口 ${extra.port}）失败`, error);
+          }
+        }
+      }
+      if (claimed.size) log(`认领了 ${claimed.size} 条已在运行的桥（避免重复起桥）`);
+    } catch (error) {
+      log('扫描已有桥失败（不影响后续启动）', error);
+    }
+    claimCache = { at: Date.now(), value: claimed };
+    return claimed;
+  }
+
+  /**
    * 拉起一个分组的桥并记下它的账号（启动路径与运行时激活共用）。
    *
    * 失败只记在 group 上，不抛 —— 一个账号起不来不能让别的账号或主流程受影响。
+   *
+   * **端口上若坐着另一个账号的桥，就换端口重试**：桥是 detached 的、故意活过
+   * dsh 重启，所以新一轮启动算出的"空闲端口"可能正被上一轮的某条桥占着。
+   * 复用它会拿到别账号的额度与模型（实测：两条分组读到同一账号，面板把 A 的
+   * 积分挂在 B 名下）。
+   *
+   * @param {object} group
+   * @param {{port?: number, health?: object}} [claimed] 预先认领到的桥（见 claimExistingBridges）
    */
-  async function startGroupBridge(group) {
+  async function startGroupBridge(group, claimed) {
     if (!group?.supervisor) return null;
-    try {
-      const result = await group.supervisor.ensure({ readyTimeoutMs: config.autoStartTimeoutMs });
-      group.lastEnsure = { at: Date.now(), ...result };
-      if (result.ok) {
-        group.adapter?.invalidate();
-        group.account = result.health?.auth?.userId || null;
-        log(`分组「${group.displayName}」桥已就绪：${group.supervisor.baseUrl}/v1（端口 ${group.port}，账号 ${String(group.account || '?').slice(0, 8)}…）`);
-      } else {
+    /*
+     * 已经认领到一条服务同一账号的桥：**直接采用它的端口**，不新起。
+     * 这一步必须在 ensure 之前 —— 否则会为同一账号再拉一条（重复桥的根因）。
+     */
+    if (claimed && claimed.port && claimed.port !== group.port) {
+      log(`分组「${group.displayName}」认领已在运行的桥：端口 ${group.port} → ${claimed.port}`);
+      replaceGroupSupervisor(group, claimed.port);
+      group.account = claimed.health?.auth?.userId || null;
+      group.adapter?.invalidate();
+      return { ok: true, started: false, reused: true, state: 'running', health: claimed.health };
+    }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const result = await group.supervisor.ensure({ readyTimeoutMs: config.autoStartTimeoutMs });
+        group.lastEnsure = { at: Date.now(), ...result };
+        if (result.ok) {
+          group.adapter?.invalidate();
+          group.account = result.health?.auth?.userId || null;
+          log(`分组「${group.displayName}」桥已就绪：${group.supervisor.baseUrl}/v1（端口 ${group.port}，账号 ${String(group.account || '?').slice(0, 8)}…）`);
+          return result;
+        }
+        if (result.portConflict) {
+          const next = nextFreeGroupPort();
+          if (!next) {
+            group.error = '没有空闲端口（端口都被别的账号的桥占着）';
+            log(`分组「${group.displayName}」${group.error}`);
+            return result;
+          }
+          log(`分组「${group.displayName}」的端口 ${group.port} 被另一个账号的桥占用，改用 ${next} 重试`);
+          replaceGroupSupervisor(group, next);
+          continue;
+        }
         group.error = result.error || '';
         log(`分组「${group.displayName}」桥未能就绪：${result.error}`);
+        return result;
+      } catch (error) {
+        group.error = String(error?.message || error);
+        log(`分组「${group.displayName}」启动桥失败`, error);
+        return null;
       }
-      return result;
-    } catch (error) {
-      group.error = String(error?.message || error);
-      log(`分组「${group.displayName}」启动桥失败`, error);
-      return null;
     }
+    log(`分组「${group.displayName}」换端口重试 3 次仍未就绪`);
+    return null;
+  }
+
+  /**
+   * 给分组换一个端口：重建 supervisor 与 client，并让适配器指向新地址。
+   *
+   * 适配器的 `client` 是构造时注入的，换端口后必须一并替换 —— 否则路由还在，
+   * 但请求会打到旧端口（那里坐着别人的桥）。`supervisor.port` 也不可变
+   * （构造时定死并算进 baseUrl），所以只能重建一个实例。
+   */
+  function replaceGroupSupervisor(group, port) {
+    group.port = port;
+    group.supervisor = new BridgeSupervisor({
+      projectRoot: projectRoot || process.cwd(),
+      host: config.bridgeHost,
+      port,
+      token: config.localToken,
+      authFile: group.authFile || '',
+      logPath: join(projectRoot || process.cwd(), 'bridge', `bridge-${group.id}.log`),
+      autoCheckin: config.autoCheckin,
+      autoStart: config.autoStart,
+      nodePath: config.nodePath || undefined,
+      timeoutMs: 8000,
+      env: { WORKBUDDY_ACCOUNT_LABEL: group.provider },
+      onLog: (line) => log(`[${group.id}]`, line),
+    });
+    const client = new BridgeClient({
+      baseUrl: group.supervisor.baseUrl,
+      token: config.localToken,
+      timeoutMs: 8000,
+    });
+    group.client = client;
+    if (group.adapter) group.adapter.client = client;
   }
 
   /**
@@ -1477,7 +1609,8 @@ export function apply(ctx, rawConfig = {}) {
    *
    * @returns {Promise<number>} 本次新激活的分组数
    */
-  async function activateManagedGroups() {    // 主账号未知时先探一次（限时 2 秒）：排除它靠的就是这个身份。
+  async function activateManagedGroups() {
+    // 主账号未知时先探一次（限时 2 秒）：排除它靠的就是这个身份。
     // 首次调用发生在插件加载后不久，此时桥可能还没起来 —— 探不到就先注册不了，
     // 下一次巡检（15 秒后）会补上。
     if (state.bridgeAccount === null) {
@@ -1499,6 +1632,12 @@ export function apply(ctx, rawConfig = {}) {
       log('读取纳管账号失败（跳过激活）', error);
       return 0;
     }
+    /*
+     * 先认领**已经在跑的**桥（桥 detached，活过了 dsh 重启）。
+     * 不认领的话，本轮会为同一账号再起一条 —— 实测 8793/8794 都是 `6d2b5f6b`。
+     * 认领也会顺带停掉同账号的多余桥（并把这件事写进日志）。
+     */
+    const claimedBridges = await claimExistingBridges();
     for (const account of managed) {
       if (account.expired) continue;                                  // 过期的不起桥，面板会标红
       if (account.uid === state.bridgeAccount) {
@@ -1540,8 +1679,12 @@ export function apply(ctx, rawConfig = {}) {
      * 起桥**并行**：串行时 N 个账号最坏要等 N × 30 秒（每个 readyTimeoutMs），
      * 而它们之间没有任何依赖（各自的端口、登录文件、日志都隔离）。失败的仍然
      * 只记在自己的 group 上 —— startGroupBridge 自己 catch，不会拖累别的分组。
+     *
+     * 每个分组带上"预先认领到的桥"（如果有）：认领到就直接采用它的端口，不再新起。
      */
-    if (config.autoStart && pending.length) await Promise.all(pending.map((g) => startGroupBridge(g)));
+    if (config.autoStart && pending.length) {
+      await Promise.all(pending.map((g) => startGroupBridge(g, claimedBridges.get(authFileKey(g.authFile)))));
+    }
     return added + retired;
   }
 
@@ -1964,10 +2107,16 @@ export function apply(ctx, rawConfig = {}) {
 
   // ── 7b. 多账号分组的桥：各自独立拉起（互不阻塞、互不影响） ──────────────
   if (config.autoStart) {
-    for (const group of accountGroups) {
-      if (!group.registered || !group.supervisor) continue;
-      void startGroupBridge(group);
-    }
+    void (async () => {
+      /*
+       * 先认领已在运行的桥（桥 detached，活过了 dsh 重启），再起剩下的。
+       * 顺序很重要：不先认领，手写分组也会为同一账号另起一条。
+       */
+      const claimed = await claimExistingBridges();
+      await Promise.all(accountGroups
+        .filter((g) => g.registered && g.supervisor)
+        .map((g) => startGroupBridge(g, claimed.get(authFileKey(g.authFile)))));
+    })().catch((error) => log('启动分组桥失败（不影响主桥）', error));
   }
 
   /**

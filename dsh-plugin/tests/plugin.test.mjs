@@ -658,6 +658,58 @@ test('桥的健康检查：503 要认领成「凭据异常」，不能误判成"
     const sup = new BridgeSupervisor({ host: '127.0.0.1', port: wrongToken.port, token: 't', projectRoot: '.', logPath: 'x' });
     assert.equal((await sup.probe()).state, 'unauthorized');
   } finally { await wrongToken.close(); }
+
+  /**
+   * ④ **端口上坐着另一个账号的桥** —— 必须认出来，不能复用。
+   *
+   * 回归（用户实测）：桥是 detached 的、活过 dsh 重启。新一轮启动给分组算出的
+   * "空闲端口"可能正被上一轮某条桥占着，而 `probe()` 原先只看"端口上是个
+   * workbuddy-bridge"就复用 → 分组拿到**别账号的额度和模型**。用户一眼看出
+   * "这俩账号不是一样的吗"：两条分组读到的是同一个账号。
+   */
+  const otherAccount = await startFake({
+    ok: true, pid: 12345,
+    auth: { userId: 'other-uid-0000', endpoint: 'https://copilot.tencent.com' },
+    authFile: 'C:\\Users\\demo\\.dsh\\workbuddy-accounts\\OTHER-ACCOUNT.info',
+  }, 200);
+  try {
+    const sup = new BridgeSupervisor({
+      host: '127.0.0.1', port: otherAccount.port, token: 't', projectRoot: '.', logPath: 'x',
+      authFile: 'C:\\Users\\demo\\.dsh\\workbuddy-accounts\\MINE.info',
+    });
+    const probe = await sup.probe();
+    assert.equal(probe.state, 'running', '它确实是个桥（不是 foreign）');
+    assert.equal(probe.foreignAccount, true, '但它服务的是别账号 —— 必须标出来');
+    assert.match(probe.error, /另一个账号/, '错误信息要说清是账号不符，而不是端口冲突');
+
+    // ensure() 绝不能复用：复用了就等于把别账号的额度当自己的
+    const ensured = await sup.ensure({ readyTimeoutMs: 500 });
+    assert.equal(ensured.ok, false, '别账号的桥不能算作"自己的桥就绪"');
+    assert.equal(ensured.reused, false, '不许复用（这正是"两个账号看起来一样"的根因）');
+    assert.equal(ensured.state, 'account-mismatch');
+    assert.equal(ensured.portConflict, true, '要给出"换端口"的信号，让上层重试');
+  } finally { await otherAccount.close(); }
+
+  /**
+   * ⑤ 同账号（authFile 相同）时**应该**复用 —— 别把正常复用也挡掉了。
+   * 路径分隔符与大小写要归一化：Windows 下 `C:\A\b.info` 与 `c:/a/b.info` 是同一个。
+   */
+  const sameAccount = await startFake({
+    ok: true, pid: 999,
+    auth: { userId: 'mine-uid', endpoint: 'https://copilot.tencent.com' },
+    authFile: 'C:/Users/Demo/.dsh/workbuddy-accounts/MINE.info',
+  }, 200);
+  try {
+    const sup = new BridgeSupervisor({
+      host: '127.0.0.1', port: sameAccount.port, token: 't', projectRoot: '.', logPath: 'x',
+      authFile: 'C:\\Users\\demo\\.dsh\\workbuddy-accounts\\MINE.info',
+    });
+    const probe = await sup.probe();
+    assert.equal(probe.state, 'running');
+    assert.ok(!probe.foreignAccount, '同一账号（仅分隔符/大小写不同）不算冲突');
+    const ensured = await sup.ensure({ readyTimeoutMs: 500 });
+    assert.equal(ensured.reused, true, '同一账号的桥必须照常复用（否则每次启动都白拉一条）');
+  } finally { await sameAccount.close(); }
 });
 
 test('分发形态：只有插件文件夹（自带 vendor）时也能定位到运行目录', async () => {
@@ -1787,4 +1839,75 @@ test('账号升格为主账号后，原分组必须被撤销（回归：同一�
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+/**
+ * 按身份扫描已在运行的桥（桥是 detached 的、活过 dsh 重启）。
+ *
+ * 回归（用户实测）：重启后插件内存里没有分组记录，于是为每个纳管账号重新分配
+ * 端口、重新起桥 —— 而上一轮的桥还在跑，同一个账号起了两三条（8793 与 8794
+ * 都是 `6d2b5f6b`）。它们并发刷新同一会话，上游每次刷新都轮换 refresh token，
+ * 用旧令牌的那个可能被判异常、吊销会话。
+ *
+ * 端口靠猜不行（上一轮用哪个没有任何记录），所以必须**按 authFile 认领**。
+ */
+test('scanBridges：按 authFile 认领已在运行的桥，并识别同账号的重复桥', async () => {
+  const { createServer } = await import('node:http');
+  const { scanBridges, authFileKey } = await import('../lib/bridge.mjs');
+
+  /** 起一个假桥：回 `/health`，带 authFile 与 pid。 */
+  const fakeBridge = async (authFile, pid) => {
+    const server = createServer((req, res) => {
+      if (req.url.startsWith('/health')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ ok: true, pid, auth: { userId: `uid-${pid}` }, authFile }));
+      }
+      res.writeHead(404); res.end('{}');
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    return { port: server.address().port, close: () => new Promise((r) => server.close(r)) };
+  };
+
+  const A = 'C:\\Users\\demo\\.dsh\\workbuddy-accounts\\AAA.info';
+  const B = 'C:\\Users\\demo\\.dsh\\workbuddy-accounts\\BBB.info';
+  // A 账号**两条**桥（模拟 detached 残留）+ B 账号一条
+  const a1 = await fakeBridge(A, 1001);
+  const a2 = await fakeBridge(A, 1002);
+  const b1 = await fakeBridge(B, 2001);
+  try {
+    const ports = [a1.port, a2.port, b1.port, a1.port + 100000 < 65535 ? a1.port + 1 : 65000];
+    const byKey = await scanBridges({ host: '127.0.0.1', token: '', ports });
+
+    assert.equal(byKey.size, 2, '应识别出 2 个不同账号');
+    const aHits = byKey.get(authFileKey(A));
+    assert.equal(aHits.length, 2, 'A 账号的两条桥都要被找出来（重复桥正是要暴露的事实）');
+    assert.deepEqual(aHits.map((h) => h.port).sort((x, y) => x - y), [a1.port, a2.port].sort((x, y) => x - y));
+    assert.equal(byKey.get(authFileKey(B)).length, 1);
+
+    // 大小写/分隔符不同也要认成同一个账号（Windows 路径）
+    assert.ok(byKey.has(authFileKey('c:/users/demo/.dsh/workbuddy-accounts/aaa.info')),
+      '路径分隔符与大小写差异不能影响认领（否则每次重启都会重起一条）');
+  } finally {
+    await Promise.all([a1.close(), a2.close(), b1.close()]);
+  }
+});
+
+test('scanBridges：端口上没有桥 / 不是我们的桥时，不误报', async () => {
+  const { createServer } = await import('node:http');
+  const { scanBridges } = await import('../lib/bridge.mjs');
+
+  // 一个"别的服务"：HTTP 200，但没有桥的 /health 形状
+  const stranger = createServer((req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<html>其它服务</html>'); });
+  await new Promise((r) => stranger.listen(0, '127.0.0.1', r));
+  const strangerPort = stranger.address().port;
+  // 一个空端口（连不上）
+  const probe = createServer(() => {});
+  await new Promise((r) => probe.listen(0, '127.0.0.1', r));
+  const freePort = probe.address().port;
+  await new Promise((r) => probe.close(r));
+
+  try {
+    const byKey = await scanBridges({ host: '127.0.0.1', token: '', ports: [strangerPort, freePort], timeoutMs: 400 });
+    assert.equal(byKey.size, 0, '陌生服务与空端口都不能被当成桥');
+  } finally { await new Promise((r) => stranger.close(r)); }
 });

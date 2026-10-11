@@ -26,6 +26,66 @@ export function authHeaders(token) {
 }
 
 /**
+ * 两个登录文件路径是否指向同一个文件。
+ *
+ * 归一化分隔符与大小写（Windows 路径大小写不敏感），去掉重复与末尾分隔符。
+ * 只做路径比较 —— 不读文件内容：路径就是我们启动时注入的那个值，比内容简单可靠。
+ */
+export function sameAuthFile(a, b) {
+  const norm = (p) => String(p).replace(/\//g, '\\').replace(/\\+/g, '\\').replace(/\\+$/, '').toLowerCase();
+  return norm(a) === norm(b);
+}
+
+/**
+ * 扫描一段端口，找出**所有**正在跑的 workbuddy-bridge，按 authFile 归类。
+ *
+ * 为什么必须做这件事：桥是 detached 的、故意活过 dsh 重启。重启后插件内存里的
+ * `accountGroups` 是空的，新一轮启动会重新分配端口、重新起桥 —— 而上一轮那些桥
+ * 还在跑。结果同一个账号起两三条桥（实测：8793 与 8794 都是 `6d2b5f6b`），
+ * 它们并发刷新同一会话，而上游每次刷新都轮换 refresh token，用旧令牌的那个
+ * 请求可能被判异常、吊销会话。
+ *
+ * 端口靠猜不行（上一轮用哪个没有任何记录），所以**按身份认领**：谁报的
+ * `authFile` 匹配，那条桥就是谁的。
+ *
+ * @param {object} options
+ * @param {string} options.host
+ * @param {string} options.token
+ * @param {number[]} options.ports 候选端口
+ * @param {AbortSignal} [options.signal]
+ * @param {number} [options.timeoutMs] 单端口探测超时（默认 700ms；并行探测，总额可控）
+ * @returns {Promise<Map<string, {port: number, health: object, pid: number}[]>>}
+ *   key = 归一化后的 authFile（**保留原始大小写**的那个值），value = 该账号的桥列表
+ *   （列表长度 > 1 表示同账号有多条桥 —— 上层可以据此停掉多余的）
+ */
+export async function scanBridges({ host, token, ports, signal, timeoutMs = 700 } = {}) {
+  const candidates = [...new Set(ports)].filter((p) => Number.isInteger(p) && p > 1024 && p < 65536);
+  const found = await Promise.all(candidates.map(async (port) => {
+    const client = new BridgeClient({ baseUrl: `http://${host}:${port}`, token, timeoutMs });
+    try {
+      const health = await client.health(signal);
+      if (health?.ok !== true || typeof health.pid !== 'number') return null;
+      if (!health.authFile) return null; // 没有身份信息 → 无法认领，当成陌生服务
+      return { port, health, pid: health.pid, authFile: String(health.authFile) };
+    } catch {
+      return null; // 端口空着 / 不是我们的桥 / 超时
+    }
+  }));
+  const byKey = new Map();
+  for (const hit of found.filter(Boolean)) {
+    const key = String(hit.authFile).replace(/\//g, '\\').replace(/\\+/g, '\\').replace(/\\+$/, '').toLowerCase();
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push({ port: hit.port, health: hit.health, pid: hit.pid });
+  }
+  return byKey;
+}
+
+/** 由同一套归一化规则算 key，供调用方按 authFile 查 `scanBridges()` 的结果。 */
+export function authFileKey(p) {
+  return String(p || '').replace(/\//g, '\\').replace(/\\+/g, '\\').replace(/\\+$/, '').toLowerCase();
+}
+
+/**
  * 一个桥进程的 HTTP 客户端。
  *
  * 所有方法都显式接收 `signal`，并保证超时——控制台曾经的坑是「/health 等上游
@@ -190,13 +250,35 @@ export class BridgeSupervisor {
 
   /**
    * 探测桥状态。**不抛错**——把失败翻译成状态。
-   * @returns {Promise<{state: 'running'|'stopped'|'unauthorized'|'foreign'|'error', health?: object, error?: string}>}
+   *
+   * 返回 `foreignAccount` 表示：端口上确实是个 workbuddy-bridge，但它服务的
+   * **不是本实例配置的那个登录文件**。这不是"别人的服务"，而是"**另一个账号的
+   * 桥**"——最常见于桥是 detached 的、活过了 dsh 重启，而新一轮启动给某个分组
+   * 分配到了同一个端口（旧桥还在那儿）。
+   *
+   * 为什么必须识别出来：`ensure()` 原先只看「端口上有桥」就复用，于是分组会
+   * 拿到**别账号的额度与模型**——面板把 A 的积分挂在 B 名下（实测：用户发现
+   * "这俩账号不是一样的吗"，因为两条分组读到的是同一个账号）。
+   *
+   * @returns {Promise<{state: 'running'|'stopped'|'unauthorized'|'foreign'|'degraded'|'error', health?: object, error?: string, foreignAccount?: boolean}>}
    */
   async probe(signal) {
     try {
       const health = await this.client.health(signal);
       if (!health || health.ok !== true || typeof health.pid !== 'number') {
         return { state: 'foreign', error: '端口上有一个 HTTP 服务，但它不是 workbuddy-bridge' };
+      }
+      /**
+       * 身份核对：本实例配了 `authFile` 时，桥报的必须是同一个文件。
+       * 比路径而不是比内容 —— 路径就是我们启动时注入的那个值，比内容简单可靠。
+       */
+      if (this.authFile && health.authFile && !sameAuthFile(health.authFile, this.authFile)) {
+        return {
+          state: 'running',
+          health,
+          foreignAccount: true,
+          error: `端口 ${this.port} 上的桥服务的是另一个账号（${String(health.authFile).split(/[\\/]/).pop()}），不是本分组配置的 ${String(this.authFile).split(/[\\/]/).pop()}`,
+        };
       }
       return { state: 'running', health };
     } catch (error) {
@@ -251,6 +333,27 @@ export class BridgeSupervisor {
   async #ensure({ restart, signal, readyTimeoutMs, authFile }) {
     let status = await this.probe(signal);
     if (status.state === 'running' && !restart) {
+      /**
+       * **别账号的桥不能复用。**
+       *
+       * 端口上是个 workbuddy-bridge，但它服务的是另一个登录文件 —— 典型成因：
+       * 桥是 detached 的、活过了 dsh 重启，而新一轮启动把某个分组分配到了这个
+       * 端口。复用它的后果是分组拿到**别账号的额度与模型**（实测：两条分组读到
+       * 同一个账号，面板把 A 的积分挂在 B 名下，用户一眼看出"这俩不是一样吗"）。
+       *
+       * 也不能"停掉它再起自己的" —— 那条桥正被**另一个账号的分组**用着（它的
+       * owner 可能就是这个进程里的另一个分组，也可能来自上一轮）。停它等于
+       * 打掉别人的服务。正确做法是如实报冲突，由上层换端口重试。
+       */
+      if (status.foreignAccount) {
+        return {
+          ok: false, started: false, reused: false,
+          state: 'account-mismatch',
+          error: status.error || '端口上的桥服务的是另一个账号',
+          health: status.health,
+          portConflict: true,
+        };
+      }
       return { ok: true, started: false, reused: true, state: 'running', health: status.health };
     }
     if (status.state === 'unauthorized' || status.state === 'foreign') {
