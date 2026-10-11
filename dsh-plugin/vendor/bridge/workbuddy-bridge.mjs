@@ -113,10 +113,20 @@ const STARTED_AT = Date.now();
 // Curated models exposed by default; others remain reachable via /v1/models?all=1
 // 兜底的精选模型定义。倍率优先取上游的 credits（形如 "x0.11"），
 // 这里的数值取自上游实测，仅在上游没给时才用——注意它们会随官方调价而过时。
+//
+// **`images` 必须显式写**：这些模型是**补全项**（不在上游目录端点里，见下方
+// `supplemented` 那段），所以拿不到 `m.supportsImages` —— 不写就等于声明"不支持
+// 图片"，用户在 dsh 里贴不了图。
+//
+// 实测（judier-cod / 国际版账号，2026-10-12）：
+//   deepseek-v4.1-flash + **真实 400x300 图片** → 200 "Green"（能看图）
+//   deepseek-v4.1-flash + 1x1 / 16x16 玩具图    → 400 model_param_invalid
+// 也就是说：**小到不合理的图会被上游当无效请求拒**，那是测试假象，不代表模型
+// 不支持图片。判据要用真实尺寸的图。
 const FEATURED = [
-  { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', context: 1000000, maxOutput: 128000, credits: 0.11 },
-  { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', context: 1000000, maxOutput: 50000, credits: 0.51 },
-  { id: 'glm-5.3', name: 'GLM-5.3', context: 1000000, maxOutput: 48000, credits: 0.79 },
+  { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', context: 1000000, maxOutput: 128000, credits: 0.11, images: true },
+  { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', context: 1000000, maxOutput: 50000, credits: 0.51, images: true },
+  { id: 'glm-5.3', name: 'GLM-5.3', context: 1000000, maxOutput: 48000, credits: 0.79, images: true },
 ];
 
 /**
@@ -2651,6 +2661,14 @@ async function fetchCatalog() {
         name: f.name,
         maxInputTokens: f.context,
         maxOutputTokens: f.maxOutput,
+        /*
+         * **`supportsImages` 必须带上**：补全项拿不到上游的字段，不写就等于
+         * 声明"不支持图片"（`images: !!m.supportsImages` 会是 false）。
+         * 实测：国际版账号下 `deepseek-v4.1-flash` 本来就不在上游目录里，
+         * 补全时漏了它 → 桥不声明 supports_images → dsh 里贴不了图，
+         * 而该模型**实测能看图**（真实 400x300 图片返回 200 "Green"）。
+         */
+        ...(f.images ? { supportsImages: true } : {}),
         ...(promo?.free ? { credits: 0 } : {}),
         _supplemented: true,
       });
