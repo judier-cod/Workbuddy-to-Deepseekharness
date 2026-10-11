@@ -16,6 +16,9 @@ usage.jsonl
 # 程序写入的运行时状态（如当前选中的账号）
 .state.json
 
+# 控制台的 pid 记录（插件用它认出"上一轮启动的控制台"，属运行时状态）
+dashboard/console.pid
+
 # 凭据：任何情况下都不得提交
 *.info
 *.info.bak-*
