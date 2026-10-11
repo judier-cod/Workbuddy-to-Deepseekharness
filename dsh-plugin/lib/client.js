@@ -618,11 +618,11 @@ body.dark .wb-root,
       // ── 纳管账号（插件自己走 OAuth 登录） ──────────────────────────────
       '纳管账号': 'Managed accounts',
       '正在读取纳管账号…': 'Loading managed accounts…',
-      '客户端登录目录里的账号由**客户端**写入，登第二个国内版账号会覆盖同一个文件。这里可以再登录一个账号：插件自己走官方授权拿到令牌，存成独立的加密凭据，与客户端的互不影响。':
-        'Accounts in the client login directory are written **by the client**, and signing in a second domestic account overwrites the same file. You can sign in another account here: the plugin completes the official authorization itself and stores an independent encrypted credential that does not interfere with the client.',
+      '**国际版账号会自动出现在这里**（客户端登录过就会被扫描到）。国内版则不同：客户端登录目录里的账号由**客户端**写入，登第二个国内版账号会覆盖同一个文件 —— 所以下面这个按钮用于手动补登一个国内版账号：插件自己走官方授权拿到令牌，存成独立的加密凭据，与客户端的互不影响。':
+        '**International accounts show up here automatically** (the client\'s login directory is scanned). Domestic accounts differ: the client writes them into a single fixed file, so signing in a second one overwrites the first — the button below signs in an additional domestic account via the official authorization flow and stores it as an independent encrypted credential that does not interfere with the client.',
       '凭据为 AtRest 加密信封、权限 0600，存在 dsh 目录下（不在仓库里）。受上游令牌有效期限制，约 **30 天**需重新登录一次。':
         'Credentials are stored as at-rest encrypted envelopes with mode 0600 under the dsh directory (never inside the repo). Upstream token lifetime requires re-signing in roughly every **30 days**.',
-      '添加账号（国内版）': 'Add account (domestic)',
+      '添加账号': 'Add account',
       '正在发起…': 'Starting…',
       '取消登录': 'Cancel sign-in',
       '请在浏览器里完成授权，完成后本页会自动更新。': 'Complete the authorization in your browser; this page updates automatically once done.',
@@ -2432,9 +2432,10 @@ body.dark .wb-root,
       return h(Card, { title: '纳管账号' },
         error ? h(Alert, { bad: true }, error) : null,
         h('p', { className: 'wb-note', style: { marginTop: 0 } },
-          '客户端登录目录里的账号由**客户端**写入，登第二个国内版账号会覆盖同一个文件。'
-          + '这里可以再登录一个账号：插件自己走官方授权拿到令牌，存成独立的加密凭据，'
-          + '与客户端的互不影响。'),
+          '**国际版账号会自动出现在这里**（客户端登录过就会被扫描到）。'
+          + '国内版则不同：客户端登录目录里的账号由**客户端**写入，登第二个国内版账号会覆盖'
+          + '同一个文件 —— 所以下面这个按钮用于手动补登一个国内版账号：'
+          + '插件自己走官方授权拿到令牌，存成独立的加密凭据，与客户端的互不影响。'),
         h('p', { className: 'wb-note' },
           '凭据为 AtRest 加密信封、权限 0600，存在 dsh 目录下（不在仓库里）。'
           + '受上游令牌有效期限制，约 **30 天**需重新登录一次。'),
@@ -2444,7 +2445,7 @@ body.dark .wb-root,
           phase === 'waiting'
             ? h(Btn, { onClick: cancel }, '取消登录')
             : h(Btn, { primary: true, disabled: busy || !regions.length, onClick: begin },
-              busy ? '正在发起…' : '添加账号（国内版）')),
+              busy ? '正在发起…' : '添加账号')),
 
         phase === 'waiting' ? h('div', { style: { marginTop: '8px' } },
           h(Alert, null, '请在浏览器里完成授权，完成后本页会自动更新。'),
