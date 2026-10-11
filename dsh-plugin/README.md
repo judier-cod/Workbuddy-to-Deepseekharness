@@ -258,6 +258,13 @@ npm run release:check      # = vendor:check + 单测 + 独立分发演练（发�
   由 dsh 的引导图加载，`react` 来自平台模块表。`dsh.client.inject` 是**引导图上的
   行依赖**（写包名），不是 cordis 服务名 —— 写错会让整行不激活；本插件因此不声明它，
   改在运行时用 `ctx.inject(['slots'], …)` 等槽服务。
+- **换账号必须广播 `llm/adapters-updated`，而且不能只靠面板对账**。桥每次请求都
+  重读登录文件，所以换账号后桥是**立刻**跟着换的；但 dsh 的模型选择器不主动重查
+  目录，只在 `llm/adapters-updated` 上重拉 `listModels()`。因此两件事缺一不可：
+  `reconcileAccount()` 发现身份变化时必须广播（**只** `adapter.invalidate()` 不够
+  —— 那清的是适配器内部缓存，UI 看不到变化）；`accountWatchMs` 后台巡检（默认 15 秒）
+  保证**没开着设置页**也能发现变化，否则"没开着设置页就换账号"会永远不对账。
+  分组桥同样参与对账（原先只在启动时记一次账号，换号后目录与积分标签都会停旧）。
 - **纳管账号用加密信封，不是明文**。设置页登录拿到的令牌由
   `sealEncryptedField()`（仓库 `lib/atrest.mjs`）封成与客户端**同款**的
   AES-256-GCM 字段信封，再写入 `$DSH_HOME/workbuddy-accounts/<uid>.info`。

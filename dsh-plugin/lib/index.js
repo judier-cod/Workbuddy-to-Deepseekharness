@@ -439,6 +439,17 @@ export const DEFAULTS = {
   catalogTtlMs: 60_000,
   /** 桥「已确认活着」结论的缓存时长（ensureReady 短路用）。对话失败会立即作废。 */
   bridgeAliveTtlMs: 5_000,
+  /**
+   * 账号巡检间隔（毫秒）。0 = 关闭巡检。
+   *
+   * 为什么需要一个后台定时器：在 WorkBuddy 客户端里换账号后，桥会立刻跟着换
+   * （它每次请求都重读登录文件），但**插件的缓存与 dsh 的模型选择器不会自己
+   * 知道** —— 选择器只订阅 `llm/adapters-updated`，不主动重查目录。原先的对账
+   * 只在面板轮询 `/workbuddy/status` 时发生，所以"没开着设置页就换账号"表现为
+   * 模型列表一直是旧的（用户报过"插件没有反应过来"）。巡检独立于面板，发现
+   * 身份变化就作废缓存并广播事件。
+   */
+  accountWatchMs: 15_000,
   modelAllow: [],
   modelDeny: [],
   /**
@@ -606,6 +617,10 @@ export function resolveConfig(raw = {}) {
      * 运行测试那台机器上真实的账号。
      */
     dshHome: String(cfg.dshHome || ''),
+    /** 账号巡检间隔；0 = 关闭（见 DEFAULTS 的说明） */
+    accountWatchMs: cfg.accountWatchMs === undefined || cfg.accountWatchMs === null
+      ? DEFAULTS.accountWatchMs
+      : Math.max(0, Number(cfg.accountWatchMs) || 0),
     tools: asBool(cfg.tools, DEFAULTS.tools),
     commands: asBool(cfg.commands, DEFAULTS.commands),
     routes: asBool(cfg.routes, DEFAULTS.routes),
@@ -1334,6 +1349,39 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   /**
+   * **分组**桥的账号对账。
+   *
+   * 与 {@link reconcileAccount} 同一类问题，但分组原先只在桥启动时记一次账号
+   * （见 7b 段的 `group.account = …`），之后**永不复查** —— 于是在客户端里换掉
+   * 某个分组的账号后：分组 adapter 的目录缓存停在旧账号的清单上，面板还会把新
+   * 账号的余额标成旧账号（`groupQuotas[].account` 取的就是这个字段）。
+   *
+   * 探测**限时 2 秒**：分组桥可能没起来，而这里可能在轮询路径上被调用 —— 不能
+   * 让一个挂掉的桥把状态页拖住（client 默认超时是 8 秒）。单个分组失败不影响其它。
+   *
+   * @returns {Promise<boolean>} 是否有分组换了账号（调用方据此决定要不要广播事件）
+   */
+  async function reconcileGroupAccounts() {
+    let changed = false;
+    await Promise.all(accountGroups.map(async (group) => {
+      if (!group.registered || !group.supervisor) return;
+      try {
+        const probe = await group.supervisor.probe(AbortSignal.timeout(2000));
+        const account = bridgeAccountOf(probe);
+        if (account === null) return; // 桥没起来 / 旧桥没有 userId：保留现状
+        if (group.account && group.account !== account) {
+          log(`分组「${group.displayName}」的登录账号已变化（${group.account} → ${account}）：作废其目录与积分缓存`);
+          group.adapter?.invalidate();
+          group.quotaCache = { at: 0, value: null, error: '' };
+          changed = true;
+        }
+        group.account = account;
+      } catch { /* 单个分组探测失败：不影响其它，也不影响主流程 */ }
+    }));
+    return changed;
+  }
+
+  /**
    * 发起一次签到状态刷新（不 await）。在途去重：并发调用只会打一次上游。
    * 快照里始终返回缓存值，最坏情况是"少一次数据"，绝不会把状态查询拖慢。
    */
@@ -1369,6 +1417,15 @@ export function apply(ctx, rawConfig = {}) {
     const consoleProbe = await consoleSupervisor.probe({ signal, cached: true });
     // 先对账号：身份变了就作废全部跨账号缓存（含模型目录）
     const reconciliation = reconcileAccount(probe);
+    /**
+     * 换了账号必须**广播** `llm/adapters-updated`。
+     *
+     * 只 `adapter.invalidate()` 是不够的：那清的是适配器**内部**的目录缓存，
+     * 而 dsh 的模型选择器不主动重查目录 —— 它只在收到这个事件时重拉 listModels()。
+     * 少了广播，用户看到的就是"账号切了、模型列表还是旧的"（用户报过这个问题）。
+     * 与面板里改显示偏好触发广播是同一套理由。
+     */
+    if (reconciliation.changed) notifyAdaptersUpdated();
     let quotaValue = state.quotaCache.value;
     let quotaError = state.quotaCache.error;
     const staleQuota = state.quotaCache.value && state.quotaCache.account !== state.bridgeAccount;
@@ -1747,6 +1804,47 @@ export function apply(ctx, rawConfig = {}) {
         }
       })();
     }
+  }
+
+  // ── 7c. 账号巡检：换账号后主动让 dsh 的模型选择器跟上 ──────────────────
+  /**
+   * 独立于面板的后台巡检（见 DEFAULTS.accountWatchMs 的说明）。
+   *
+   * 场景：用户在 WorkBuddy 客户端里换了账号 → 桥立刻跟着换（每次请求都重读登录
+   * 文件）→ 但插件进程里的目录缓存与 dsh 的模型选择器不会自己知道。原先只有
+   * 面板轮询 `/workbuddy/status` 时才会对账，所以"没开着设置页就换账号"表现为
+   * 模型列表一直是旧的。这里每 accountWatchMs 探一次主桥与各分组桥，发现身份
+   * 变化就作废对应缓存并广播 `llm/adapters-updated`。
+   *
+   * 成本：每次一轮本地回环 HTTP（/health），可忽略；分组探测限时 2 秒，且全部
+   * 失败都静默 —— 巡检永远不能让插件变差。`accountWatchMs: 0` 可整体关闭。
+   */
+  if (config.accountWatchMs > 0) {
+    let running = false;
+    const timer = setInterval(() => {
+      // 上一轮还没跑完就跳过这一轮：桥卡住时不让巡检请求堆积
+      if (running) return;
+      running = true;
+      void (async () => {
+        try {
+          const probe = await supervisor.probe();
+          const main = reconcileAccount(probe);
+          const groups = await reconcileGroupAccounts();
+          if (main.changed || groups) {
+            notifyAdaptersUpdated();
+            log(`账号巡检：身份变化（主桥=${main.changed ? '是' : '否'}，分组=${groups ? '是' : '否'}），已广播模型拓扑变更`);
+          }
+        } catch (error) {
+          log('账号巡检失败（忽略，不影响其它功能）', error);
+        } finally {
+          running = false;
+        }
+      })();
+    }, config.accountWatchMs);
+    // 不要因为这个定时器把进程钉住（dsh 退出时不应被它拖住）
+    timer.unref?.();
+    ctx.effect(() => () => clearInterval(timer), 'workbuddy.account-watch');
+    log(`账号巡检已启用：每 ${config.accountWatchMs} ms 一次`);
   }
 
   log(`插件已加载：projectRoot=${projectRoot || '(未找到)'} bridge=${supervisor.baseUrl} console=${consoleSupervisor.url} provider=${state.route.provider}`);

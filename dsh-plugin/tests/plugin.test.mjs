@@ -312,9 +312,24 @@ test('detectProjectRoot 能从插件目录上溯找到项目根', () => {
   assert.ok(existsSync(join(root, 'bridge', 'workbuddy-bridge.mjs')));
 });
 
+/**
+ * 轮询等待条件成立（用于定时器驱动的行为）。
+ *
+ * 刻意**不用固定 sleep**：定时器是 30ms 级的，机器快慢会让固定等待变脆。
+ * 超时后不抛错，让调用方的断言给出更具体的失败信息。
+ */
+async function waitFor(predicate, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { if (predicate()) return true; } catch { /* 条件本身报错也当未成立 */ }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return false;
+}
+
 /** 一个足够像 cordis 的假 ctx：记录注册了什么，验证装配而不需要真实 dsh。 */
 function fakeCtx() {
-  const calls = { adapters: [], tools: [], commands: [], routes: [], effects: [], provides: [] };
+  const calls = { adapters: [], tools: [], commands: [], routes: [], effects: [], provides: [], adaptersUpdated: 0, disposers: [] };
   const ctx = {
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     llm: {
@@ -324,6 +339,11 @@ function fakeCtx() {
         handle.replace = () => {};
         return handle;
       },
+      /**
+       * dsh 的模型选择器**只**在收到这个通知时才重拉目录。换账号后不广播，
+       * 用户看到的就是"账号切了、模型列表还是旧的"——所以要能断言它被调用过。
+       */
+      emitAdaptersUpdated() { calls.adaptersUpdated += 1; },
     },
     get(name) {
       if (name === 'tools') return { register: (d) => { calls.tools.push(d); return () => {}; } };
@@ -331,7 +351,7 @@ function fakeCtx() {
       if (name === 'webServer') return { register: (r) => { calls.routes.push(r); return () => {}; } };
       return undefined;
     },
-    effect(fn, label) { calls.effects.push(label); const dispose = fn(); return dispose; },
+    effect(fn, label) { calls.effects.push(label); const dispose = fn(); calls.disposers.push(dispose); return dispose; },
     provide(name, value) { calls.provides.push({ name, value }); return () => {}; },
   };
   return { ctx, calls };
@@ -340,8 +360,8 @@ function fakeCtx() {
 test('换账号后积分/签到缓存必须作废（回归：面板把 A 账号积分挂在 B 账号头上）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wb-account-'));
   try {
-    const { ctx } = fakeCtx();
-    const result = apply(ctx, { projectRoot: dir, dshHome: dir, autoStart: false, consoleAutoStart: false, migrateLegacy: false });
+    const { ctx, calls } = fakeCtx();
+    const result = apply(ctx, { projectRoot: dir, dshHome: dir, accountWatchMs: 0, autoStart: false, consoleAutoStart: false, migrateLegacy: false });
     const { state, snapshot } = result;
 
     // 桩：probe 返回的 userId 由外部变量控制 —— **模拟真实换号**：
@@ -385,6 +405,17 @@ test('换账号后积分/签到缓存必须作废（回归：面板把 A 账号�
     // （adapter.invalidate 会把 catalogCache 清空，下一次目录读取自然从桥重取）
     assert.equal(result.adapter.catalogCache.models.length, 0, '换号后模型目录必须已作废（等下一次从桥重取）');
 
+    // ── 第三幕之二：光作废目录还不够，必须**广播**让 dsh 的模型选择器重拉。
+    // 选择器只在收到 llm/adapters-updated 时重查目录；少了广播，用户看到的是
+    // "账号切了、模型列表还是旧的"（真实反馈过）。
+    assert.ok(calls.adaptersUpdated >= 1,
+      `换账号后必须广播 llm/adapters-updated（实际 ${calls.adaptersUpdated} 次）—— 否则模型选择器不会刷新`);
+
+    // 没换账号时不许重复广播（每 8 秒一次快照都广播会把选择器刷爆）
+    const afterSwitch = calls.adaptersUpdated;
+    await snapshot({});
+    assert.equal(calls.adaptersUpdated, afterSwitch, '账号没变时不许广播 —— 否则模型选择器每 8 秒闪一次');
+
     // ── 第四幕：bridgeAccount 为 null（旧桥/探测不完整）时**不许**误清有效缓存
     result.supervisor.probe = async () => ({ state: 'running', health: { auth: {} } });
     const beforeNull = { quota: state.quotaCache.value, checkin: state.checkinCache.value };
@@ -394,12 +425,80 @@ test('换账号后积分/签到缓存必须作废（回归：面板把 A 账号�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+/**
+ * 换账号后**不打开设置页**也必须让模型选择器跟上（回归：用户报"插件没有反应过来"）。
+ *
+ * 场景：在 WorkBuddy 客户端里换账号 → 桥立刻跟着换（每次请求重读登录文件）→
+ * 但插件进程里的目录缓存与 dsh 的模型选择器不会自己知道。原先对账只在面板轮询
+ * `/workbuddy/status` 时发生，所以没开着设置页就换账号 = 模型列表一直是旧的。
+ * 这里钉住 accountWatchMs 巡检能在**没人调 snapshot** 的情况下发现变化并广播。
+ */
+test('账号巡检：没人开设置页也能发现换账号并广播（回归：模型列表不刷新）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wb-watch-'));
+  const { ctx, calls } = fakeCtx();   // 在 try 外声明：finally 里要用它清理定时器
+  try {
+    const result = apply(ctx, {
+      projectRoot: dir,
+      dshHome: dir,
+      autoStart: false,
+      consoleAutoStart: false,
+      migrateLegacy: false,
+      tools: false,
+      commands: false,
+      routes: false,
+      accountWatchMs: 30,      // 巡检开得很密，测试才跑得动
+      bridgeAliveTtlMs: 0,
+    });
+
+    let currentAccount = 'A';
+    result.supervisor.probe = async () => ({
+      state: 'running',
+      health: { auth: { userId: currentAccount, expiresAt: new Date(Date.now() + 864e5).toISOString() } },
+    });
+
+    // 先让巡检看到账号 A（这一步只记录身份，不广播）
+    await waitFor(() => result.state.bridgeAccount === 'A', 2000);
+    const baseline = calls.adaptersUpdated;
+    assert.equal(baseline, 0, '首次观察身份不该广播（没有变化）');
+
+    // 预置一份目录，用来断言"换号后目录被作废"
+    result.adapter.catalogCache = { at: Date.now(), models: [{ id: 'm-from-A' }] };
+
+    // 换账号：**不调 snapshot**，全靠巡检发现
+    currentAccount = 'B';
+    await waitFor(() => result.state.bridgeAccount === 'B', 3000);
+
+    assert.equal(result.state.bridgeAccount, 'B', '巡检必须发现账号已变化');
+    assert.equal(result.adapter.catalogCache.models.length, 0, '换号后目录必须作废（否则模型列表还是旧的）');
+    assert.ok(calls.adaptersUpdated > baseline,
+      `巡检发现换号后必须广播 llm/adapters-updated（实际 ${calls.adaptersUpdated} 次）`);
+  } finally {
+    // 清理巡检定时器：不清理会在后续用例里继续探测，污染它们的断言
+    for (const d of calls.disposers) { try { d?.(); } catch { /* 忽略 */ } }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('账号巡检：accountWatchMs: 0 时完全不启动（默认行为不受影响）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wb-nowatch-'));
+  try {
+    const { ctx, calls } = fakeCtx();
+    apply(ctx, {
+      projectRoot: dir, dshHome: dir, accountWatchMs: 0,
+      autoStart: false, consoleAutoStart: false, migrateLegacy: false,
+      tools: false, commands: false, routes: false,
+    });
+    assert.ok(!calls.effects.includes('workbuddy.account-watch'),
+      '关掉巡检时不该注册定时器（否则"关闭"是假的）');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('apply() 装配：注册 llm 路由、5 个工具、命令、HTTP 路由', () => {
   const dir = mkdtempSync(join(tmpdir(), 'wb-apply-'));
   try {
     const { ctx, calls } = fakeCtx();
     // 用一个空目录当 projectRoot（桥/控制台脚本都不存在）：不自动启任何进程，只验证装配
-    const result = apply(ctx, { projectRoot: dir, dshHome: dir, autoStart: false, consoleAutoStart: false, migrateLegacy: false });
+    const result = apply(ctx, { projectRoot: dir, dshHome: dir, accountWatchMs: 0, autoStart: false, consoleAutoStart: false, migrateLegacy: false });
     assert.equal(calls.adapters.length, 1);
     assert.deepEqual(calls.adapters[0].providers, ['workbuddy']);
     assert.equal(calls.adapters[0].adapter.providerInfo('workbuddy').name, 'WorkBuddy');
@@ -452,7 +551,7 @@ test('apply() 遇到 DUPLICATE_ADAPTER 时退回兜底 provider', async () => {
       get() { return undefined; },
       effect(fn) { return fn(); },
     };
-    const result = apply(ctx, { projectRoot: dir, dshHome: dir, autoStart: false, migrateLegacy: false, tools: false, commands: false, routes: false });
+    const result = apply(ctx, { projectRoot: dir, dshHome: dir, accountWatchMs: 0, autoStart: false, migrateLegacy: false, tools: false, commands: false, routes: false });
     await new Promise((r) => setTimeout(r, 3200));
     assert.ok(calls.providers.includes('workbuddy-native'), '应该用兜底 provider 再注册一次');
     assert.equal(result.state.route.registered, true);
@@ -718,14 +817,14 @@ test('readProjectEnv 解析 .env，且只在 config 未显式指定时生效', (
 
     const { ctx } = fakeCtx();
     // 不显式给端口 → 跟随 .env
-    const fromEnv = apply(ctx, { projectRoot: dir, dshHome: dir, autoStart: false, tools: false, commands: false, routes: false, migrateLegacy: false });
+    const fromEnv = apply(ctx, { projectRoot: dir, dshHome: dir, accountWatchMs: 0, autoStart: false, tools: false, commands: false, routes: false, migrateLegacy: false });
     assert.equal(fromEnv.state.config.bridgePort, 8899, '.env 里的端口必须被采纳');
     assert.equal(fromEnv.state.config.localToken, 'tok-from-env');
     assert.equal(fromEnv.supervisor.authFile, 'C:\\tmp\\custom.info');
 
     // 显式给了端口 → 以配置为准，不被 .env 覆盖
     const { ctx: ctx2 } = fakeCtx();
-    const explicit = apply(ctx2, { projectRoot: dir, dshHome: dir, bridgePort: 9911, autoStart: false, tools: false, commands: false, routes: false, migrateLegacy: false });
+    const explicit = apply(ctx2, { projectRoot: dir, dshHome: dir, accountWatchMs: 0, bridgePort: 9911, autoStart: false, tools: false, commands: false, routes: false, migrateLegacy: false });
     assert.equal(explicit.state.config.bridgePort, 9911, '显式配置优先于 .env');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -908,7 +1007,7 @@ test('apply() 的 migrateLegacy 默认会清理指向的文件（用临时目录
     writeFileSync(patch, PATCH, 'utf8');
 
     const { ctx } = fakeCtx();
-    const result = apply(ctx, { projectRoot: join(dir, 'nowhere'), dshHome: dir, autoStart: false, tools: false, commands: false, routes: false });
+    const result = apply(ctx, { projectRoot: join(dir, 'nowhere'), dshHome: dir, accountWatchMs: 0, autoStart: false, tools: false, commands: false, routes: false });
     // 语义：`cleaned` 记录这次删了什么，`found` 是**清理之后**是否还有残留
     assert.equal(result.state.legacy.cleaned.changed, true);
     assert.equal(result.state.legacy.found, false, '清理干净之后不应再报“检测到旧路由”');
@@ -1006,7 +1105,7 @@ test('图片能力覆盖：分组 adapter 必须应用该分组自己的覆盖�
     const { ctx, calls } = fakeCtx();
     apply(ctx, {
       projectRoot: dir,
-      dshHome: dir,
+      dshHome: dir, accountWatchMs: 0,
       autoStart: false,
       consoleAutoStart: false,
       migrateLegacy: false,
@@ -1068,7 +1167,7 @@ test('图片能力覆盖：按 provider 分开，一组不能影响另一组', a
     const { ctx, calls } = fakeCtx();
     apply(ctx, {
       projectRoot: dir,
-      dshHome: dir,
+      dshHome: dir, accountWatchMs: 0,
       autoStart: false,
       consoleAutoStart: false,
       migrateLegacy: false,
@@ -1111,7 +1210,7 @@ test('图片能力覆盖：兼容旧的全局 vision 键，且分组不继承', 
     const { ctx, calls } = fakeCtx();
     apply(ctx, {
       projectRoot: dir,
-      dshHome: dir,
+      dshHome: dir, accountWatchMs: 0,
       autoStart: false,
       consoleAutoStart: false,
       migrateLegacy: false,
@@ -1268,7 +1367,7 @@ test('推理能力覆盖：分组 adapter 必须应用该分组自己的覆盖�
     const { ctx, calls } = fakeCtx();
     apply(ctx, {
       projectRoot: dir,
-      dshHome: dir,
+      dshHome: dir, accountWatchMs: 0,
       autoStart: false,
       consoleAutoStart: false,
       migrateLegacy: false,
@@ -1368,7 +1467,7 @@ test('刷新积分：强制刷新必须同时重读分组账号（回归：按�
     const { ctx } = fakeCtx();
     const result = apply(ctx, {
       projectRoot: dir,
-      dshHome: dir,
+      dshHome: dir, accountWatchMs: 0,
       autoStart: false,
       consoleAutoStart: false,
       migrateLegacy: false,
@@ -1515,7 +1614,7 @@ test('上下文覆盖：分组 adapter 必须拿到面板保存的上限（回�
     const { ctx, calls } = fakeCtx();
     apply(ctx, {
       projectRoot: dir,
-      dshHome: dir,
+      dshHome: dir, accountWatchMs: 0,
       autoStart: false,
       consoleAutoStart: false,
       migrateLegacy: false,
@@ -1573,7 +1672,7 @@ test('纳管账号分配端口：必须避开控制台端口（回归：抢 8792
     const { ctx } = fakeCtx();
     const result = apply(ctx, {
       projectRoot: dir,
-      dshHome: dir,                 // 纳管账号从这里的 workbuddy-accounts/ 读
+      dshHome: dir, accountWatchMs: 0,                 // 纳管账号从这里的 workbuddy-accounts/ 读
       bridgePort: 8790,
       consolePort: 8792,
       autoStart: false,
