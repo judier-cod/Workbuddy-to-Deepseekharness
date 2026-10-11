@@ -234,7 +234,18 @@ FIXTURES.consoleCheckin = {
  */
 FIXTURES.managedAccounts = {
   ok: true,
-  regions: [{ id: 'cn', label: '国内版' }],
+  /*
+   * **两个区域都要给** —— 面板只在 `regions.length > 1` 时才渲染区域选择器。
+   *
+   * 回归：夹具原先只有 `cn`，于是「国内版 / 国际版」选择器在渲染测试里**从来不
+   * 出现**，相关断言（"点了国际版，请求里 region 要是 global"）形同虚设 ——
+   * 而用户实机上那个选择器是渲染出来的，反馈"这个感觉没有生效"时，
+   * 测试这边完全帮不上忙。夹具必须与真实契约（REGIONS 有 cn + global）一致。
+   */
+  regions: [
+    { id: 'cn', label: '国内版' },
+    { id: 'global', label: '国际版' },
+  ],
   accounts: [
     {
       uid: '7ffbd7f5-36e2-4eed-b911-8cc6a14e0d2b',
