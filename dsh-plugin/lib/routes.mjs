@@ -593,8 +593,24 @@ export function createRouteTable(deps) {
             const result = await consoleSupervisor.stop();
             return sendJson(res, 200, { ok: result.ok, action, url: consoleSupervisor.url, result });
           }
-          const result = await consoleSupervisor.ensure({});
-          return sendJson(res, 200, { ok: result.ok, action: 'start', url: consoleSupervisor.url, result });
+          /*
+           * `restart` 必须真的重启，不能落到 `ensure({})` ——
+           * `ensure` 发现进程在跑就**直接复用**，于是"重启"变成"什么都没做"：
+           * 实测点了重启之后 pid 完全没变（23164 → 23164），控制台继续跑旧代码，
+           * 用户看到的现象就是"改了代码但界面没变"（诊断页那次就是这么被坑的）。
+           *
+           * `BridgeSupervisor.ensure()` 本来就支持 `restart: true`（先停再起），
+           * 这里只是原先没把 action 传下去 —— 而且返回值里把 action 硬编码成了
+           * 'start'，连"到底做了什么"都看不出来。
+           */
+          const wantRestart = action === 'restart';
+          const result = await consoleSupervisor.ensure({ restart: wantRestart });
+          return sendJson(res, 200, {
+            ok: result.ok,
+            action: wantRestart ? 'restart' : 'start',
+            url: consoleSupervisor.url,
+            result,
+          });
         } catch (error) {
           log('panel console action failed', error);
           sendJson(res, 500, { ok: false, error: String(error?.message || error) });

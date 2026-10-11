@@ -12,9 +12,81 @@
  * 识别方式：控制台首页的 `<title>` 是 `WorkBuddy 中转控制台` —— 用它判断 8792
  * 上跑的到底是不是我们的控制台，而不是随便一个占着端口的 HTTP 服务。
  */
-import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, openSync, closeSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, openSync, closeSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+
+/**
+ * 读 `console.pid`：**只认活着的 pid**。
+ *
+ * 进程可能早就退出了（崩溃、被杀、机器重启），残留的 pid 还会被复用给别的进程
+ * —— 那种情况下拿它去 kill 就是误杀无关进程。所以这里顺手确认它还在。
+ *
+ * @param {string} file
+ * @returns {number|null}
+ */
+function readPidFile(file) {
+  try {
+    const pid = Number(readFileSync(file, 'utf8').trim());
+    if (!Number.isInteger(pid) || pid <= 0) return null;
+    process.kill(pid, 0); // 信号 0 = 只探测存活，不真的发信号
+    return pid;
+  } catch {
+    return null; // 文件不存在 / 内容坏了 / 进程已退出
+  }
+}
+
+/** 记下"这个控制台是我们起的"。失败不该影响启动（只是下次认不出来而已）。 */
+function writePidFile(file, pid) {
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, String(pid), 'utf8');
+  } catch { /* 忽略 */ }
+}
+
+/** 清掉 pid 记录（进程已停 / 已确认不是我们的）。 */
+function clearPidFile(file) {
+  try { unlinkSync(file); } catch { /* 本来就不存在 */ }
+}
+
+/**
+ * 从**端口**反查监听进程的 pid。
+ *
+ * 为什么需要：控制台不像桥那样在 `/health` 里自报 pid，所以 `stop()` 原先只能
+ * 停「本进程亲手拉起的」那个 pid。而控制台是 **detached 的、活过 dsh 重启**的 ——
+ * 重启 dsh 之后 `spawnedPid` 是 `null`，于是"重启控制台"永远做不到
+ * （实测：点了重启，pid 23164 纹丝不动，控制台继续跑旧代码）。
+ *
+ * 有了端口反查，重启就能停掉"上一轮启动、现在还在跑"的那个控制台。
+ * 拿不到 pid 时返回 null（调用方如实报错，不猜、不乱杀）。
+ *
+ * @param {number} port
+ * @returns {number|null}
+ */
+export function findPortPid(port) {
+  const isWin = process.platform === 'win32';
+  try {
+    if (isWin) {
+      const r = spawnSync('netstat', ['-ano', '-p', 'TCP'], { encoding: 'utf8', timeout: 5000, windowsHide: true });
+      if (r.status !== 0 || !r.stdout) return null;
+      for (const line of r.stdout.split('\n')) {
+        // 形如：  TCP    127.0.0.1:8792    0.0.0.0:0    LISTENING    23164
+        if (!/LISTENING/i.test(line)) continue;
+        const cols = line.trim().split(/\s+/);
+        if (cols.length < 5) continue;
+        if (!new RegExp(`[:.]${port}$`).test(cols[1])) continue;
+        const pid = Number(cols[cols.length - 1]);
+        if (Number.isInteger(pid) && pid > 0) return pid;
+      }
+      return null;
+    }
+    const r = spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8', timeout: 5000 });
+    const pid = Number((r.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean)[0]);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * 用来确认端口上**是我们自己的控制台**的标记。
@@ -68,8 +140,15 @@ export class ConsoleSupervisor {
     this.nodePath = options.nodePath || process.execPath;
     this.env = options.env || {};
     this.onLog = options.onLog || (() => {});
-    /** 只有「本进程亲手拉起的」控制台才由我们停；别人起的（双击 启动.cmd）不动。 */
-    this.spawnedPid = null;
+    /**
+     * 只有「本进程亲手拉起的」控制台才由我们停；别人起的（双击 启动.cmd）不动。
+     *
+     * 但**控制台是 detached 的、活过 dsh 重启**，所以光靠内存里的 `spawnedPid`
+     * 不够：重启 dsh 之后它是 null，于是"重启控制台"永远做不到（实测点了没反应）。
+     * 因此把 pid 落盘到 `dashboard/console.pid`，下一轮启动仍能认出"这是我们起的"。
+     */
+    this.pidFile = options.pidFile || join(options.projectRoot, 'dashboard', 'console.pid');
+    this.spawnedPid = readPidFile(this.pidFile);
     this.lastStartError = null;
     this.pendingEnsure = null;
     /** 探测结果缓存：面板每 5 秒问一次状态，没必要每次都把首页拉一遍。 */
@@ -142,18 +221,37 @@ export class ConsoleSupervisor {
 
   /**
    * 保证控制台可用：活着就复用，否则按配置拉起并等它就绪。
-   * @param {{signal?: AbortSignal, readyTimeoutMs?: number}} [options]
+   *
+   * `restart: true` 时**先停再起** —— 这是"改了控制台代码要生效"的唯一办法。
+   * 原先没有这个开关，路由层的 `action: 'restart'` 落到这里就被当成"复用"，
+   * 于是点了重启 pid 纹丝不动（实测 23164 → 23164），控制台继续跑旧代码；
+   * 用户看到的现象是"代码改了但界面没变"（诊断页显示 5 个登录文件名那次
+   * 就是这么被坑的：`lib/diagnostics.mjs` 改了，控制台进程 28 分钟前就起了）。
+   *
+   * @param {{signal?: AbortSignal, readyTimeoutMs?: number, restart?: boolean}} [options]
    */
-  async ensure({ signal, readyTimeoutMs = 20_000 } = {}) {
+  async ensure({ signal, readyTimeoutMs = 20_000, restart = false } = {}) {
     if (this.pendingEnsure) return this.pendingEnsure;
-    this.pendingEnsure = this.#ensure({ signal, readyTimeoutMs }).finally(() => { this.pendingEnsure = null; });
+    this.pendingEnsure = this.#ensure({ signal, readyTimeoutMs, restart }).finally(() => { this.pendingEnsure = null; });
     return this.pendingEnsure;
   }
 
-  async #ensure({ signal, readyTimeoutMs }) {
-    const status = await this.probe({ signal });
-    if (status.state === 'running') return { ok: true, started: false, reused: true, state: 'running', url: this.url };
+  async #ensure({ signal, readyTimeoutMs, restart }) {
+    let status = await this.probe({ signal });
+    if (status.state === 'running' && !restart) return { ok: true, started: false, reused: true, state: 'running', url: this.url };
     if (status.state === 'foreign') return { ok: false, started: false, reused: false, state: 'foreign', error: status.error };
+    if (status.state === 'running' && restart) {
+      /*
+       * `adoptPort: true` —— 重启是**明确的用户动作**（"我要让新代码生效"），
+       * 这时允许用端口反查认领控制台。控制台是 detached 的、活过 dsh 重启，
+       * 光靠 spawnedPid / pid 文件认不出来（实测：点了重启，pid 纹丝不动，
+       * 控制台继续跑旧代码 —— 诊断页显示 5 个登录文件名那次就是这么被坑的）。
+       */
+      const stopped = await this.stop({ adoptPort: true });
+      if (!stopped.ok) {
+        return { ok: false, started: false, reused: false, state: 'running', error: stopped.error };
+      }
+    }
     const started = await this.start();
     if (!started.ok) return { ok: false, started: false, reused: false, state: 'stopped', error: started.error };
     const deadline = Date.now() + readyTimeoutMs;
@@ -162,7 +260,9 @@ export class ConsoleSupervisor {
       if (signal?.aborted) return { ok: false, started: true, reused: false, state: 'starting', error: 'aborted' };
       await sleep(250);
       const probe = await this.probe({ signal });
-      if (probe.state === 'running') return { ok: true, started: true, reused: false, state: 'running', url: this.url, pid: started.pid };
+      if (probe.state === 'running') {
+        return { ok: true, started: true, reused: false, restart, state: 'running', url: this.url, pid: started.pid };
+      }
       if (probe.state === 'foreign') return { ok: false, started: true, reused: false, state: 'foreign', error: probe.error };
       lastError = probe.error || lastError;
     }
@@ -207,6 +307,8 @@ export class ConsoleSupervisor {
       });
       child.unref();
       this.spawnedPid = child.pid ?? null;
+      // 落盘：控制台 detached、活过 dsh 重启，下一轮靠这个文件认出"这是我们起的"
+      if (this.spawnedPid) writePidFile(this.pidFile, this.spawnedPid);
       this.lastStartError = null;
       this.cache = { at: 0, state: null, error: '' };
       this.onLog(`console spawned pid=${child.pid} ${this.url}`);
@@ -229,8 +331,22 @@ export class ConsoleSupervisor {
    * 控制台不像桥那样在 `/health` 里自报 pid，所以对别人启动的实例（双击
    * `启动.cmd`）我们**不动它** —— 停别人起的东西不是插件该做的事。
    */
-  async stop() {
-    const pid = this.spawnedPid;
+  /**
+   * 停控制台。
+   *
+   * pid 来源按可信度排序：
+   *   ① 内存里的 `spawnedPid`（本进程刚拉起的）；
+   *   ② `console.pid` 落盘文件（**上一轮** dsh 拉起的，活过了重启）。
+   *
+   * ③ 端口反查**只在 `adoptPort` 时用**（`restart` 走这条）：控制台是 detached 的，
+   * 重启 dsh 后 ①② 可能都没有，不反查就永远重启不了（实测点了重启 pid 纹丝不动）。
+   * 但普通 `stop` 保持保守 —— 用户双击 `启动.cmd` 起的实例，插件不主动去停，
+   * 那是原有设计意图（"停别人起的东西不是插件该做的事"）。
+   *
+   * @param {{adoptPort?: boolean}} [options]
+   */
+  async stop({ adoptPort = false } = {}) {
+    const pid = this.spawnedPid || readPidFile(this.pidFile) || (adoptPort ? findPortPid(this.port) : null);
     if (!pid) {
       const status = await this.probe({ cached: false });
       return {
@@ -244,6 +360,7 @@ export class ConsoleSupervisor {
     try {
       process.kill(pid, 'SIGTERM');
     } catch (error) {
+      clearPidFile(this.pidFile);
       return { ok: false, stopped: false, error: `无法结束 pid ${pid}：${error.message}` };
     }
     const deadline = Date.now() + 8000;
@@ -251,9 +368,26 @@ export class ConsoleSupervisor {
       await sleep(200);
       if ((await this.probe({ cached: false })).state === 'stopped') {
         this.spawnedPid = null;
+        clearPidFile(this.pidFile);
         return { ok: true, stopped: true, pid };
       }
     }
-    return { ok: false, stopped: false, error: `pid ${pid} 在 8 秒内没有退出` };
+    /*
+     * SIGTERM 没让它退出（Windows 上 detached 进程常见）：升级到强杀。
+     * 控制台没有需要优雅落盘的状态（账本在桥那边、它是只读展示），强杀安全。
+     */
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch { /* 已经退出了 */ }
+    const hardDeadline = Date.now() + 5000;
+    while (Date.now() < hardDeadline) {
+      await sleep(200);
+      if ((await this.probe({ cached: false })).state === 'stopped') {
+        this.spawnedPid = null;
+        clearPidFile(this.pidFile);
+        return { ok: true, stopped: true, pid, forced: true };
+      }
+    }
+    return { ok: false, stopped: false, error: `pid ${pid} 在 13 秒内没有退出（已尝试 SIGTERM 与 SIGKILL）` };
   }
 }
