@@ -114,19 +114,24 @@ const STARTED_AT = Date.now();
 // 兜底的精选模型定义。倍率优先取上游的 credits（形如 "x0.11"），
 // 这里的数值取自上游实测，仅在上游没给时才用——注意它们会随官方调价而过时。
 //
-// **`images` 必须显式写**：这些模型是**补全项**（不在上游目录端点里，见下方
-// `supplemented` 那段），所以拿不到 `m.supportsImages` —— 不写就等于声明"不支持
-// 图片"，用户在 dsh 里贴不了图。
+// **能力字段（images / supportsReasoning）必须显式写**：这些模型是**补全项**
+// （不在上游目录端点里，见下方 `supplemented` 那段），所以拿不到
+// `m.supportsImages` / `m.supportsReasoning` —— 不写就等于声明"不支持"，
+// 用户会发现「贴不了图」「没有推理等级下拉」，而模型其实两个都支持。
 //
 // 实测（judier-cod / 国际版账号，2026-10-12）：
-//   deepseek-v4.1-flash + **真实 400x300 图片** → 200 "Green"（能看图）
-//   deepseek-v4.1-flash + 1x1 / 16x16 玩具图    → 400 model_param_invalid
-// 也就是说：**小到不合理的图会被上游当无效请求拒**，那是测试假象，不代表模型
-// 不支持图片。判据要用真实尺寸的图。
+//   图片：deepseek-v4.1-flash + **真实 400x300 图片** → 200 "Green"（能看图）
+//         同一个模型 + 1x1 / 16x16 玩具图 → 400 model_param_invalid
+//         **小到不合理的图会被上游当无效请求拒** —— 那是测试假象，不是能力问题。
+//   推理：deepseek-v4.1-flash + reasoning_effort=low  → reasoning_tokens=19
+//         不带 reasoning_effort                        → reasoning_tokens=0
+//         也就是说它**真的按档位推理**，与目录里 glm-5.3 / hy3 的行为一致。
+//
+// 判据必须用真实尺寸的图 / 真实的 reasoning_tokens，别用玩具载荷。
 const FEATURED = [
-  { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', context: 1000000, maxOutput: 128000, credits: 0.11, images: true },
-  { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', context: 1000000, maxOutput: 50000, credits: 0.51, images: true },
-  { id: 'glm-5.3', name: 'GLM-5.3', context: 1000000, maxOutput: 48000, credits: 0.79, images: true },
+  { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash', context: 1000000, maxOutput: 128000, credits: 0.11, images: true, supportsReasoning: true },
+  { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', context: 1000000, maxOutput: 50000, credits: 0.51, images: true, supportsReasoning: true },
+  { id: 'glm-5.3', name: 'GLM-5.3', context: 1000000, maxOutput: 48000, credits: 0.79, images: true, supportsReasoning: true },
 ];
 
 /**
@@ -2510,6 +2515,43 @@ function preflightModelError(model) {
     + ' set WORKBUDDY_SKIP_MODEL_PREFLIGHT=1 to forward unknown model ids anyway.';
 }
 
+/**
+ * 上游目录的**能力误报**纠正表：`modelId → 该区域不支持的能力`。
+ *
+ * 为什么需要：上游目录会**误报**（与漏报相反的方向）。实测 `glm-5.3` 在国际版
+ * 目录里 `supportsImages: true`，但把图片发过去会被**静默丢掉**：
+ *
+ *     国际版 (8791/8795)：glm-5.3 + 图片 → prompt_tokens=56（纯文本量），
+ *                         模型回"I can't see any image"
+ *     国内版 (8790/8793)：glm-5.3 + 图片 → prompt_tokens=194，正确描述图片
+ *     对照 hy3（同区域）：国际版 prompt_tokens=340，正常看到图片
+ *
+ * 换协议路径（Anthropic）与换图片尺寸（400x300 / 800x600）结果一致 ——
+ * 所以是**国际版网关侧**丢图，桥改不了。能做的是**如实反映**：目录里不声明
+ * 这个能力，用户在 dsh 里就不会被允许贴一张注定被丢的图。
+ *
+ * 键是模型 id，值是**该区域不支持**的能力名（`images` / `reasoning`）。
+ * 只有实测确认过的才写进来 —— 猜错会让用户少用一个本来能用的能力。
+ */
+const REGION_CAPABILITY_CORRECTIONS = {
+  // 国际版网关不接收 glm-5.3 的图片（实测 2026-10-12）
+  'workbuddy.ai': { 'glm-5.3': ['images'] },
+  'codebuddy.ai': { 'glm-5.3': ['images'] },
+};
+
+/**
+ * 取当前区域的"能力纠正表"。
+ * @param {string} endpoint 上游 chat 端点（`auth.endpoint`）
+ * @returns {Record<string, string[]>} modelId → 要压掉的能力
+ */
+function capabilityCorrections(endpoint) {
+  const e = String(endpoint || '');
+  for (const [host, table] of Object.entries(REGION_CAPABILITY_CORRECTIONS)) {
+    if (e.includes(host)) return table;
+  }
+  return {};
+}
+
 async function fetchCatalog() {
   // 是否**真的**从上游取到了目录。下面 FEATURED 补全会让 merged 永远非空，
   // 所以不能靠「目录非空」判断这次抓取成没成功。
@@ -2525,6 +2567,8 @@ async function fetchCatalog() {
   let hardError = false;
   try {
     const auth = readStoredAuth();
+    // 该区域的能力纠正表（实测确认过的上游误报，见 REGION_CAPABILITY_CORRECTIONS）
+    const corrections = capabilityCorrections(auth.endpoint);
     const shape = { paths: catalogPathsFor(), sources: {}, model: [] };
     const merged = new Map();
     const promotions = new Map(); // modelId → 徽章文案（如「Free now」）
@@ -2662,13 +2706,14 @@ async function fetchCatalog() {
         maxInputTokens: f.context,
         maxOutputTokens: f.maxOutput,
         /*
-         * **`supportsImages` 必须带上**：补全项拿不到上游的字段，不写就等于
-         * 声明"不支持图片"（`images: !!m.supportsImages` 会是 false）。
-         * 实测：国际版账号下 `deepseek-v4.1-flash` 本来就不在上游目录里，
-         * 补全时漏了它 → 桥不声明 supports_images → dsh 里贴不了图，
-         * 而该模型**实测能看图**（真实 400x300 图片返回 200 "Green"）。
+         * **能力字段必须带上**：补全项拿不到上游的字段，不写就等于声明"不支持"。
+         *   - `supportsImages`    → `images: !!m.supportsImages` 会是 false（贴不了图）
+         *   - `supportsReasoning` → 目录不声明 → dsh 选择器没有「推理等级」下拉
+         * 两个都在补全时漏过，实测各引发一次用户反馈。
          */
         ...(f.images ? { supportsImages: true } : {}),
+        ...(f.supportsReasoning ? { supportsReasoning: true } : {}),
+        ...(f.onlyReasoning ? { onlyReasoning: true } : {}),
         ...(promo?.free ? { credits: 0 } : {}),
         _supplemented: true,
       });
@@ -2704,7 +2749,12 @@ async function fetchCatalog() {
           name: m.name || m.id,
           context: m.maxInputTokens,
           maxOutput: m.maxOutputTokens,
-          images: !!m.supportsImages,
+          /*
+           * 能力声明要**同时**过一遍区域纠正表：上游目录会误报（如国际版的
+           * glm-5.3 声明 supportsImages 却收不到图）。压掉之后 dsh 不再允许
+           * 贴那张注定被丢的图 —— 比"贴了才发现模型说看不见"诚实。
+           */
+          images: !!m.supportsImages && !(corrections[m.id] || []).includes('images'),
           credits: effectiveCredits,
           // 上游的推理能力标记：supportsReasoning=true 表示该模型接受推理强度控制
           //（选择器要据此显示"推理等级"下拉）；onlyReasoning 表示该模型只能以
@@ -2760,8 +2810,22 @@ function pickFeatured(catalog) {
   const byId = new Map(catalog.map((m) => [m.id, m]));
   // 精选模型始终保留：目录里没有的用定义值补上（上游目录并不完整，
   // 例如国际版能调 deepseek-v4.1-flash，但目录里没有它）。
-  return FEATURED.map((f) => byId.get(f.id)
-    ?? { id: f.id, name: f.name, context: f.context, maxOutput: f.maxOutput, credits: f.credits });
+  //
+  // **能力字段必须一起带上**（images / supportsReasoning）。这里是**第二条**
+  // 补全路径（另一条是 merged.set 那段），两处漏字段的表现完全一样：
+  // 目录里该模型没有 supports_images / supports_reasoning → dsh 里贴不了图、
+  // 没有「推理等级」下拉。第一版只修了 merged.set 那条，这条漏了 ——
+  // 用户报"deepseek-v4.1-flash 没有推理等级"就是它。
+  return FEATURED.map((f) => byId.get(f.id) ?? {
+    id: f.id,
+    name: f.name,
+    context: f.context,
+    maxOutput: f.maxOutput,
+    credits: f.credits,
+    ...(f.images ? { supportsImages: true } : {}),
+    ...(f.supportsReasoning ? { supportsReasoning: true } : {}),
+    ...(f.onlyReasoning ? { onlyReasoning: true } : {}),
+  });
 }
 
 // ── Billing / credits ────────────────────────────────────────────────────
