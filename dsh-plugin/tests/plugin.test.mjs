@@ -1783,6 +1783,90 @@ test('纳管账号分配端口：必须避开控制台端口（回归：抢 8792
 });
 
 /**
+ * 所有路由的展示名统一成**账号标签**（手机号/邮箱）。
+ *
+ * 用户要求"模型选择器里直接用手机号或者邮箱分组"。原先三处口径不一：
+ * 主账号 `WorkBuddy`、手写分组 `WorkBuddy 国际版`、纳管分组 `纳管账号 191****1006`
+ * —— 看着不像同一个维度的东西。
+ *
+ * 关键机制：`providerInfo()` 的结果在 `registerAdapter` 时**同步冻结**
+ * （契约第 1508 行），所以改名必须调 `handle.replace()`；而标签要异步解密，
+ * 因此注册时只能先用配置名，之后由 `syncGroupNames()` 刷新。
+ */
+test('syncGroupNames：主账号与手写分组的展示名都刷成账号标签（并 replace 生效）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wb-names-'));
+  try {
+    // 手写分组的 authFile：明文手机号（不需要密钥，纯逻辑验证）
+    const customAuth = join(dir, 'custom.info');
+    writeFileSync(customAuth, JSON.stringify({
+      account: { uin: '450000000000', phoneNumber: '19900001111' },
+      auth: { domain: 'www.workbuddy.ai', expiresAt: Date.now() + 864e5 },
+    }), 'utf8');
+    // 主账号的 authFile（模拟桥正在用的那个）
+    const mainAuth = join(dir, 'main.info');
+    writeFileSync(mainAuth, JSON.stringify({
+      account: { uin: '330000000000', phoneNumber: '18800002222' },
+      auth: { domain: 'www.workbuddy.cn', expiresAt: Date.now() + 864e5 },
+    }), 'utf8');
+
+    const { ctx, calls } = fakeCtx();
+    const result = apply(ctx, {
+      projectRoot: dir, dshHome: dir, accountWatchMs: 0,
+      autoStart: false, consoleAutoStart: false, migrateLegacy: false,
+      tools: false, commands: false, routes: false,
+      accounts: [{ id: 'custom', displayName: 'WorkBuddy 国际版', authFile: customAuth, port: 8791 }],
+      accountProviderPrefix: 'workbuddy-',
+    });
+
+    // 注册时的名字还是配置里的（标签要异步解密，此时拿不到）
+    const reg = calls.adapters.find((a) => a.providers[0] === 'workbuddy-custom');
+    assert.ok(reg, '前置：手写分组应已注册');
+
+    // 驱动一轮统一改名（真实环境里由巡检每 15 秒调一次）
+    const probe = { state: 'running', health: { authFile: mainAuth, auth: { userId: 'main-uid' } } };
+    const renamed = result.syncGroupNames(probe);
+    assert.ok(renamed >= 2, `主账号与手写分组都应改名，实际改了 ${renamed} 个`);
+
+    assert.equal(result.adapter.displayName, '188****2222',
+      '主账号展示名必须是脱敏手机号（18800002222 → 188****2222）');
+    const custom = result.state.accountGroups.find((g) => g.provider === 'workbuddy-custom');
+    assert.equal(custom.displayName, '199****1111', '手写分组展示名必须是脱敏手机号');
+
+    // 幂等：再跑一轮不该重复改名（显示名已相同）
+    assert.equal(result.syncGroupNames(probe), 0, '名字没变时不该重复 replace（会白白扰动 UI）');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * 面板不应把**同一账号的残留快照**当成"另一个未启用账号"列出。
+ *
+ * 回归（用户实测）：账号页多出一条 `330125158554`。那是客户端切换账号时留下的
+ * 带时间戳的备份（`workbuddy-desktop.2026-10-11T09-10-37-642Z….info`），与当前
+ * `workbuddy-desktop.info` 是**同一个账号**。原先只看文件名，于是同号重复显示。
+ */
+test('同账号的残留快照不算"未启用账号"（回归：列表多出一条同号重复项）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wb-unused-'));
+  try {
+    const { ctx } = fakeCtx();
+    const result = apply(ctx, {
+      projectRoot: dir, dshHome: dir, accountWatchMs: 0,
+      autoStart: false, consoleAutoStart: false, migrateLegacy: false,
+      tools: false, commands: false, routes: false,
+    });
+    // 面板侧的判定逻辑在 client.js；这里钉住宿主给的数据足以区分（uin 一致）
+    const snap = await result.snapshot({});
+    assert.ok(Array.isArray(snap.accountGroups), '快照必须带 accountGroups（面板据此判"在用"）');
+    for (const g of snap.accountGroups) {
+      assert.equal(typeof g.uin, 'string', '每个分组都要带 uin —— 面板靠它按身份去重');
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
  * 分组标签必须能从 uin **刷新**成手机号/邮箱。
  *
  * 回归（用户实测："重启了但没看到改变"）：标签要解密，而解密密钥是异步取的

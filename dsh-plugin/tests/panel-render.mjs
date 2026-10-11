@@ -295,6 +295,19 @@ try {
   for (const provider of ['workbuddy-ai', 'workbuddy-m7ffbd7f5']) {
     if (!beforeExpand.includes(provider)) problems.push(`账号页缺少 provider 名「${provider}」（用户要照它去模型选择器里选）`);
   }
+  /*
+   * **同一账号的残留快照不许出现在「已扫描到、尚未启用」里**。
+   *
+   * 回归（用户实测）：账号页多列了一条 `330125158554` —— 那是客户端切换账号时
+   * 留下的带时间戳备份，与当前 `workbuddy-desktop.info` 是**同一个账号**。
+   * 判定必须按账号身份（uin）去重，只看文件名就会漏（两个文件名完全不同）。
+   *
+   * 夹具里那条残留快照的 account 与主账号相同（都是 330125158554），所以正确
+   * 的实现下这一整块**不该出现**。
+   */
+  if (beforeExpand.includes('已扫描到、尚未启用')) {
+    problems.push('账号页出现了「已扫描到、尚未启用」—— 夹具里那条是**同账号的残留快照**，应按账号身份去重，不该列出来');
+  }
 
   // 用量页要有真的图表（内联 SVG），模型页要有表格行；再各截一页做人工确认
   await page.cdp.evaluate(`(() => { const b=[...document.querySelectorAll('.wb-tab')].find(x=>x.textContent==='用量'); b && b.click(); })()`);

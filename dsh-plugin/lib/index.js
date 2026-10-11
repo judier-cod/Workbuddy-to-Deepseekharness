@@ -1643,6 +1643,86 @@ export function apply(ctx, rawConfig = {}) {
    * @param {string} uid 主桥当前服务的账号 uid
    * @returns {Promise<boolean>} 是否撤掉了某个分组
    */
+  /**
+   * 给分组换展示名，并让 dsh 的模型选择器看到新名字。
+   *
+   * 为什么需要 replace：`providerInfo()` 在 `registerAdapter` 时被**同步调用并
+   * 冻结**（契约见 docs/dsh-llm-adapter-contract.md 第 1508 行），之后改
+   * `adapter.displayName` 不调 `handle.replace([provider])` 的话，模型选择器
+   * 永远显示旧名字。
+   *
+   * 组名用**手机号/邮箱**（脱敏）：用户要的是"在模型选择器里直接认出这是哪个
+   * 账号"，而不是 `workbuddy-m6d2b5f6b` 这种路由键。
+   *
+   * 失败只记日志：换名字失败不该影响路由本身可用。
+   */
+  function renameGroup(group, label) {
+    const next = String(label || '').trim();
+    if (!next || group.displayName === next) return false;
+    group.displayName = next;
+    if (group.adapter) group.adapter.displayName = next;
+    try {
+      if (typeof group.handle === 'function' && typeof group.handle.replace === 'function') {
+        group.handle.replace([group.provider]);
+      }
+    } catch (error) {
+      log(`刷新分组「${next}」在模型选择器里的名字失败（不影响路由可用）`, error);
+    }
+    return true;
+  }
+
+  /**
+   * 把所有路由的**展示名**统一刷成账号标签（手机号/邮箱，退回 uin）。
+   *
+   * 用户要求"模型选择器里直接用手机号或者邮箱分组"。原先三处口径不一：
+   * 主账号叫 `WorkBuddy`、手写分组叫 `WorkBuddy 国际版`、纳管分组叫
+   * `纳管账号 191****1006` —— 看着不像同一个维度的东西。现在统一成账号标签。
+   *
+   * 覆盖：
+   *   1. 主账号 —— 读桥正在用的 authFile；
+   *   2. 手写分组（cordis.patch.yml 的 `accounts`）—— 读各自的 authFile；
+   *   3. 纳管分组 —— 标签在激活时已解析（那轮密钥可能没就绪，这里会重试）。
+   *
+   * 为什么放在这里而不是注册时：标签要解密（异步、要拉起客户端取密钥），而
+   * `registerAdapter` 是同步的、`providerInfo` 的结果当场冻结。所以注册时先用
+   * 配置里的名字，等这里拿到标签再 `handle.replace()` 刷新。
+   *
+   * @param {object} [probe] 主桥探测结果（含 authFile）；缺省则不刷主账号
+   * @returns {number} 实际改了名字的路由数
+   */
+  function syncGroupNames(probe) {
+    let renamed = 0;
+    const decryptOf = () => (decoderRef.value ? (v) => decoderRef.value.decrypt(v) : null);
+
+    // ── 1. 主账号 ────────────────────────────────────────────────────
+    const mainAuthFile = probe?.health?.authFile;
+    if (mainAuthFile) {
+      const ident = readAuthIdentity(mainAuthFile, decryptOf());
+      if (ident?.label && ident.label !== adapter.displayName) {
+        adapter.displayName = ident.label;
+        try {
+          if (typeof adapterHandle === 'function') adapterHandle.replace([state.route.provider]);
+          renamed += 1;
+        } catch (error) {
+          log('刷新主账号在模型选择器里的名字失败（不影响路由可用）', error);
+        }
+      }
+    }
+
+    // ── 2 & 3. 各分组 ────────────────────────────────────────────────
+    for (const group of accountGroups) {
+      // 纳管分组：标签在激活时已解析好（那一轮密钥可能还没就绪，这里会重试）
+      let label = group.label || '';
+      // 手写分组：读它自己的 authFile（按 mtime 缓存，见 resolveGroupLabel）
+      if (!label && group.authFile) label = resolveGroupLabel(group);
+      if (!label && group.uin) label = group.uin;
+      if (!label) continue;
+      group.label = group.label || label;
+      if (renameGroup(group, label)) renamed += 1;
+    }
+    return renamed;
+  }
+
   async function retirePromotedGroup(uid) {
     const group = accountGroups.find((g) => g.authFile && g.authFile.includes(String(uid)) && !g.retired);
     if (!group) return false;
@@ -1744,12 +1824,22 @@ export function apply(ctx, rawConfig = {}) {
        */
       const existing = accountGroups.find((g) => g.provider === provider);
       if (existing) {
+        /*
+         * 标签变了就刷新**展示名**，并调 `handle.replace()`。
+         *
+         * 为什么必须 replace：`providerInfo()` 的结果在 `registerAdapter` 时被
+         * **同步冻结**（契约见 docs/dsh-llm-adapter-contract.md 第 1508 行），
+         * 改 `adapter.displayName` 不调 replace 的话，模型选择器永远显示旧名字。
+         * 标签要解密才能拿到，而注册发生在密钥就绪之前 —— 所以这条刷新路径是
+         * 必须的，否则组名会永久停在 uin。
+         */
         if (account.label && existing.label !== account.label) {
           existing.label = account.label;
           existing.uin = account.uin || existing.uin || '';
-          existing.displayName = `纳管账号 ${account.label}`;
+          renameGroup(existing, account.label);
         } else if (!existing.label && account.label) {
           existing.label = account.label;
+          renameGroup(existing, account.label);
         }
         continue;
       }
@@ -1759,12 +1849,15 @@ export function apply(ctx, rawConfig = {}) {
         id,
         provider,
         /*
-         * 展示名用**用户认得出的账号标签**（脱敏后的手机号/邮箱，退回到 uin）。
-         * uuid 前 8 位对不上客户端界面上的任何东西（实测反馈"不知道哪个是哪个
-         * 账号"）；uin 虽然是真标识，但一串 12 位数字也不如手机号好认。
-         * 标签已脱敏 —— 它会进截图与诊断报告（见 login.mjs 的 maskIdentity）。
+         * 展示名 = **账号标签本身**（脱敏手机号/邮箱，退回 uin）。
+         *
+         * 不带 "纳管账号 " 前缀是**有意的**：这个名字就是 dsh 模型选择器里那一组
+         * 的标题（`providerInfo().name`）。用户的诉求是"模型选择器里直接用手机号
+         * 或者邮箱分组"，加了前缀反而让那一行变长、且三个分组看着不像同一个维度
+         * 的东西（一个叫 "WorkBuddy 国际版"、另一个叫 "纳管账号 191****1006"）。
+         * 现在三个分组名分别是手机号 / 邮箱 / 手机号，一眼就是"哪个账号"。
          */
-        displayName: `纳管账号 ${account.label || account.uin || account.uid.slice(0, 8)}`,
+        displayName: account.label || account.uin || account.uid.slice(0, 8),
         authFile: account.path,
         port,
         token: '',
@@ -2304,9 +2397,11 @@ export function apply(ctx, rawConfig = {}) {
           // 存档之后再看有没有"还没成为分组"的账号 —— 换账号后旧账号会在这里
           // 自动变成独立分组，**不需要重启 dsh**。
           const activated = await activateManagedGroups();
-          if (main.changed || groups || activated) {
+          // 所有分组的组名统一刷成账号标签（手写分组在这里才第一次拿到标签）
+          const renamedGroups = syncGroupNames(probe);
+          if (main.changed || groups || activated || renamedGroups) {
             notifyAdaptersUpdated();
-            log(`账号巡检：身份变化（主桥=${main.changed ? '是' : '否'}，分组=${groups ? '是' : '否'}，新分组=${activated}），已广播模型拓扑变更`);
+            log(`账号巡检：身份变化（主桥=${main.changed ? '是' : '否'}，分组=${groups ? '是' : '否'}，新分组=${activated}，改名=${renamedGroups}），已广播模型拓扑变更`);
           }
         } catch (error) {
           log('账号巡检失败（忽略，不影响其它功能）', error);
@@ -2322,9 +2417,12 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   log(`插件已加载：projectRoot=${projectRoot || '(未找到)'} bridge=${supervisor.baseUrl} console=${consoleSupervisor.url} provider=${state.route.provider}`);
-  // activateManagedGroups 一并返回：测试要能确定性地驱动它（它是异步的，
-  // 加载时那次是 fire-and-forget，断言不能靠等）。
-  return { supervisor, consoleSupervisor, client, adapter, state, snapshot, activateManagedGroups };
+  // 一并返回几个内部函数：测试要能**确定性地**驱动它们（异步、或挂在定时器上，
+  // 断言不能靠等）。生产路径不依赖这些导出。
+  return {
+    supervisor, consoleSupervisor, client, adapter, state, snapshot,
+    activateManagedGroups, syncGroupNames,
+  };
 }
 
 export default { name, inject, apply, DEFAULTS, resolveConfig, detectProjectRoot };

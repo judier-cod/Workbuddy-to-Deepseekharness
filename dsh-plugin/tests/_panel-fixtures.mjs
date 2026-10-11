@@ -175,9 +175,20 @@ FIXTURES.consoleOverview = { bridge: { running: true, port: 8790 }, dsh: { route
 FIXTURES.consoleAccounts = {
   dir: 'C:\\Users\\demo\\AppData\\Local\\CodeBuddyExtension\\Data\\Public\\auth',
   active: 'C:\\Users\\demo\\AppData\\Local\\CodeBuddyExtension\\Data\\Public\\auth\\workbuddy-desktop.info',
+  /*
+   * `account` 必须与 status 里各分组的 `uin` **一致** —— 面板按账号身份去重，
+   * 两处对不上就测不到"残留快照应被忽略"这条逻辑（会误判成真·未启用）。
+   */
   accounts: [
-    { name: 'workbuddy-desktop.info', path: 'C:\\Users\\demo\\AppData\\Local\\CodeBuddyExtension\\Data\\Public\\auth\\workbuddy-desktop.info', active: true, usable: true, account: '330000000000', domain: 'copilot.tencent.com', encrypted: true, expiresAt: now + 44 * 86400000, remainingMs: 44 * 86400000 },
-    { name: 'workbuddy-desktop-ai.info', path: 'C:\\Users\\demo\\AppData\\Local\\CodeBuddyExtension\\Data\\Public\\auth\\workbuddy-desktop-ai.info', active: false, usable: true, account: '450000000000', domain: 'www.workbuddy.ai', encrypted: true, expiresAt: now + 342 * 86400000, remainingMs: 342 * 86400000 },
+    { name: 'workbuddy-desktop.info', path: 'C:\\Users\\demo\\AppData\\Local\\CodeBuddyExtension\\Data\\Public\\auth\\workbuddy-desktop.info', active: true, usable: true, account: '330125158554', domain: 'copilot.tencent.com', encrypted: true, expiresAt: now + 44 * 86400000, remainingMs: 44 * 86400000 },
+    { name: 'workbuddy-desktop-ai.info', path: 'C:\\Users\\demo\\AppData\\Local\\CodeBuddyExtension\\Data\\Public\\auth\\workbuddy-desktop-ai.info', active: false, usable: true, account: '450702377403', domain: 'www.workbuddy.ai', encrypted: true, expiresAt: now + 342 * 86400000, remainingMs: 342 * 86400000 },
+    /*
+     * **同一账号的残留快照**（客户端切账号时留下的带时间戳备份）。
+     * 回归（用户实测）：面板把它当"另一个未启用账号"列了出来，于是列表里多出
+     * 一条与当前账号同号的重复项。判定必须按**账号身份**（uin）去重，不能只看
+     * 文件名 —— 这个名字和 `workbuddy-desktop.info` 完全不同。
+     */
+    { name: 'workbuddy-desktop.2026-10-11T09-10-37-642Z.16856.info', path: 'C:\\Users\\demo\\AppData\\Local\\CodeBuddyExtension\\Data\\Public\\auth\\workbuddy-desktop.2026-10-11T09-10-37-642Z.16856.info', active: false, usable: true, account: '330125158554', domain: 'copilot.tencent.com', encrypted: true, expiresAt: now + 43 * 86400000, remainingMs: 43 * 86400000 },
   ],
 };
 FIXTURES.consoleDiagnose = {

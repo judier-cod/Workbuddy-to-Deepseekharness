@@ -2530,9 +2530,28 @@ body.dark .wb-root,
           account: g.account || '', uin: g.uin || '', label: g.label || '',
         })),
       ];
-      /** 账号快照 → 被哪个分组使用（按文件名匹配）。 */
+      /**
+       * 账号快照 → 被哪个分组使用。
+       *
+       * **按账号身份（uin / userId）判，不按文件名**：客户端切账号时会留下带
+       * 时间戳的备份快照（实测 `workbuddy-desktop.2026-10-11T09-10-37-642Z….info`），
+       * 它与当前 `workbuddy-desktop.info` 是**同一个账号**。只按文件名对照的话，
+       * 那个备份会被当成"另一个未启用的账号"显示出来 —— 用户看到的就是列表里
+       * 多出一条同号重复项（实测反馈）。
+       */
       const usedBy = (name) => groups.filter((g) => g.authFile === name);
-      const unused = accounts.filter((a) => usedBy(a.name).length === 0);
+      const identityOf = (a) => a?.account || a?.userId || '';
+      const usedIdentities = new Set(
+        groups.map((g) => {
+          const snap = accounts.find((a) => a.name === g.authFile);
+          return g.uin || identityOf(snap) || g.account || '';
+        }).filter(Boolean),
+      );
+      const unused = accounts.filter((a) => {
+        if (usedBy(a.name).length) return false;          // 按文件名直接命中
+        const id = identityOf(a);
+        return !(id && usedIdentities.has(id));           // 同账号的残留快照：不算"未启用"
+      });
 
       return h(Card, { title: '账号' },
         error ? h(Alert, { bad: true }, error) : null,
