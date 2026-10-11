@@ -39,11 +39,20 @@ const POLL_INTERVAL_MS = 3000;
 const UA = 'WorkBuddy/4.9.29177644 VSCode/1.119.0';
 
 /**
- * 受支持的区域。**本次只做国内版**：国际版的成功态响应未实测（只探到
- * pending），不做没有验证过的东西。
+ * 受支持的区域。
+ *
+ * 两个域都实测过**发起**与**轮询 pending** 的契约（都返回
+ * `{"code":11217,"msg":"11217:login ing..."}`，见 docs/2026-10-11-account-login-module-design.md §2）。
+ * 国际版的**成功态响应体**在实现时尚未实测 —— 代码按国内版的结构处理（同一套
+ * `/v2/plugin/auth/*` 接口、同样的 `data.{accessToken,refreshToken,expiresIn,…}`），
+ * 且对缺字段做了容错：拿不到 `refreshToken` 就存空串（那样只是不能自刷新），
+ * 拿不到 `expiresIn` 就按 0 算（有效期显示"未知"，而不是编一个数）。
+ *
+ * 区域决定的是**上游域**；账号身份（uid/uin）从令牌里读，与区域无关。
  */
 export const REGIONS = {
   cn: { id: 'cn', label: '国内版', base: 'https://copilot.tencent.com' },
+  global: { id: 'global', label: '国际版', base: 'https://www.workbuddy.ai' },
 };
 
 /**
@@ -115,7 +124,10 @@ function nonce() {
  */
 export async function startLogin({ dshHome, region = 'cn' } = {}) {
   const reg = REGIONS[region];
-  if (!reg) return { ok: false, error: `不支持的区域：${region}（当前只支持国内版）` };
+  if (!reg) {
+    const known = Object.keys(REGIONS).join(' / ');
+    return { ok: false, error: `不支持的区域：${region}（支持：${known}）` };
+  }
 
   const id = nonce();
   try {
@@ -187,8 +199,11 @@ export async function pollLogin(id) {
       entry.last = { status: 'error', error: `授权未完成（code ${body.code ?? '未知'}）` };
       return entry.last;
     }
-    // 令牌不进返回值、不进日志：只回非敏感的元数据
-    const account = await persist(entry.dir, body.data);
+    // 令牌不进返回值、不进日志：只回非敏感的元数据。
+    // 传区域进去：上游若没回 `domain`，用区域的默认域兜底 —— 桥靠 `domain`
+    // 决定打哪个网关（`pickUpstream()`），缺了它会落到国内网关、国际版账号
+    // 直接 401。国际版的成功态响应未实测，这条容错是必须的。
+    const account = await persist(entry.dir, body.data, entry.region);
     pending.delete(id);
     entry.last = { status: 'done', account };
     return entry.last;
@@ -292,7 +307,7 @@ export async function createIdentityDecoder() {
  *
  * @returns {Promise<{uid: string, path: string, domain: string, expiresAt: number, refreshExpiresAt: number}>}
  */
-async function persist(dir, data) {
+async function persist(dir, data, region = null) {
   const { sealEncryptedField, defaultExecutableCandidates, fetchKeyFor } = await loadAtRest();
   const { existsSync } = await import('node:fs');
 
@@ -302,6 +317,21 @@ async function persist(dir, data) {
   const { key } = await fetchKeyFor(defaultExecutableCandidates().filter((p) => { try { return existsSync(p); } catch { return false; } }), '');
 
   const now = Date.now();
+  /*
+   * `domain` 缺失时用区域的默认域兜底。
+   *
+   * 桥的 `pickUpstream()` 靠它决定打哪个网关：没有它（空串）会落到
+   * `https://copilot.tencent.com`，**国际版账号会直接 401**。
+   * 国内版实测响应里带 `domain`；国际版未实测，所以这层兜底是必需的。
+   */
+  const domain = String(data.domain || '').trim() || (region ? new URL(region.base).host : '');
+  /*
+   * `expiresIn` 缺失时**不编造**：写 0 并让 `expiresAt` 保持 0
+   * （面板显示"剩余未知"），而不是 `now + 0` —— 那会让账号看起来**立刻就过期**，
+   * 比"未知"更误导。
+   */
+  const expiresIn = Number(data.expiresIn || 0);
+  const refreshExpiresIn = Number(data.refreshExpiresIn || 0);
   const payload = {
     account: { uin: '', nickname: '' },
     auth: {
@@ -310,11 +340,11 @@ async function persist(dir, data) {
       tokenType: data.tokenType || 'Bearer',
       scope: data.scope || '',
       sessionState: data.sessionState || '',
-      domain: data.domain || '',
-      expiresIn: Number(data.expiresIn || 0),
-      refreshExpiresIn: Number(data.refreshExpiresIn || 0),
-      expiresAt: now + Number(data.expiresIn || 0) * 1000,
-      refreshExpiresAt: now + Number(data.refreshExpiresIn || 0) * 1000,
+      domain,
+      expiresIn,
+      refreshExpiresIn,
+      expiresAt: expiresIn > 0 ? now + expiresIn * 1000 : 0,
+      refreshExpiresAt: refreshExpiresIn > 0 ? now + refreshExpiresIn * 1000 : 0,
       lastRefreshTime: now,
     },
     accounts: [],

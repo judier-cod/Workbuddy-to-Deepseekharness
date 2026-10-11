@@ -618,8 +618,11 @@ body.dark .wb-root,
       // ── 纳管账号（插件自己走 OAuth 登录） ──────────────────────────────
       '纳管账号': 'Managed accounts',
       '正在读取纳管账号…': 'Loading managed accounts…',
-      '**国际版账号会自动出现在这里**（客户端登录过就会被扫描到）。国内版则不同：客户端登录目录里的账号由**客户端**写入，登第二个国内版账号会覆盖同一个文件 —— 所以下面这个按钮用于手动补登一个国内版账号：插件自己走官方授权拿到令牌，存成独立的加密凭据，与客户端的互不影响。':
-        '**International accounts show up here automatically** (the client\'s login directory is scanned). Domestic accounts differ: the client writes them into a single fixed file, so signing in a second one overwrites the first — the button below signs in an additional domestic account via the official authorization flow and stores it as an independent encrypted credential that does not interfere with the client.',
+      '**国际版账号会自动出现在这里**（客户端登录过就会被扫描到）。国内版则不同：客户端登录目录里的账号由**客户端**写入，登第二个国内版账号会覆盖同一个文件 —— 所以下面这个按钮用于手动补登：插件自己走官方授权拿到令牌，存成独立的加密凭据，与客户端的互不影响。两个区域是**两套账号体系**（额度不通用），所以要先选区域。':
+        '**International accounts show up here automatically** (the client\'s login directory is scanned). Domestic accounts differ: the client writes them into a single fixed file, so signing in a second one overwrites the first — the button below signs in an additional account through the official authorization flow and stores it as an independent encrypted credential that does not interfere with the client. The two regions are **separate account systems** (credits do not carry over), so pick a region first.',
+      '登录区域': 'Sign-in region',
+      '国内版': 'Domestic',
+      '国际版': 'International',
       '凭据为 AtRest 加密信封、权限 0600，存在 dsh 目录下（不在仓库里）。受上游令牌有效期限制，约 **30 天**需重新登录一次。':
         'Credentials are stored as at-rest encrypted envelopes with mode 0600 under the dsh directory (never inside the repo). Upstream token lifetime requires re-signing in roughly every **30 days**.',
       '添加账号': 'Add account',
@@ -2367,6 +2370,13 @@ body.dark .wb-root,
       const [authUrl, setAuthUrl] = useState('');
       const [message, setMessage] = useState('');
       const [removing, setRemoving] = useState('');
+      /**
+       * 登录区域（`cn` / `global`）。两个区域是**两套账号体系**：上游域不同、
+       * 额度不通用，所以必须显式选，不能靠猜。
+       * 默认国内版：客户端把它写死在一个文件名里（登第二个会覆盖），
+       * 所以那边更需要手动补登；国际版多数靠自动纳管。
+       */
+      const [region, setRegion] = useState('cn');
 
       const accounts = data?.accounts || [];
       const regions = data?.regions || [];
@@ -2402,7 +2412,8 @@ body.dark .wb-root,
       const begin = async () => {
         setBusy(true);
         setMessage('');
-        const r = await post({ action: 'start', region: 'cn' });
+        // 用**当前选中的区域**发起：国内版与国际版是两套上游域与账号体系。
+        const r = await post({ action: 'start', region });
         setBusy(false);
         if (!r.ok) { setMessage(r.error || '发起登录失败'); return; }
         setLoginId(r.id);
@@ -2434,8 +2445,9 @@ body.dark .wb-root,
         h('p', { className: 'wb-note', style: { marginTop: 0 } },
           '**国际版账号会自动出现在这里**（客户端登录过就会被扫描到）。'
           + '国内版则不同：客户端登录目录里的账号由**客户端**写入，登第二个国内版账号会覆盖'
-          + '同一个文件 —— 所以下面这个按钮用于手动补登一个国内版账号：'
-          + '插件自己走官方授权拿到令牌，存成独立的加密凭据，与客户端的互不影响。'),
+          + '同一个文件 —— 所以下面这个按钮用于手动补登：'
+          + '插件自己走官方授权拿到令牌，存成独立的加密凭据，与客户端的互不影响。'
+          + '两个区域是**两套账号体系**（额度不通用），所以要先选区域。'),
         h('p', { className: 'wb-note' },
           '凭据为 AtRest 加密信封、权限 0600，存在 dsh 目录下（不在仓库里）。'
           + '受上游令牌有效期限制，约 **30 天**需重新登录一次。'),
@@ -2444,8 +2456,29 @@ body.dark .wb-root,
         h('div', { className: 'wb-actions', style: { marginTop: '10px' } },
           phase === 'waiting'
             ? h(Btn, { onClick: cancel }, '取消登录')
-            : h(Btn, { primary: true, disabled: busy || !regions.length, onClick: begin },
-              busy ? '正在发起…' : '添加账号')),
+            : [
+              /*
+               * 区域选择：国内版 / 国际版各一套上游域，账号体系也各自独立
+               * （额度不通用）。**默认国内版** —— 国内版客户端把登录态写死在
+               * 一个文件名里（登第二个会覆盖），所以那边更需要这个按钮；
+               * 国际版多数情况靠自动纳管就够了。
+               */
+              regions.length > 1
+                ? h(Segmented, {
+                  key: 'region',
+                  value: region,
+                  onChange: (e) => setRegion(e.target.value),
+                  options: regions.map((r) => ({ value: r.id, label: r.label })),
+                  ariaLabel: '登录区域',
+                })
+                : null,
+              h(Btn, {
+                key: 'add',
+                primary: true,
+                disabled: busy || !regions.length,
+                onClick: begin,
+              }, busy ? '正在发起…' : '添加账号'),
+            ]),
 
         phase === 'waiting' ? h('div', { style: { marginTop: '8px' } },
           h(Alert, null, '请在浏览器里完成授权，完成后本页会自动更新。'),

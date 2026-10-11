@@ -9,7 +9,7 @@
  * 误判成成功/失败"的关键分支。
  */
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
@@ -45,9 +45,14 @@ let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'wb-login-')); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
-test('只支持国内版（国际版成功态未实测，不做）', () => {
-  assert.deepEqual(Object.keys(REGIONS), ['cn']);
+test('支持国内版与国际版两个区域（各自的官方域）', () => {
+  assert.deepEqual(Object.keys(REGIONS).sort(), ['cn', 'global']);
   assert.equal(REGIONS.cn.base, 'https://copilot.tencent.com');
+  assert.equal(REGIONS.global.base, 'https://www.workbuddy.ai');
+  // 区域决定上游域；账号身份从令牌里读，与区域无关
+  for (const r of Object.values(REGIONS)) {
+    assert.ok(r.label, '每个区域都要有人可读的标签（面板的区域选择器要用）');
+  }
 });
 
 test('纳管账号：目录不存在时返回空列表（不抛错）', () => {
@@ -121,9 +126,12 @@ test('移除：缺少 uid 时拒绝', () => {
 });
 
 test('登录流程：不支持的区域直接拒绝（不发起网络请求）', async () => {
-  const r = await startLogin({ dshHome: dir, region: 'global' });
+  // 注意：`global` 现在是**受支持**的区域（见 REGIONS），所以这里用一个真正
+  // 未知的值 —— 断言的是"未知区域要被挡住"，而不是"国际版不给用"。
+  const r = await startLogin({ dshHome: dir, region: 'mars' });
   assert.equal(r.ok, false);
   assert.match(r.error, /不支持的区域/);
+  assert.match(r.error, /cn/, '错误信息要列出支持的区域，方便排错');
 });
 
 test('登录流程：上游失败时如实报错，不留下半程状态', async () => {
@@ -542,4 +550,94 @@ test('archiveAllSnapshots：目录不存在时安全返回（不抛）', () => {
   const res = archiveAllSnapshots({ dshHome: dir, authDir: join(dir, 'nope') });
   assert.deepEqual(res.archived, []);
   assert.equal(res.scanned, 0);
+});
+
+// ── 国际版登录（成功态） ────────────────────────────────────────────────
+/*
+ * 国际版的**成功态响应体**没有真机实测过（只探到 pending `11217`）。所以这里用
+ * 打桩把"假如上游回了这些字段"的每条路径都跑一遍，重点是**缺字段时的容错** ——
+ * 那些分支正是真机上最可能出问题、又最难复现的地方。
+ *
+ * 依赖客户端密钥（`sealEncryptedField` 要现取），CI 上没有客户端 → 跳过。
+ */
+
+/** 造一个三段式 JWT（只有 payload 有意义），`decodeJwtSub` 读得出来。 */
+function fakeJwt(sub) {
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  return `${b64({ alg: 'RS256' })}.${b64({ sub })}.sig`;
+}
+
+test('国际版：成功态按国内版同构处理，且 domain 缺失时用区域默认域兜底', async () => {
+  const { defaultExecutableCandidates, fetchKeyFor } = await import('file:///D:/deepseek/workbuddy-to-dsh/lib/atrest.mjs');
+  const isFile = (p) => { try { return statSync(p).isFile(); } catch { return false; } };
+  const cands = defaultExecutableCandidates().filter(isFile);
+  if (!cands.length) return; // 无客户端环境：跳过（CI 上就是这样）
+
+  const original = globalThis.fetch;
+  const UID = 'intl-uid-1234';
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/auth/state')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ code: 0, data: { state: 'st-intl', authUrl: 'https://www.workbuddy.ai/login' } }),
+      };
+    }
+    // 成功态：**故意不带 domain**（国际版未实测，模拟最坏情况）
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        code: 0,
+        data: { accessToken: fakeJwt(UID), refreshToken: fakeJwt(`${UID}-r`), expiresIn: 3600, refreshExpiresIn: 7200 },
+      }),
+    };
+  };
+  try {
+    const started = await startLogin({ dshHome: dir, region: 'global' });
+    assert.equal(started.ok, true, '国际版发起登录应成功');
+    assert.match(started.authUrl, /workbuddy\.ai/, '授权链接必须指向国际版域');
+
+    const done = await pollLogin(started.id);
+    assert.equal(done.status, 'done', `应完成登录，实际 ${done.status}：${done.error || ''}`);
+    assert.equal(done.account.uid, UID);
+
+    // 落盘的文件必须能被桥读 —— domain 兜底成国际版域（否则桥会打国内网关、
+    // 国际版账号直接 401）
+    const saved = JSON.parse(readFileSync(done.account.path, 'utf8'));
+    assert.equal(saved.auth.domain, 'www.workbuddy.ai', 'domain 缺失时必须用区域默认域兜底');
+    assert.ok(saved.auth.expiresAt > Date.now(), '有效期必须落在未来');
+    assert.equal(saved.managed, true);
+    // 令牌是加密信封，不是明文
+    assert.equal(saved.auth.accessToken.$wbEncrypted, 1);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('国际版：expiresIn 缺失时不编造（expiresAt 保持 0 = 未知，而不是"立刻过期"）', async () => {
+  const { defaultExecutableCandidates, fetchKeyFor } = await import('file:///D:/deepseek/workbuddy-to-dsh/lib/atrest.mjs');
+  const isFile = (p) => { try { return statSync(p).isFile(); } catch { return false; } };
+  if (!defaultExecutableCandidates().filter(isFile).length) return; // 无客户端：跳过
+  void fetchKeyFor;
+
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/auth/state')) {
+      return { ok: true, status: 200, json: async () => ({ code: 0, data: { state: 'st-nx', authUrl: 'https://x/login' } }) };
+    }
+    // 只给 accessToken，其余字段全缺 —— 上游若换格式，这是最可能的形态
+    return { ok: true, status: 200, json: async () => ({ code: 0, data: { accessToken: fakeJwt('uid-minimal') } }) };
+  };
+  try {
+    const started = await startLogin({ dshHome: dir, region: 'global' });
+    const done = await pollLogin(started.id);
+    assert.equal(done.status, 'done', '缺字段也要能完成（不能因为上游少给就整个失败）');
+    const saved = JSON.parse(readFileSync(done.account.path, 'utf8'));
+    assert.equal(saved.auth.expiresAt, 0,
+      'expiresIn 缺失时 expiresAt 必须是 0（未知），不能是 now —— 那会让账号看起来立刻过期');
+    assert.equal(saved.auth.refreshToken, '', '没有 refreshToken 就存空串（只是不能自刷新）');
+  } finally {
+    globalThis.fetch = original;
+  }
 });
