@@ -251,6 +251,27 @@ test('自动存档：来源没变就不重写（巡检每 15 秒跑，不能反�
   assert.equal(again.changed, false, '来源 mtime 没变 → 不该重复写盘');
 });
 
+/**
+ * mtime 精度：`statSync().mtimeMs` 在 NTFS 上带小数，写进 JSON 再读回来，
+ * 与内存里的浮点数直接 `===` 可能差一个 ULP —— 那会把"没变"判成"变了"，
+ * 于是巡检每 15 秒白写一次盘（还每次都触发分组桥重读凭据）。
+ * 这条断言"存档登记的是整数毫秒"，把精度问题钉死在源头。
+ */
+test('自动存档：登记的 sourceMtime 是整数毫秒（防浮点精度导致反复写盘）', () => {
+  const clientDir = join(dir, 'client-auth');
+  const { path: src, uid } = writeClientAuth(clientDir);
+  const r = archiveSnapshot({ dshHome: dir, uid, sourcePath: src });
+  assert.equal(r.ok, true);
+  const saved = JSON.parse(readFileSync(r.path, 'utf8'));
+  assert.equal(Number.isInteger(saved.sourceMtime), true,
+    `sourceMtime 必须是整数毫秒，实际 ${saved.sourceMtime}（浮点会让"没变"判成"变了"）`);
+  // 连续三次调用都应判"没变"
+  for (let i = 0; i < 3; i += 1) {
+    assert.equal(archiveSnapshot({ dshHome: dir, uid, sourcePath: src }).changed, false,
+      `第 ${i + 2} 次调用不该重写`);
+  }
+});
+
 test('自动存档：来源更新后滚动覆盖（活跃账号跟着客户端刷新，不会 30 天过期）', async () => {
   const clientDir = join(dir, 'client-auth');
   const { path: src, uid } = writeClientAuth(clientDir, { mark: 'v1' });

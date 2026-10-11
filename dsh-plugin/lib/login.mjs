@@ -313,15 +313,17 @@ export function archiveSnapshot({ dshHome, uid, sourcePath }) {
   let srcMtime;
   try {
     raw = readFileSync(src, 'utf8');
-    srcMtime = statSync(src).mtimeMs;
+    srcMtime = Math.round(statSync(src).mtimeMs);
   } catch (error) {
     return { ok: false, reason: `读不到来源登录文件：${String(error?.message || error)}` };
   }
 
   // 已有存档且来源没更新过 → 什么都不用做（秒级巡检的常态路径）
+  // `Math.round` 在两侧都要：NTFS 的 mtimeMs 带小数，JSON 往返后与内存里的
+  // 原始浮点数比较可能差 1 个 ULP，那会让"没变"判成"变了"、每 15 秒白写一次盘。
   try {
     const existing = JSON.parse(readFileSync(dest, 'utf8'));
-    if (existing?.managed && Number(existing.sourceMtime || 0) === srcMtime) {
+    if (existing?.managed && Math.round(Number(existing.sourceMtime) || 0) === srcMtime) {
       return { ok: true, changed: false, path: dest };
     }
   } catch { /* 没有 / 坏了：下面重写 */ }
