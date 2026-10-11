@@ -203,9 +203,12 @@ test('纳管文件：权限为 0600', () => {
   const path = join(dir, 'perm.info');
   writeFileSync(path, '{}', 'utf8');
   chmodSync(path, 0o600);
-  // POSIX 上可读；Windows 上 chmod 是 no-op，断言不强制
+  // POSIX 上可读；Windows 上 chmod 是 no-op，断言不强制。
+  //
+  // 注意：`statSync` 必须走**顶部 import**，不能在这里 `require('node:fs')` ——
+  // 本文件是 ESM，`require` 未定义。本机（Windows）走不到这个分支所以看不出来，
+  // 而 CI 的 ubuntu / macos 一进 `if` 就报 `require is not defined`。
   if (process.platform !== 'win32') {
-    const { statSync } = require('node:fs');
     assert.equal(statSync(path).mode & 0o777, 0o600);
   }
   assert.ok(existsSync(path));
@@ -568,7 +571,13 @@ function fakeJwt(sub) {
 }
 
 test('国际版：成功态按国内版同构处理，且 domain 缺失时用区域默认域兜底', async () => {
-  const { defaultExecutableCandidates, fetchKeyFor } = await import('file:///D:/deepseek/workbuddy-to-dsh/lib/atrest.mjs');
+  /*
+   * 用**相对路径**引仓库的 `lib/atrest.mjs`：本文件在 `dsh-plugin/tests/` 下，
+   * `../../lib/` 就是仓库根。原先写的是绝对路径 `file:///D:/deepseek/…` ——
+   * 那是**我这台机器**的路径，CI（Linux/macOS）上直接 `Cannot find module`，
+   * 而且 `import()` 在下面的"无客户端就跳过"之前执行，连跳过都来不及。
+   */
+  const { defaultExecutableCandidates } = await import('../../lib/atrest.mjs');
   const isFile = (p) => { try { return statSync(p).isFile(); } catch { return false; } };
   const cands = defaultExecutableCandidates().filter(isFile);
   if (!cands.length) return; // 无客户端环境：跳过（CI 上就是这样）
@@ -616,10 +625,10 @@ test('国际版：成功态按国内版同构处理，且 domain 缺失时用区
 });
 
 test('国际版：expiresIn 缺失时不编造（expiresAt 保持 0 = 未知，而不是"立刻过期"）', async () => {
-  const { defaultExecutableCandidates, fetchKeyFor } = await import('file:///D:/deepseek/workbuddy-to-dsh/lib/atrest.mjs');
+  // 相对路径（同上一个用例：绝对路径在 CI 上不存在）
+  const { defaultExecutableCandidates } = await import('../../lib/atrest.mjs');
   const isFile = (p) => { try { return statSync(p).isFile(); } catch { return false; } };
   if (!defaultExecutableCandidates().filter(isFile).length) return; // 无客户端：跳过
-  void fetchKeyFor;
 
   const original = globalThis.fetch;
   globalThis.fetch = async (url) => {
