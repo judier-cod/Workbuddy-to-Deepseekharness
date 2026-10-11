@@ -548,63 +548,38 @@ try {
   writeFileSync(join(OUT_DIR, 'plugin-panel-accounts.png'), Buffer.from(shot.result.data, 'base64'));
 
   /*
-   * 「添加账号」的区域选择器必须**真的能切换**，且点按钮时带的是选中的区域。
+   * 「添加账号」**只有一个按钮，界面上没有任何区域字样**，且点下去时不带区域
+   * （由宿主按"当前客户端是哪个域"自动判断）。
    *
-   * 回归（用户实测）：截图上能看到「国内版 | 国际版」，但反馈"这个感觉没有生效" ——
-   * 光渲染出来不算数，必须验证交互链路：点「国际版」→ 点「添加账号」→
-   * 发出去的请求体里 `region` 是 `global`（而不是写死的 `cn`）。
-   *
-   * 断言分两层：
-   *   ① 点「国际版」后它变成选中态（`.on` 移过去了）；
-   *   ② POST /workbuddy/login 的 body.region === 'global'。
-   * 第 ② 层是关键 —— 只测 ① 会漏掉"UI 切了但请求写死 cn"这种 bug。
+   * 演进：切换器 + 一个按钮（用户："不要这个切换按钮了"）→ 两个按钮（用户：
+   * "两个明确的按钮也不需要"）→ 现在一个按钮。所以这里同时钉住"没有区域控件"
+   * 和"请求不带 region"两件事 —— 防止以后又有人把选择加回来。
    */
-  const regionPick = await page.cdp.evaluate(`(() => {
-    const items = [...document.querySelectorAll('.wb-segmented-item')];
-    const intl = items.find((x) => x.textContent === '国际版');
-    const cn = items.find((x) => x.textContent === '国内版');
-    if (!intl || !cn) return { found: false };
-    intl.click();
-    return { found: true, intlOn: intl.classList.contains('on'), cnOn: cn.classList.contains('on') };
+  const addBtnProbe = await page.cdp.evaluate(`(() => {
+    const btns = [...document.querySelectorAll('.wb-btn')];
+    const add = btns.find((x) => x.textContent === '添加账号');
+    const segItems = [...document.querySelectorAll('.wb-segmented-item')].map((x) => x.textContent);
+    return { hasAdd: !!add, addText: add ? add.textContent : null, segItems };
   })()`);
-  if (!regionPick.found) {
-    problems.push('账号页没有「国内版 / 国际版」区域选择器');
-  } else {
-    await sleep(300);
-    const after = await page.cdp.evaluate(`(() => {
-      const items = [...document.querySelectorAll('.wb-segmented-item')];
-      const intl = items.find((x) => x.textContent === '国际版');
-      const cn = items.find((x) => x.textContent === '国内版');
-      const ind = document.querySelector('.wb-segmented-indicator');
-      return {
-        intlOn: !!intl && intl.classList.contains('on'),
-        cnOn: !!cn && cn.classList.contains('on'),
-        indLeft: ind ? ind.style.left : null,
-        indOpacity: ind ? ind.style.opacity : null,
-        intlLeft: intl ? intl.offsetLeft + 'px' : null,
-      };
-    })()`);
-    if (!after.intlOn) problems.push('点了「国际版」但选中态没跟过去（区域选择器不生效）');
-    if (after.cnOn) problems.push('点了「国际版」但「国内版」仍是选中态（两个同时选中）');
-    /*
-     * **指示框（那圈白底）必须跟着移动。**
-     *
-     * 这是"点了没反应"最可能的形态：`.on` 类变了、逻辑上确实切过去了，但那个
-     * 白底高亮还停在「国内版」上 —— 用户看到的仍是"国内版被选中"，观感就是
-     * "这个感觉没有生效"（实测反馈原话）。只断言 `.on` 类会漏掉这种情况。
-     */
-    if (after.indLeft && after.intlLeft && after.indLeft !== after.intlLeft) {
-      problems.push(`指示框没跟着走：停在 ${after.indLeft}，应在 ${after.intlLeft}（点了国际版但高亮仍在国内版）`);
+  if (!addBtnProbe.hasAdd) problems.push('账号页找不到「添加账号」按钮');
+  if (addBtnProbe.segItems.length) {
+    problems.push(`账号页不该再有区域切换控件，但现在有：${addBtnProbe.segItems.join(' / ')}`);
+  }
+  // 按钮文字里也不该出现区域字样
+  for (const word of ['国内版', '国际版']) {
+    if (addBtnProbe.addText && addBtnProbe.addText.includes(word)) {
+      problems.push(`「添加账号」按钮文字里不该出现「${word}」（区域由宿主自动判断）`);
     }
+  }
 
-    // ② 点「添加账号」，看请求体里的 region
+  if (addBtnProbe.hasAdd) {
     const sent = await page.cdp.evaluate(`(async () => {
       const orig = window.fetch;
       let captured = null;
       window.fetch = function (url, opts) {
         if (String(url).includes('/workbuddy/login') && opts && opts.method === 'POST') {
           try { captured = JSON.parse(opts.body); } catch { captured = { parseError: true }; }
-          // 不真的打后端：返回一个"发起成功"的假响应，避免开浏览器窗口
+          // 不真的打后端：返回"发起成功"的假响应，避免开浏览器窗口
           return Promise.resolve(new Response(JSON.stringify({ ok: true, id: 'probe', authUrl: '' }), {
             status: 200, headers: { 'Content-Type': 'application/json' },
           }));
@@ -612,25 +587,19 @@ try {
         return orig.apply(this, arguments);
       };
       const btn = [...document.querySelectorAll('.wb-btn')].find((x) => x.textContent === '添加账号');
-      if (!btn) { window.fetch = orig; return { noBtn: true }; }
       btn.click();
       await new Promise((r) => setTimeout(r, 500));
       window.fetch = orig;
       return { captured };
     })()`);
-    if (sent.noBtn) problems.push('账号页找不到「添加账号」按钮');
-    else if (!sent.captured) problems.push('点了「添加账号」但没有发出 /workbuddy/login 请求');
-    else if (sent.captured.region !== 'global') {
-      problems.push(`选了「国际版」但请求里 region=${JSON.stringify(sent.captured.region)}（应当带 global，不能写死 cn）`);
+    if (!sent.captured) problems.push('点了「添加账号」但没有发出 /workbuddy/login 请求');
+    else if (sent.captured.action !== 'start') {
+      problems.push(`请求 action 不对：${JSON.stringify(sent.captured.action)}`);
+    } else if ('region' in sent.captured) {
+      problems.push(`请求不该带 region（区域由宿主自动判断），实际带了 ${JSON.stringify(sent.captured.region)}`);
     } else {
-      console.log('区域选择器：点「国际版」→ 请求 region=global ✓');
+      console.log('添加账号：单个按钮、不带 region（区域由宿主自动判断）✓');
     }
-    // 测完切回国内版，免得影响后续截图与断言
-    await page.cdp.evaluate(`(() => {
-      const cn = [...document.querySelectorAll('.wb-segmented-item')].find((x) => x.textContent === '国内版');
-      if (cn) cn.click();
-    })()`);
-    await sleep(200);
   }
 
   // 模型页的可用性筛选（全部 / 只看不可用 / 只看未测）

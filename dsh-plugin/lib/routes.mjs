@@ -86,6 +86,60 @@ export function createRouteTable(deps) {
   const guard = (req) => req.headers['x-workbuddy-panel'] === '1';
 
   /**
+   * 判断"该给哪个区域加账号" —— 看**当前客户端登录的是哪个域**。
+   *
+   * 为什么要自动判断：两个区域是两套上游域与账号体系（额度不通用），选错等于
+   * 白登一次；但"该选哪个"其实有确定答案 —— 你正在用的客户端是哪个域，就是要
+   * 补登的那个域。用户明确要求界面上不要区域选择（切换按钮不要、两个按钮也不要），
+   * 所以这个决定只能由插件做。
+   *
+   * 依据是主桥 `/health` 的 `auth.endpoint`：国内版 `https://copilot.tencent.com`、
+   * 国际版 `https://www.workbuddy.ai`。它与 `REGIONS[*].base` 同源，所以直接
+   * 按域名匹配，不硬编码字符串。
+   *
+   * 兜底顺序（每一步都可能是唯一可用信息）：
+   *   ① 主桥 auth.endpoint 的域名 → 匹配到哪个区域就用哪个；
+   *   ② 主桥登录文件的 `auth.domain`（endpoint 缺失时）；
+   *   ③ 都拿不到 → 默认 `cn`（国内版是主场景，且 `startLogin` 会校验区域合法性）。
+   *
+   * @returns {Promise<string>} 区域 id
+   */
+  async function detectRegion() {
+    const regionByHost = (host) => {
+      const h = String(host || '').trim().toLowerCase();
+      if (!h) return '';
+      for (const r of Object.values(REGIONS)) {
+        try {
+          if (new URL(r.base).host.toLowerCase() === h) return r.id;
+        } catch { /* base 不合法就跳过这个区域 */ }
+      }
+      /*
+       * 已知的等价域。上游在不同版本里用过不同的域（实测国际版出现过
+       * `workbuddy.ai` 与 `codebuddy.ai`，国内版出现过 `codebuddy.cn`），
+       * 所以按**后缀**认，而不是只认 `REGIONS[*].base` 那一个。
+       *
+       * 不在这里的域一律返回空 → 由调用方落到默认区域。**不猜**：猜错等于
+       * 让用户去错的上游登一次。
+       */
+      if (/(^|\.)workbuddy\.ai$|(^|\.)codebuddy\.ai$/.test(h)) return 'global';
+      if (/(^|\.)workbuddy\.cn$|(^|\.)codebuddy\.cn$|(^|\.)tencent\.com$/.test(h)) return 'cn';
+      return '';
+    };
+    try {
+      const probe = await supervisor.probe(AbortSignal.timeout(4000));
+      if (probe?.state === 'running') {
+        const byEndpoint = regionByHost((() => {
+          try { return new URL(probe.health?.auth?.endpoint || '').host; } catch { return ''; }
+        })());
+        if (byEndpoint) return byEndpoint;
+        const byDomain = regionByHost(probe.health?.auth?.domain);
+        if (byDomain) return byDomain;
+      }
+    } catch { /* 桥没起来 / 探测超时：走兜底 */ }
+    return 'cn';
+  }
+
+  /**
    * 账号标签解密的惰性单例（见 `/workbuddy/login` 的 GET）。
    *
    * 为什么是单例而不是每次新建：内部的密钥要**现取并常驻缓存**（取一次要拉起
@@ -677,9 +731,21 @@ export function createRouteTable(deps) {
           const body = await readJsonBody(req);
           const action = String(body?.action || '');
           if (action === 'start') {
-            const result = await startLogin({ dshHome: paths.home, region: body?.region });
+            /*
+             * 区域**自动判断**，不让界面问用户。
+             *
+             * 两个区域是两套上游域与账号体系（额度不通用），所以必须选对；但
+             * "该加哪个"其实有确定答案：**看你现在用的客户端登录的是哪个域**。
+             * 主桥 `/health` 的 `auth.endpoint` 就是它（国内版
+             * `https://copilot.tencent.com`、国际版 `https://www.workbuddy.ai`）。
+             *
+             * 界面上因此没有任何区域字样（用户明确要求：切换按钮不要、两个按钮
+             * 也不要）。显式传 `region` 仍被尊重（诊断/脚本用得上）。
+             */
+            const region = body?.region || await detectRegion();
+            const result = await startLogin({ dshHome: paths.home, region });
             if (!result.ok) return sendJson(res, 200, { ok: false, error: result.error });
-            return sendJson(res, 200, { ok: true, id: result.id, authUrl: result.authUrl });
+            return sendJson(res, 200, { ok: true, id: result.id, authUrl: result.authUrl, region });
           }
           if (action === 'poll') {
             const result = await pollLogin(String(body?.id || ''));

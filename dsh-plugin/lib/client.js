@@ -618,11 +618,8 @@ body.dark .wb-root,
       // ── 纳管账号（插件自己走 OAuth 登录） ──────────────────────────────
       '纳管账号': 'Managed accounts',
       '正在读取纳管账号…': 'Loading managed accounts…',
-      '**国际版账号会自动出现在这里**（客户端登录过就会被扫描到）。国内版则不同：客户端登录目录里的账号由**客户端**写入，登第二个国内版账号会覆盖同一个文件 —— 所以下面这个按钮用于手动补登：插件自己走官方授权拿到令牌，存成独立的加密凭据，与客户端的互不影响。两个区域是**两套账号体系**（额度不通用），所以要先选区域。':
-        '**International accounts show up here automatically** (the client\'s login directory is scanned). Domestic accounts differ: the client writes them into a single fixed file, so signing in a second one overwrites the first — the button below signs in an additional account through the official authorization flow and stores it as an independent encrypted credential that does not interfere with the client. The two regions are **separate account systems** (credits do not carry over), so pick a region first.',
-      '登录区域': 'Sign-in region',
-      '国内版': 'Domestic',
-      '国际版': 'International',
+      '**国际版账号会自动出现在这里**（客户端登录过就会被扫描到）。国内版则不同：客户端登录目录里的账号由**客户端**写入，登第二个国内版账号会覆盖同一个文件 —— 所以下面这个按钮用于手动补登：插件自己走官方授权拿到令牌，存成独立的加密凭据，与客户端的互不影响。**加哪个区域由插件自动判断**（看你现在用的客户端是哪个域），不用你选。':
+        '**International accounts show up here automatically** (the client\'s login directory is scanned). Domestic accounts differ: the client writes them into a single fixed file, so signing in a second one overwrites the first — the button below signs in an additional account through the official authorization flow and stores it as an independent encrypted credential that does not interfere with the client. **The plugin picks the region for you** (it follows whichever domain your current client uses).',
       '凭据为 AtRest 加密信封、权限 0600，存在 dsh 目录下（不在仓库里）。受上游令牌有效期限制，约 **30 天**需重新登录一次。':
         'Credentials are stored as at-rest encrypted envelopes with mode 0600 under the dsh directory (never inside the repo). Upstream token lifetime requires re-signing in roughly every **30 days**.',
       '添加账号': 'Add account',
@@ -2406,16 +2403,8 @@ body.dark .wb-root,
       const [authUrl, setAuthUrl] = useState('');
       const [message, setMessage] = useState('');
       const [removing, setRemoving] = useState('');
-      /**
-       * 登录区域（`cn` / `global`）。两个区域是**两套账号体系**：上游域不同、
-       * 额度不通用，所以必须显式选，不能靠猜。
-       * 默认国内版：客户端把它写死在一个文件名里（登第二个会覆盖），
-       * 所以那边更需要手动补登；国际版多数靠自动纳管。
-       */
-      const [region, setRegion] = useState('cn');
 
       const accounts = data?.accounts || [];
-      const regions = data?.regions || [];
 
       const post = async (body) => {
         const res = await fetch('/workbuddy/login', {
@@ -2445,11 +2434,14 @@ body.dark .wb-root,
         }, 3000);
       };
 
+      /**
+       * 发起登录。**不传区域** —— 由宿主按"当前客户端是哪个域"自动判断
+       * （见 routes.mjs 的 detectRegion）。界面因此没有任何区域字样。
+       */
       const begin = async () => {
         setBusy(true);
         setMessage('');
-        // 用**当前选中的区域**发起：国内版与国际版是两套上游域与账号体系。
-        const r = await post({ action: 'start', region });
+        const r = await post({ action: 'start' });
         setBusy(false);
         if (!r.ok) { setMessage(r.error || '发起登录失败'); return; }
         setLoginId(r.id);
@@ -2483,38 +2475,31 @@ body.dark .wb-root,
           + '国内版则不同：客户端登录目录里的账号由**客户端**写入，登第二个国内版账号会覆盖'
           + '同一个文件 —— 所以下面这个按钮用于手动补登：'
           + '插件自己走官方授权拿到令牌，存成独立的加密凭据，与客户端的互不影响。'
-          + '两个区域是**两套账号体系**（额度不通用），所以要先选区域。'),
+          + '**加哪个区域由插件自动判断**（看你现在用的客户端是哪个域），不用你选。'),
         h('p', { className: 'wb-note' },
           '凭据为 AtRest 加密信封、权限 0600，存在 dsh 目录下（不在仓库里）。'
           + '受上游令牌有效期限制，约 **30 天**需重新登录一次。'),
 
         // ── 添加账号 ────────────────────────────────────────────────────
+        /*
+         * **只有一个按钮**，区域由宿主自动判断（看你现在用的客户端是哪个域）。
+         *
+         * 演进过程：先是 `国内版 | 国际版` 切换器 + 一个按钮（用户："不要这个
+         * 切换按钮了"）→ 改成两个按钮（用户："两个明确的按钮也不需要"）→
+         * 现在一个按钮，区域对用户完全不可见。
+         *
+         * 这是合理的：**"该加哪个区域"有确定答案** —— 你正在用的客户端是哪个域，
+         * 就是要补登的那个域（见 routes.mjs 的 detectRegion）。让用户去选一个
+         * 他自己都不知道该怎么选的东西，本来就是设计失误。
+         */
         h('div', { className: 'wb-actions', style: { marginTop: '10px' } },
           phase === 'waiting'
             ? h(Btn, { onClick: cancel }, '取消登录')
-            : [
-              /*
-               * 区域选择：国内版 / 国际版各一套上游域，账号体系也各自独立
-               * （额度不通用）。**默认国内版** —— 国内版客户端把登录态写死在
-               * 一个文件名里（登第二个会覆盖），所以那边更需要这个按钮；
-               * 国际版多数情况靠自动纳管就够了。
-               */
-              regions.length > 1
-                ? h(Segmented, {
-                  key: 'region',
-                  value: region,
-                  onChange: (e) => setRegion(e.target.value),
-                  options: regions.map((r) => ({ value: r.id, label: r.label })),
-                  ariaLabel: '登录区域',
-                })
-                : null,
-              h(Btn, {
-                key: 'add',
-                primary: true,
-                disabled: busy || !regions.length,
-                onClick: begin,
-              }, busy ? '正在发起…' : '添加账号'),
-            ]),
+            : h(Btn, {
+              primary: true,
+              disabled: busy,
+              onClick: () => begin(),
+            }, busy ? '正在发起…' : '添加账号')),
 
         phase === 'waiting' ? h('div', { style: { marginTop: '8px' } },
           h(Alert, null, '请在浏览器里完成授权，完成后本页会自动更新。'),
