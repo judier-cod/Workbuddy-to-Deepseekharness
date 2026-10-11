@@ -883,6 +883,27 @@ export function apply(ctx, rawConfig = {}) {
     }
   }
 
+  /**
+   * 读一个分组的账号**域名**（`www.workbuddy.ai` / `www.workbuddy.cn`）。
+   *
+   * 域名是**明文**（不加密），所以不需要密钥，读起来没有代价。
+   * 面板靠它区分国内版/国际版 —— 缺了它那一行就没有域名可显示，
+   * 同一个列表里会"有的行有域名、有的没有"（实测）。
+   *
+   * @param {object} group
+   * @returns {string} 拿不到返回 ''
+   */
+  function resolveGroupDomain(group) {
+    try {
+      const file = group.authFile;
+      if (!file || !existsSync(file)) return '';
+      const raw = JSON.parse(readFileSync(file, 'utf8'));
+      return String(raw?.auth?.domain || '');
+    } catch {
+      return '';
+    }
+  }
+
 
   // 项目根 `.env` 补默认值：优先级 = 插件 config（显式）> .env > 进程环境变量 > 内置默认。
   // 只在用户**没有显式**在 config 里写这一项时才补，避免覆盖用户意图。
@@ -2211,6 +2232,14 @@ export function apply(ctx, rawConfig = {}) {
          * uin。用 `readAuthIdentity()` 读它自己的 authFile 拿到标签。
          */
         label: g.label || (g.authFile ? resolveGroupLabel(g) : ''),
+        /**
+         * 账号所属域名（`www.workbuddy.ai` / `www.workbuddy.cn`）。
+         *
+         * 面板靠它区分国内版/国际版 —— 缺了它，纳管分组那一行就没有域名可显示，
+         * 而同页的主账号/国际版分组却有（实测：同一个列表里前两行有域名、后两行
+         * 没有，看着像"这两行没读到账号"）。从各自 authFile 里读。
+         */
+        domain: g.domain || (g.authFile ? (resolveGroupDomain(g) || '') : ''),
         registered: g.registered,
         error: g.error,
       })),
@@ -2245,7 +2274,9 @@ export function apply(ctx, rawConfig = {}) {
         if (!file || !existsSync(file)) return null;
         const decrypt = decoderRef.value ? (v) => decoderRef.value.decrypt(v) : null;
         const id = readAuthIdentity(file, decrypt);
-        return id ? { label: id.label, uin: id.uin, labelKind: id.labelKind } : null;
+        // domain 也带上：面板每行都显示域名（区分国内版/国际版），
+        // 主账号那行缺了它就会"有的行有域名、有的没有"（实测）。
+        return id ? { label: id.label, uin: id.uin, labelKind: id.labelKind, domain: id.domain || '' } : null;
       })(),
       /**
        * 各分组的积分（多账号概览用）：每个账号一份，互不影响。

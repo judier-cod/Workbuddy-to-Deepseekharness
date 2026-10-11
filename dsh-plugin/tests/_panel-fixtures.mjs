@@ -43,14 +43,20 @@ export const FIXTURES = {
       error: '',
     },
     // 路径同样用中性值：这些截图会进仓库，真实目录不该出现在里面
-    config: { provider: 'workbuddy', configuredProvider: 'workbuddy', displayName: 'WorkBuddy', bridgeUrl: 'http://127.0.0.1:8790', consoleUrl: 'http://127.0.0.1:8792', projectRoot: 'D:\\workbuddy-to-dsh', autoStart: true, consoleAutoStart: true, logPath: 'bridge\\bridge.log' },
+    /*
+     * `displayName` 会被巡检**刷成账号标签**（模型选择器里显示的就是它），
+     * 所以夹具里直接给最终形态 —— 面板那行「模型选择器里选 X」取的就是它，
+     * 必须与选择器一致（否则用户照着面板找不到那一条）。
+     */
+    config: { provider: 'workbuddy', configuredProvider: 'workbuddy', displayName: '185****0760', bridgeUrl: 'http://127.0.0.1:8790', consoleUrl: 'http://127.0.0.1:8792', projectRoot: 'D:\\workbuddy-to-dsh', autoStart: true, consoleAutoStart: true, logPath: 'bridge\\bridge.log' },
     /** 控制台状态：这一页的主入口。 */
     console: { state: 'running', url: 'http://127.0.0.1:8792', error: '', managed: false, autoStart: true },
     /**
      * 主账号的脱敏标签（宿主读桥正在用的 authFile 解出来的）。
      * **所有**账号行都显示这种标签 —— 主账号也只有 uuid 的话，用户照样认不出。
+     * `domain` 一并给：账号页每行都显示域名（区分国内版/国际版）。
      */
-    bridgeIdentity: { label: '185****0760', uin: '330125158554', labelKind: 'phone' },
+    bridgeIdentity: { label: '185****0760', uin: '330125158554', labelKind: 'phone', domain: 'www.workbuddy.cn' },
     route: { registered: true, provider: 'workbuddy', error: '', fallback: false },
     /**
      * 账号分组：一个手写分组 + 一个**纳管分组**。
@@ -66,14 +72,16 @@ export const FIXTURES = {
      */
     accountGroups: [
       {
-        id: 'ai', provider: 'workbuddy-ai', displayName: 'WorkBuddy 国际版',
+        // displayName = 账号标签本身：巡检会把模型选择器里的组名刷成它，
+        // 面板那行「模型选择器里选 X」也取它 —— 两处必须一致。
+        id: 'ai', provider: 'workbuddy-ai', displayName: 'a3****72@gmail.com',
         port: 8791, authFile: 'workbuddy-desktop-ai.info', account: '450000000000',
         // 国际版那个账号的"昵称"字段里就是邮箱（实测），所以标签是脱敏邮箱
         uin: '450702377403', label: 'a3****72@gmail.com', domain: 'www.workbuddy.ai',
         registered: true, error: '',
       },
       {
-        id: 'm7ffbd7f5', provider: 'workbuddy-m7ffbd7f5', displayName: '纳管账号 191****1006',
+        id: 'm7ffbd7f5', provider: 'workbuddy-m7ffbd7f5', displayName: '191****1006',
         port: 8793, authFile: '7ffbd7f5-36e2-4eed-b911-8cc6a14e0d2b.info', account: '7ffbd7f5-36e2-4eed-b911-8cc6a14e0d2b',
         /*
          * 与主账号**不同**的手机号 —— 夹具必须反映真实情况（主账号是 185…、

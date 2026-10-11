@@ -291,9 +291,29 @@ try {
   if (phoneLeak.length) {
     problems.push(`账号页出现了完整手机号 ${phoneLeak.join(', ')} —— 截图会进公开仓库，必须脱敏`);
   }
-  // provider 名必须出现 —— 那是"我该在模型选择器里选什么"，本页最重要的一行
-  for (const provider of ['workbuddy-ai', 'workbuddy-m7ffbd7f5']) {
-    if (!beforeExpand.includes(provider)) problems.push(`账号页缺少 provider 名「${provider}」（用户要照它去模型选择器里选）`);
+  /*
+   * 「模型选择器里选 X」里的 X 必须是**模型选择器实际显示的那个名字**
+   * （`displayName`，已刷成账号标签），不是 provider id（路由键）。
+   *
+   * 回归（用户实测）：面板写"模型选择器里选 workbuddy-m6d2b5f6b"，而选择器里
+   * 显示的是"191****1006" —— 用户照着面板去找，**根本找不到那一条**。
+   * 两个名字现在是同一份数据，所以这里断言"标签出现在该行"，且**不出现**路由键
+   * 那种裸 id（除 title 属性外）。
+   */
+  for (const label of ['185****0760', 'a3****72@gmail.com', '191****1006']) {
+    if (!beforeExpand.includes(label)) {
+      problems.push(`账号页「模型选择器里选」缺少标签「${label}」—— 用户要照它去选择器里找`);
+    }
+  }
+  /*
+   * 每行都要有**域名**（区分国内版/国际版）。
+   * 回归：纳管分组那两行原先没有域名（宿主快照没带），同一个列表里
+   * "前两行有、后两行没有"，看着像那两行没读到账号。
+   */
+  for (const domain of ['www.workbuddy.ai', 'www.workbuddy.cn']) {
+    if (!beforeExpand.includes(domain)) {
+      problems.push(`账号页缺少域名「${domain}」—— 用户靠它区分国内版/国际版`);
+    }
   }
   /*
    * **同一账号的残留快照不许出现在「已扫描到、尚未启用」里**。

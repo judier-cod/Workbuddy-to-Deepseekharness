@@ -2523,11 +2523,13 @@ body.dark .wb-root,
            */
           uin: pluginStatus?.bridgeIdentity?.uin || '',
           label: pluginStatus?.bridgeIdentity?.label || '',
+          // 域名同理由桥的 authFile 解出来（宿主在 bridgeIdentity 里一起给了）
+          domain: pluginStatus?.bridgeIdentity?.domain || '',
           port: pluginStatus?.config?.bridgeUrl ? String(pluginStatus.config.bridgeUrl).split(':').pop() : '',
         },
         ...(pluginStatus?.accountGroups || []).map((g) => ({
           provider: g.provider, displayName: g.displayName, authFile: g.authFile, port: g.port, error: g.error,
-          account: g.account || '', uin: g.uin || '', label: g.label || '',
+          account: g.account || '', uin: g.uin || '', label: g.label || '', domain: g.domain || '',
         })),
       ];
       /**
@@ -2572,13 +2574,23 @@ body.dark .wb-root,
              */
             const ident = g.label || g.uin || snap?.account || snap?.userId || g.account || '';
             const domain = g.domain || snap?.domain || '';
+            /*
+             * 这一行必须显示**模型选择器里的那个名字**（`displayName`），
+             * 不是 provider id（`workbuddy-m6d2b5f6b` 那种路由键）。
+             *
+             * 回归（用户实测）：面板写"模型选择器里选 workbuddy-m6d2b5f6b"，
+             * 而选择器里显示的是"191****1006" —— 用户照着面板去选择器里找，
+             * **找不到那一条**。两个名字现在是同一份数据（displayName 由巡检刷成
+             * 账号标签），所以这里直接用它；provider id 放 title 里供排障对照。
+             */
+            const pickName = g.displayName || g.provider;
             return h('div', { key: g.provider, className: 'wb-account' + (g.error ? ' bad' : '') },
               h('div', { className: 'wb-account-head' },
                 h('b', { title: g.provider }, ident || g.displayName),
                 h(Pill, { tone: g.error ? 'bad' : 'ok', text: g.error ? '异常' : '使用中' })),
               h('div', { className: 'wb-pick' },
                 h('span', { className: 'wb-note', style: { margin: 0 } }, '模型选择器里选'),
-                h('code', { className: 'wb-pick-code', title: g.provider }, g.provider)),
+                h('code', { className: 'wb-pick-code', title: g.provider }, pickName)),
               h('div', { className: 'wb-note', style: { margin: '4px 0 0' } },
                 [domain, g.port ? '端口 ' + g.port : '', g.error || ''].filter(Boolean).join(' · ')));
           })),
