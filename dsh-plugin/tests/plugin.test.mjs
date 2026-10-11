@@ -341,7 +341,7 @@ test('换账号后积分/签到缓存必须作废（回归：面板把 A 账号�
   const dir = mkdtempSync(join(tmpdir(), 'wb-account-'));
   try {
     const { ctx } = fakeCtx();
-    const result = apply(ctx, { projectRoot: dir, autoStart: false, consoleAutoStart: false, migrateLegacy: false });
+    const result = apply(ctx, { projectRoot: dir, dshHome: dir, autoStart: false, consoleAutoStart: false, migrateLegacy: false });
     const { state, snapshot } = result;
 
     // 桩：probe 返回的 userId 由外部变量控制 —— **模拟真实换号**：
@@ -399,7 +399,7 @@ test('apply() 装配：注册 llm 路由、5 个工具、命令、HTTP 路由', 
   try {
     const { ctx, calls } = fakeCtx();
     // 用一个空目录当 projectRoot（桥/控制台脚本都不存在）：不自动启任何进程，只验证装配
-    const result = apply(ctx, { projectRoot: dir, autoStart: false, consoleAutoStart: false, migrateLegacy: false });
+    const result = apply(ctx, { projectRoot: dir, dshHome: dir, autoStart: false, consoleAutoStart: false, migrateLegacy: false });
     assert.equal(calls.adapters.length, 1);
     assert.deepEqual(calls.adapters[0].providers, ['workbuddy']);
     assert.equal(calls.adapters[0].adapter.providerInfo('workbuddy').name, 'WorkBuddy');
@@ -452,7 +452,7 @@ test('apply() 遇到 DUPLICATE_ADAPTER 时退回兜底 provider', async () => {
       get() { return undefined; },
       effect(fn) { return fn(); },
     };
-    const result = apply(ctx, { projectRoot: dir, autoStart: false, migrateLegacy: false, tools: false, commands: false, routes: false });
+    const result = apply(ctx, { projectRoot: dir, dshHome: dir, autoStart: false, migrateLegacy: false, tools: false, commands: false, routes: false });
     await new Promise((r) => setTimeout(r, 3200));
     assert.ok(calls.providers.includes('workbuddy-native'), '应该用兜底 provider 再注册一次');
     assert.equal(result.state.route.registered, true);
@@ -718,14 +718,14 @@ test('readProjectEnv 解析 .env，且只在 config 未显式指定时生效', (
 
     const { ctx } = fakeCtx();
     // 不显式给端口 → 跟随 .env
-    const fromEnv = apply(ctx, { projectRoot: dir, autoStart: false, tools: false, commands: false, routes: false, migrateLegacy: false });
+    const fromEnv = apply(ctx, { projectRoot: dir, dshHome: dir, autoStart: false, tools: false, commands: false, routes: false, migrateLegacy: false });
     assert.equal(fromEnv.state.config.bridgePort, 8899, '.env 里的端口必须被采纳');
     assert.equal(fromEnv.state.config.localToken, 'tok-from-env');
     assert.equal(fromEnv.supervisor.authFile, 'C:\\tmp\\custom.info');
 
     // 显式给了端口 → 以配置为准，不被 .env 覆盖
     const { ctx: ctx2 } = fakeCtx();
-    const explicit = apply(ctx2, { projectRoot: dir, bridgePort: 9911, autoStart: false, tools: false, commands: false, routes: false, migrateLegacy: false });
+    const explicit = apply(ctx2, { projectRoot: dir, dshHome: dir, bridgePort: 9911, autoStart: false, tools: false, commands: false, routes: false, migrateLegacy: false });
     assert.equal(explicit.state.config.bridgePort, 9911, '显式配置优先于 .env');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -908,7 +908,7 @@ test('apply() 的 migrateLegacy 默认会清理指向的文件（用临时目录
     writeFileSync(patch, PATCH, 'utf8');
 
     const { ctx } = fakeCtx();
-    const result = apply(ctx, { projectRoot: join(dir, 'nowhere'), autoStart: false, tools: false, commands: false, routes: false });
+    const result = apply(ctx, { projectRoot: join(dir, 'nowhere'), dshHome: dir, autoStart: false, tools: false, commands: false, routes: false });
     // 语义：`cleaned` 记录这次删了什么，`found` 是**清理之后**是否还有残留
     assert.equal(result.state.legacy.cleaned.changed, true);
     assert.equal(result.state.legacy.found, false, '清理干净之后不应再报“检测到旧路由”');
@@ -1006,6 +1006,7 @@ test('图片能力覆盖：分组 adapter 必须应用该分组自己的覆盖�
     const { ctx, calls } = fakeCtx();
     apply(ctx, {
       projectRoot: dir,
+      dshHome: dir,
       autoStart: false,
       consoleAutoStart: false,
       migrateLegacy: false,
@@ -1067,6 +1068,7 @@ test('图片能力覆盖：按 provider 分开，一组不能影响另一组', a
     const { ctx, calls } = fakeCtx();
     apply(ctx, {
       projectRoot: dir,
+      dshHome: dir,
       autoStart: false,
       consoleAutoStart: false,
       migrateLegacy: false,
@@ -1109,6 +1111,7 @@ test('图片能力覆盖：兼容旧的全局 vision 键，且分组不继承', 
     const { ctx, calls } = fakeCtx();
     apply(ctx, {
       projectRoot: dir,
+      dshHome: dir,
       autoStart: false,
       consoleAutoStart: false,
       migrateLegacy: false,
@@ -1265,6 +1268,7 @@ test('推理能力覆盖：分组 adapter 必须应用该分组自己的覆盖�
     const { ctx, calls } = fakeCtx();
     apply(ctx, {
       projectRoot: dir,
+      dshHome: dir,
       autoStart: false,
       consoleAutoStart: false,
       migrateLegacy: false,
@@ -1364,6 +1368,7 @@ test('刷新积分：强制刷新必须同时重读分组账号（回归：按�
     const { ctx } = fakeCtx();
     const result = apply(ctx, {
       projectRoot: dir,
+      dshHome: dir,
       autoStart: false,
       consoleAutoStart: false,
       migrateLegacy: false,
@@ -1510,6 +1515,7 @@ test('上下文覆盖：分组 adapter 必须拿到面板保存的上限（回�
     const { ctx, calls } = fakeCtx();
     apply(ctx, {
       projectRoot: dir,
+      dshHome: dir,
       autoStart: false,
       consoleAutoStart: false,
       migrateLegacy: false,
@@ -1539,6 +1545,64 @@ test('上下文覆盖：分组 adapter 必须拿到面板保存的上限（回�
   } finally {
     if (backup !== null) writeFileSync(prefsPath, backup, 'utf8');
     else rmSync(prefsPath, { force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * 纳管账号的端口必须避开**控制台**端口。
+ *
+ * 回归：`asAccounts()` 的自动分配是 `basePort + 已处理条数 + 1` —— 只看列表位置、
+ * 不看实际占用。手写分组占过 8791（basePort 8790 时 `+1` 正好也是 8791，靠
+ * seenPort 让开），下一个自动值就轮到 8792 —— 而那正是控制台端口。真机配置
+ * （bridgePort 8790 + accounts[ai]=8791 + consolePort 8792）复现过：纳管分组会
+ * 与控制台抢同一个端口，起桥直接失败。
+ */
+test('纳管账号分配端口：必须避开控制台端口（回归：抢 8792 起不来）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wb-managed-port-'));
+  try {
+    // 造一个纳管凭据，让 apply() 把并入逻辑跑起来
+    const adir = join(dir, 'workbuddy-accounts');
+    mkdirSync(adir, { recursive: true });
+    writeFileSync(join(adir, 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.info'), JSON.stringify({
+      account: { uin: '', nickname: '' },
+      auth: { accessToken: { $wbEncrypted: 1, envelope: 'x' }, domain: 'www.codebuddy.cn', expiresAt: Date.now() + 864e5 },
+      managed: true,
+    }), 'utf8');
+
+    const { ctx } = fakeCtx();
+    const result = apply(ctx, {
+      projectRoot: dir,
+      dshHome: dir,                 // 纳管账号从这里的 workbuddy-accounts/ 读
+      bridgePort: 8790,
+      consolePort: 8792,
+      autoStart: false,
+      consoleAutoStart: false,
+      migrateLegacy: false,
+      tools: false,
+      commands: false,
+      routes: false,
+      accounts: [{ id: 'ai', displayName: '国际版', authFile: 'C:/a/ai.info', port: 8791 }],
+      accountProviderPrefix: 'workbuddy-',
+    });
+
+    const groups = result.state.accountGroups || [];
+    assert.equal(groups.length, 2, '手写分组 + 纳管分组都应在册');
+
+    const ports = groups.map((g) => g.port);
+    assert.equal(new Set(ports).size, ports.length, `分组端口不能重复：${ports.join(', ')}`);
+    assert.ok(!ports.includes(8792),
+      `纳管分组不能占用控制台端口 8792（实际：${ports.join(', ')}）—— 会撞端口起不来`);
+    assert.ok(!ports.includes(8790), '也不能占用主桥端口');
+
+    // 手写的分组保留它声明的 8791；**自动分配的那个**才要避开已知占用
+    const manual = groups.find((g) => g.provider === 'workbuddy-ai');
+    assert.equal(manual?.port, 8791, '手写分组的端口必须原样保留');
+    const managedGroup = groups.find((g) => g.provider !== 'workbuddy-ai');
+    assert.ok(managedGroup, '纳管分组应已注册');
+    assert.ok(managedGroup.port > 8792,
+      `自动分配的端口应避开已知占用（8790 主桥 / 8791 手写分组 / 8792 控制台），实际 ${managedGroup.port}`);
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

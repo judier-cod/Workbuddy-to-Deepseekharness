@@ -600,6 +600,12 @@ export function resolveConfig(raw = {}) {
       ? String(cfg.defaultReasoningEffort)
       : undefined,
     migrateLegacy: asBool(cfg.migrateLegacy, DEFAULTS.migrateLegacy),
+    /**
+     * dsh home 覆盖。正常不设（运行时从 DSH_HOME / ~/.dsh 解析）；
+     * 只给测试用 —— 纳管账号在这个目录下，测试必须指到空目录才不会读到
+     * 运行测试那台机器上真实的账号。
+     */
+    dshHome: String(cfg.dshHome || ''),
     tools: asBool(cfg.tools, DEFAULTS.tools),
     commands: asBool(cfg.commands, DEFAULTS.commands),
     routes: asBool(cfg.routes, DEFAULTS.routes),
@@ -669,8 +675,15 @@ export function readProjectEnv(projectRoot) {
   return out;
 }
 
-/** dsh home / profile 目录（旧路由清理要用）。 */
-function resolveDshPaths() {  const home = process.env.DSH_HOME || join(homedir(), '.dsh');
+/**
+ * dsh home / profile 目录（旧路由清理与纳管账号要用）。
+ *
+ * `dshHomeOverride` 只供测试注入：测试必须指到空目录，否则会读到**运行测试的
+ * 这台机器**上的纳管账号（`~/.dsh/workbuddy-accounts/`）—— 任何已登录过纳管
+ * 账号的用户跑测试都会红，这是真实的隔离缺陷（实际发生过）。
+ */
+function resolveDshPaths(dshHomeOverride = '') {
+  const home = dshHomeOverride || process.env.DSH_HOME || join(homedir(), '.dsh');
   const profile = process.env.DSH_PROFILE || 'desktop';
   const profileDir = process.env.DSH_PROFILE_DIR || join(home, 'profiles', profile);
   return {
@@ -768,7 +781,7 @@ export function apply(ctx, rawConfig = {}) {
   const log = (...args) => { if (config.log) ctx.logger?.info?.('[workbuddy]', ...args); };
 
   const projectRoot = detectProjectRoot(config.projectRoot);
-  const dshPaths = resolveDshPaths();
+  const dshPaths = resolveDshPaths(config.dshHome);
 
   // 项目根 `.env` 补默认值：优先级 = 插件 config（显式）> .env > 进程环境变量 > 内置默认。
   // 只在用户**没有显式**在 config 里写这一项时才补，避免覆盖用户意图。
@@ -1113,18 +1126,25 @@ export function apply(ctx, rawConfig = {}) {
   // 里手写的 accounts 合并 —— 用户不必为了用纳管账号再去改配置文件。
   //
   // 合并而非替换：手写的配置是**显式意图**，纳管的是**运行时新增**，两者可以
-  // 共存。asAccounts() 会去重 id 与端口，所以重复配置不会撞车。
+  // 共存。id 由 asAccounts() 去重；端口必须**这里显式算**，不能交给 asAccounts
+  // 的自动分配 —— 那套逻辑是 `basePort + 已处理条数 + 1`，只看列表位置不看
+  // 实际占用，手写分组占过 8791、控制台占着 8792 时，纳管账号会被分到 8792
+  // 撞上控制台（真实配置复现过）。取「已知最高端口 + 1」从根上避开。
   try {
     const managed = listManagedAccounts(dshPaths.home);
     if (managed.length) {
-      config.accounts = asAccounts([
+      const consolePort = Number(config.consolePort) || 0;
+      let nextPort = Math.max(config.bridgePort, consolePort, ...config.accounts.map((a) => Number(a.port) || 0));
+      const merged = [
         ...config.accounts.map((a) => ({ id: a.id, displayName: a.displayName, authFile: a.authFile, port: a.port, token: a.token })),
         ...managed.map((a) => ({
           id: `m${a.uid.slice(0, 8)}`,
           displayName: `纳管账号 ${a.uid.slice(0, 8)}`,
           authFile: a.path,
+          port: (nextPort += 1),
         })),
-      ], config.accountProviderPrefix, config.bridgePort);
+      ];
+      config.accounts = asAccounts(merged, config.accountProviderPrefix, config.bridgePort);
       log(`并入 ${managed.length} 个纳管账号`);
     }
   } catch (error) {
