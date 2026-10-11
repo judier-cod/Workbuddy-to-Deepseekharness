@@ -472,22 +472,34 @@ test('账号巡检：没人开设置页也能发现换账号并广播（回归�
     // 注意：**不能断言"此刻广播次数为 0"** —— 插件加载时会做一次激活探测
     // （要探明主账号才能排除它），那次探测可能先于本测试的打桩落到真实桥上，
     // 于是首次观察到 A 就是一次"变化"。另外组名刷新（账号标签就绪后 replace）
-    // 也会广播。所以基线必须在**换号之前那一刻**取，而不是更早。
+    // 也会广播，而它要等取密钥（约 340ms）+ 首轮巡检。
     await waitFor(() => result.state.bridgeAccount === 'A', 2000);
-    // 给加载期的组名刷新留出窗口，避免它的广播落在换号之后被算成"换号广播"
-    await new Promise((r) => setTimeout(r, 400));
-    const baseline = calls.adaptersUpdated;
 
     // 预置一份目录，用来断言"换号后目录被作废"
     result.adapter.catalogCache = { at: Date.now(), models: [{ id: 'm-from-A' }] };
 
-    // 换账号：**不调 snapshot**，全靠巡检发现
+    /*
+     * 换账号：**不调 snapshot**，全靠巡检发现。
+     *
+     * 基线**紧贴换号那一刻**取，而不是固定等 400ms —— 组名刷新那轮广播的落地
+     * 时间取决于取密钥的快慢（本机快、CI 慢），固定等待会把它的广播夹进来，
+     * 让"换号后必须有广播"这条断言偶发失败（实测在 release:check 里偶现）。
+     */
+    const baseline = calls.adaptersUpdated;
     currentAccount = 'B';
     await waitFor(() => result.state.bridgeAccount === 'B', 3000);
 
     assert.equal(result.state.bridgeAccount, 'B', '巡检必须发现账号已变化');
     assert.equal(result.adapter.catalogCache.models.length, 0, '换号后目录必须作废（否则模型列表还是旧的）');
-    assert.ok(calls.adaptersUpdated > baseline,
+    /*
+     * 换号后广播次数必须增加。
+     *
+     * 用 `waitFor` 而不是立刻断言：广播发生在 `reconcileAccount` 里，而它与
+     * 我们观察到 `bridgeAccount === 'B'` 之间可能差一个微任务/轮询间隔 ——
+     * 立刻比对会偶发失败（实测在 release:check 里偶现过一次）。
+     */
+    const broadcasted = await waitFor(() => calls.adaptersUpdated > baseline, 2000);
+    assert.ok(broadcasted,
       `巡检发现换号后必须广播 llm/adapters-updated（换号前 ${baseline} 次 → 现在 ${calls.adaptersUpdated} 次）`);
   } finally {
     // 清理巡检定时器：不清理会在后续用例里继续探测，污染它们的断言

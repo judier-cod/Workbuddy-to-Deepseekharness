@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
 
 import {
+  archiveAllSnapshots,
   archiveSnapshot,
   cancelLogin,
   listManagedAccounts,
@@ -464,4 +465,81 @@ test('listManagedAccounts：拿不到解密函数时退回 uin（面板不能空
   assert.equal(list.length, 1);
   assert.equal(list[0].label, '330125158554', '解不开要显示 uin，不能是空');
   assert.equal(list[0].labelKind, 'uin');
+});
+
+// ── 扫描整个登录目录（国际版多账号的地基） ──────────────────────────────
+
+/**
+ * 扫描**整个客户端登录目录**把每个不同账号都存档 —— 这是"国际版也能多账号"
+ * 的关键。
+ *
+ * 回归（用户实测）：国际版客户端切账号留下的**带时间戳备份**
+ * （`workbuddy-desktop-ai.2026-10-11T13-47-47-….info`）里是**另一个账号**
+ * （`judier-cod`，uin `450702472734`）。原先只跟着主桥当前读的那个文件存档，
+ * 那个账号永远扫不到、插件完全没用上。
+ */
+
+/** 造一个"客户端登录文件"：明文 token（免密钥），三段式以便取 sub。 */
+function writePlainAuth(dir, { sub, uin, nick }) {
+  mkdirSync(dir, { recursive: true });
+  const payload = Buffer.from(JSON.stringify({ sub })).toString('base64url');
+  const token = `x.${payload}.y`;
+  const path = join(dir, `${sub}.info`);
+  writeFileSync(path, JSON.stringify({
+    account: { uin, nickname: nick },
+    auth: { accessToken: token, domain: 'www.workbuddy.ai', expiresAt: Date.now() + 864e5 },
+  }), 'utf8');
+  return path;
+}
+
+test('archiveAllSnapshots：扫整个目录，每个不同账号各存一份（含带时间戳的备份）', () => {
+  const clientDir = join(dir, 'client-auth');
+  // 当前登录的账号
+  writePlainAuth(clientDir, { sub: 'uid-aaaa-1111', uin: '450000000001', nick: 'a@x.com' });
+  // **同一账号的带时间戳备份**（客户端切账号时留下的）
+  const backupSame = join(clientDir, 'workbuddy-desktop-ai.2026-10-11T13-42-54-474Z.3500.abc.info');
+  writeFileSync(backupSame, readFileSync(join(clientDir, 'uid-aaaa-1111.info'), 'utf8'), 'utf8');
+  // **另一个账号**的备份 —— 这才是原先漏掉的那个
+  const backupOther = join(clientDir, 'workbuddy-desktop-ai.2026-10-11T13-47-47-066Z.3500.def.info');
+  const otherPayload = Buffer.from(JSON.stringify({ sub: 'uid-bbbb-2222' })).toString('base64url');
+  writeFileSync(backupOther, JSON.stringify({
+    account: { uin: '450000000002', nickname: 'judier-cod' },
+    auth: { accessToken: `x.${otherPayload}.y`, domain: 'www.workbuddy.ai', expiresAt: Date.now() + 864e5 },
+  }), 'utf8');
+
+  const res = archiveAllSnapshots({ dshHome: dir, authDir: clientDir });
+  assert.equal(res.scanned, 3, '三个 .info 都要被扫到');
+  const uids = res.archived.map((a) => a.uid).sort();
+  assert.deepEqual(uids, ['uid-aaaa-1111', 'uid-bbbb-2222'],
+    '两个不同账号各存一份；同账号的备份不产生第二份');
+
+  // 存档文件的内容要是**原样复制**
+  const saved = JSON.parse(readFileSync(join(dir, 'workbuddy-accounts', 'uid-bbbb-2222.info'), 'utf8'));
+  assert.equal(saved.managed, true, '要打纳管标记');
+  assert.equal(saved.account.uin, '450000000002');
+
+  // 幂等：来源没变时第二次不该重写
+  const again = archiveAllSnapshots({ dshHome: dir, authDir: clientDir });
+  assert.equal(again.archived.every((a) => !a.changed), true, '来源没变 → 不该重复写盘');
+});
+
+test('archiveAllSnapshots：解不开的快照跳过（不猜 uid），不影响其它', () => {
+  const clientDir = join(dir, 'client-auth');
+  writePlainAuth(clientDir, { sub: 'uid-good-1', uin: '1', nick: 'n' });
+  // 加密信封但**不给解密函数** → 拿不到 uid → 跳过（不能瞎写）
+  writeFileSync(join(clientDir, 'encrypted.info'), JSON.stringify({
+    account: { uin: '999' },
+    auth: { accessToken: { $wbEncrypted: 1, envelope: 'x' }, expiresAt: Date.now() + 864e5 },
+  }), 'utf8');
+
+  const res = archiveAllSnapshots({ dshHome: dir, authDir: clientDir }); // 不传 decrypt
+  assert.equal(res.scanned, 2);
+  assert.deepEqual(res.archived.map((a) => a.uid), ['uid-good-1'], '明文那个要存下来');
+  assert.equal(res.failed, 1, '解不开的那个要如实计入 failed（不静默）');
+});
+
+test('archiveAllSnapshots：目录不存在时安全返回（不抛）', () => {
+  const res = archiveAllSnapshots({ dshHome: dir, authDir: join(dir, 'nope') });
+  assert.deepEqual(res.archived, []);
+  assert.equal(res.scanned, 0);
 });

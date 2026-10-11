@@ -36,7 +36,7 @@ import { WorkBuddyAdapter } from './adapter.mjs';
 import { toDirectory, pickDefaultModel } from './models.mjs';
 import { createTools } from './tools.mjs';
 import { createRouteTable, mountRoutes } from './routes.mjs';
-import { archiveSnapshot, createIdentityDecoder, listManagedAccounts, readAuthIdentity } from './login.mjs';
+import { archiveAllSnapshots, createIdentityDecoder, listManagedAccounts, readAuthIdentity } from './login.mjs';
 import { cleanLegacyRoutes, detectLegacyRoutes } from './legacy.mjs';
 
 export const name = 'workbuddy';
@@ -2412,27 +2412,38 @@ export function apply(ctx, rawConfig = {}) {
           const main = reconcileAccount(probe);
 
           /**
-           * 把客户端当前账号**存档**成纳管凭据。
+           * 把客户端登录目录里**所有**账号都存档成纳管凭据。
            *
-           * 这是"切账号后旧账号还在"的唯一实现方式：客户端切账号会**覆盖**
-           * `workbuddy-desktop.info`，切走的账号在磁盘上就没了（实测确认过）。
-           * 所以必须在切换**发生之前**持续存档 —— 巡检每 15 秒读一次快照，顺手
-           * 存一份即可，用户什么都不用做，也不需要 OAuth。
+           * 为什么扫**整个目录**而不是只看主桥当前读的那个文件：
+           * 客户端切账号会覆盖当前文件，但会留下**带时间戳的备份**
+           * （实测 `workbuddy-desktop-ai.2026-10-11T13-47-47-….info`）。
+           * 只看主桥的话那些备份永远扫不到 —— 实测国际版的第二个账号
+           * （`judier-cod`，uin `450702472734`）就躺在备份里，插件完全没用上。
            *
-           * 滚动更新：源文件没变就不重写，因此**当前活跃的账号**会跟着客户端一起
-           * 刷新（不会 30 天过期）；只有不再活跃的账号才会自然过期。
+           * 扫目录同时覆盖国内版与国际版：两边备份命名规则一样，同一份代码都管。
+           * 只读来源、只写纳管目录；不删不改客户端任何文件。
+           *
+           * 位置取**主桥 authFile 的所在目录** —— 那正是客户端登录目录，且天然
+           * 跟随用户的实际安装（不需要插件自己拼 %LOCALAPPDATA% 路径）。
            */
-          if (probe.state === 'running') {
-            const uid = bridgeAccountOf(probe);
-            const src = probe.health?.authFile;
-            if (uid && src) {
-              const archived = archiveSnapshot({ dshHome: dshPaths.home, uid, sourcePath: src });
-              if (archived.ok && archived.changed) {
-                log(`已存档账号 ${uid.slice(0, 8)}…（来源 ${String(src).split(/[\\/]/).pop()}）`);
-              } else if (!archived.ok) {
-                log(`存档账号失败（忽略）：${archived.reason}`);
-              }
+          if (probe.state === 'running' && probe.health?.authFile) {
+            /*
+             * **先等密钥就绪**：存档要解密 accessToken 才能知道"这个文件是谁"，
+             * 拿不到密钥就一个都存不了（实测：首轮没等，5/5 全部跳过）。
+             * 密钥预热在插件加载时已经启动，这里通常只是等它落地。
+             */
+            await waitIdentityReady();
+            const authDir = dirname(probe.health.authFile);
+            const decoder = decoderRef.value;
+            const res = archiveAllSnapshots({
+              dshHome: dshPaths.home,
+              authDir,
+              decrypt: decoder ? (v) => decoder.decrypt(v) : null,
+            });
+            for (const a of res.archived) {
+              if (a.changed) log(`已存档账号 ${a.uid.slice(0, 8)}…`);
             }
+            if (res.failed) log(`存档时跳过 ${res.failed}/${res.scanned} 个快照（解不开或不是登录文件）`);
           }
 
           const groups = await reconcileGroupAccounts();

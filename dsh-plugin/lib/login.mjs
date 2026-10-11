@@ -360,6 +360,85 @@ async function persist(dir, data) {
  * @param {string} options.sourcePath 客户端登录文件路径（桥 /health 的 authFile）
  * @returns {{ok: boolean, changed?: boolean, path?: string, reason?: string}}
  */
+/**
+ * 扫描**整个客户端登录目录**，把每个不同账号都存档一份。
+ *
+ * 这是"国际版也能多账号"的关键。原先只跟着**主桥**走
+ * （`archiveSnapshot({ sourcePath: probe.health.authFile })`），而主桥只读客户端
+ * **当前**登录的那个文件 —— 于是：
+ *
+ *   - 客户端切账号留下的**带时间戳备份**（如
+ *     `workbuddy-desktop-ai.2026-10-11T13-47-47-….info`）永远扫不到；
+ *   - 国际版那个第二账号（实测 `judier-cod`，uin `450702472734`）就躺在备份里，
+ *     插件完全没用上。
+ *
+ * 所以改成扫目录：**每个 `.info` 都认一下是谁**（解密出 uid），不同 uid 各存一份。
+ * 与平台无关 —— 国内版 / 国际版的备份命名规则一样，同一份代码都覆盖。
+ *
+ * 安全边界：
+ *   - 只读来源、只写纳管目录；**不删不改**客户端任何文件；
+ *   - 来源就在纳管目录里时跳过（别自己复制自己）；
+ *   - 单个文件坏了不影响其它（逐个 try）。
+ *
+ * @param {object} options
+ * @param {string} options.dshHome
+ * @param {string} options.authDir 客户端登录目录
+ * @param {(value: unknown) => string|null} [options.decrypt] 信封解密（见 createIdentityDecoder）；
+ *   给出它才能解开加密的 accessToken 拿到 uid。拿不到就跳过该文件（不猜）。
+ * @param {(token: string) => string} [options.decodeUid] 从 accessToken 取 uid
+ * @returns {{archived: Array<{uid: string, path: string, changed: boolean}>, scanned: number, failed: number}}
+ */
+export function archiveAllSnapshots({ dshHome, authDir, decrypt = null, decodeUid = decodeJwtSub }) {
+  const out = { archived: [], scanned: 0, failed: 0 };
+  let names = [];
+  try {
+    names = readdirSync(authDir).filter((f) => f.endsWith('.info'));
+  } catch {
+    return out; // 目录不存在：没有可存档的
+  }
+  /*
+   * **当前的登录文件优先于备份**：备份名里有时间戳（`….2026-10-11T13-47-47-….info`），
+   * 长度明显更长。按"短名在前"排序，同一账号取到的就是令牌最新那份。
+   */
+  names.sort((a, b) => a.length - b.length || a.localeCompare(b));
+  const managedDir = accountDir(dshHome);
+  /** 已处理过的 uid：同一账号的多个快照（当前 + 备份）只记一次。 */
+  const seen = new Set();
+  for (const name of names) {
+    const src = join(authDir, name);
+    out.scanned += 1;
+    try {
+      // 来源即存档（纳管目录自己的文件）：跳过
+      if (resolve(src) === resolve(join(managedDir, name))) continue;
+      const raw = JSON.parse(readFileSync(src, 'utf8'));
+      const field = raw?.auth?.accessToken;
+      if (!field) { out.failed += 1; continue; }
+      // 取 uid 要解密令牌。解不开就跳过 —— **不猜**：猜错会把存档写到别人的 uid 下。
+      let token = '';
+      if (typeof field === 'string') token = field;
+      else if (decrypt) {
+        try { token = decrypt(field) || ''; } catch { token = ''; }
+      }
+      const uid = token ? decodeUid(token) : '';
+      if (!uid) { out.failed += 1; continue; }
+      /*
+       * 同一账号可能有**多个快照**（当前登录的那个 + 若干带时间戳的备份）。
+       * 它们都指向同一个存档文件，所以只处理一次即可 —— 否则 `archived` 里会
+       * 出现重复条目，让"存了几个账号"这个数字撒谎（测试抓到过）。
+       * 取**当前**那个（无时间戳的短名）优先：它的令牌最新。
+       */
+      if (seen.has(uid)) continue;
+      seen.add(uid);
+      const r = archiveSnapshot({ dshHome, uid, sourcePath: src });
+      if (r.ok) out.archived.push({ uid, path: r.path, changed: !!r.changed });
+      else out.failed += 1;
+    } catch {
+      out.failed += 1; // 单个文件坏了不影响其它
+    }
+  }
+  return out;
+}
+
 export function archiveSnapshot({ dshHome, uid, sourcePath }) {
   const id = String(uid || '').replace(/[^A-Za-z0-9_-]+/g, '');
   if (!id) return { ok: false, reason: '缺少账号标识' };
