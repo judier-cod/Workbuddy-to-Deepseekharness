@@ -817,18 +817,31 @@ export function apply(ctx, rawConfig = {}) {
   });
 
   /**
-   * 预热账号标签的密钥（**按需**，不是无条件）。
+   * 预热账号标签的密钥（**后台启动一次**，不阻塞任何东西）。
    *
-   * 取密钥要拉起一次客户端二进制（约 340ms），所以只在"真有纳管账号要看标签"时
-   * 才预热 —— 没有纳管账号的机器（例如只用客户端快照的用户）不该为此多跑一个进程。
-   * 幂等：内部自己缓存，重复调用没有额外代价。
+   * 为什么要在加载时就开始：标签是 AtRest 加密的，取密钥要拉起一次客户端二进制
+   * （约 340ms）。而首轮巡检紧接着就会跑 —— 它要拿标签去刷新模型选择器里的组名。
+   * 等巡检时再预热就已经晚了：那一轮 `decrypt` 还是 null，名字会被刷成 uin
+   * （比配置名更难认），而且要等 15 秒后的下一轮才纠正（实测踩过）。
+   *
+   * 为什么可以无条件：这只是**后台**预热，不阻塞加载、失败也静默（拿不到密钥时
+   * 标签退回 uin，功能照常）。代价是启动时多跑一个客户端进程约 340ms ——
+   * 相对于"组名要等 15 秒才正确"，这个代价是值得的。
    */
-  async function warmupIdentityIfNeeded() {
+  const identityReady = identityDecoder
+    .then((d) => d.warmup())
+    .catch(() => undefined);
+
+  /**
+   * 等标签密钥就绪（巡检在用标签之前调用）。
+   *
+   * 有超时兜底：客户端缺失/取密钥卡住时不能把巡检拖死 —— 超时就当"拿不到标签"，
+   * 组名保持现状（比刷成 uin 好）。
+   */
+  async function waitIdentityReady(timeoutMs = 8000) {
     try {
-      if (!listManagedAccounts(dshPaths.home).length) return;
-      const d = await identityDecoder;
-      await d.warmup();
-    } catch { /* 预热失败不影响任何功能：标签退回 uin */ }
+      await Promise.race([identityReady, new Promise((r) => setTimeout(r, timeoutMs))]);
+    } catch { /* 预热失败：标签退回 uin，不影响功能 */ }
   }
 
   /**
@@ -1698,8 +1711,22 @@ export function apply(ctx, rawConfig = {}) {
     const mainAuthFile = probe?.health?.authFile;
     if (mainAuthFile) {
       const ident = readAuthIdentity(mainAuthFile, decryptOf());
-      if (ident?.label && ident.label !== adapter.displayName) {
+      /*
+       * **只在拿到"更好的标识"时才改名** —— 即 label 不是 uin。
+       *
+       * 密钥没就绪时 `readAuthIdentity` 会退回 uin 当 label；若那时就改名，组名会
+       * 变成 `330125158554` 这种纯数字，然后**卡在那儿**（实测：首轮巡检跑得太早，
+       * 三个路由全被改成了 uin）。宁可保持配置里的名字，等标签真解出来再改。
+       */
+      const better = ident?.label && ident.label !== ident.uin;
+      if (better && ident.label !== adapter.displayName) {
         adapter.displayName = ident.label;
+        /*
+         * `config.displayName` 也要同步：面板用 `config.displayName` 当主账号那行
+         * 的标题兜底（见 client.js 的 groups[0].displayName）。只改 adapter 的话，
+         * 模型选择器变了、面板还显示旧名，两处对不上。
+         */
+        config.displayName = ident.label;
         try {
           if (typeof adapterHandle === 'function') adapterHandle.replace([state.route.provider]);
           renamed += 1;
@@ -1711,13 +1738,28 @@ export function apply(ctx, rawConfig = {}) {
 
     // ── 2 & 3. 各分组 ────────────────────────────────────────────────
     for (const group of accountGroups) {
-      // 纳管分组：标签在激活时已解析好（那一轮密钥可能还没就绪，这里会重试）
-      let label = group.label || '';
-      // 手写分组：读它自己的 authFile（按 mtime 缓存，见 resolveGroupLabel）
-      if (!label && group.authFile) label = resolveGroupLabel(group);
-      if (!label && group.uin) label = group.uin;
+      /*
+       * 只在拿到"更好的标识"时才改名 —— label 必须与**该账号的 uin 不同**
+       * （即真是手机号/邮箱）。
+       *
+       * 与主账号同一个坑：密钥没就绪时 `readAuthIdentity` 会退回 uin，若那时改名，
+       * 组名会变成纯数字并卡住（实测：首轮巡检跑太早，三个路由全被改成 uin）。
+       *
+       * uin 的取值要**先从文件里读一遍**：`group.uin` 可能还是空的（首轮激活在
+       * 密钥未就绪时不会填它），拿空值去比对会让"uin === uin"判定失效 ——
+       * 这个漏洞被测试抓到过。
+       */
+      if (!group.uin && group.authFile) {
+        const ident = readAuthIdentity(group.authFile, null);
+        if (ident?.uin) group.uin = ident.uin;
+      }
+      let label = (group.label && group.label !== group.uin) ? group.label : '';
+      if (!label && group.authFile) {
+        const resolved = resolveGroupLabel(group);
+        if (resolved && resolved !== group.uin) label = resolved;
+      }
       if (!label) continue;
-      group.label = group.label || label;
+      if (!group.label || group.label === group.uin) group.label = label;
       if (renameGroup(group, label)) renamed += 1;
     }
     return renamed;
@@ -1783,7 +1825,7 @@ export function apply(ctx, rawConfig = {}) {
       // 标签要解密（手机号/邮箱在文件里是加密信封）。这里按需预热密钥
       // （仅在真有纳管账号时才会拉起客户端）；密钥若仍未就绪，decrypt 返回 null
       // → 标签退化成 uin，下一轮巡检补上。
-      await warmupIdentityIfNeeded();
+      await waitIdentityReady();
       const decoder = await identityDecoder;
       managed = listManagedAccounts(dshPaths.home, { decrypt: decoder.decrypt });
     } catch (error) {
@@ -2360,7 +2402,7 @@ export function apply(ctx, rawConfig = {}) {
    */
   if (config.accountWatchMs > 0) {
     let running = false;
-    const timer = setInterval(() => {
+    const tick = () => {
       // 上一轮还没跑完就跳过这一轮：桥卡住时不让巡检请求堆积
       if (running) return;
       running = true;
@@ -2397,7 +2439,12 @@ export function apply(ctx, rawConfig = {}) {
           // 存档之后再看有没有"还没成为分组"的账号 —— 换账号后旧账号会在这里
           // 自动变成独立分组，**不需要重启 dsh**。
           const activated = await activateManagedGroups();
-          // 所有分组的组名统一刷成账号标签（手写分组在这里才第一次拿到标签）
+          /*
+           * 统一刷新展示名（模型选择器里那几组的标题）。
+           * 先等密钥就绪：标签是加密的，密钥没好就只能退回 uin，
+           * 而"退回到 uin"会把好端端的配置名刷成一串纯数字。
+           */
+          await waitIdentityReady();
           const renamedGroups = syncGroupNames(probe);
           if (main.changed || groups || activated || renamedGroups) {
             notifyAdaptersUpdated();
@@ -2409,11 +2456,21 @@ export function apply(ctx, rawConfig = {}) {
           running = false;
         }
       })();
-    }, config.accountWatchMs);
+    };
+    /*
+     * **立刻跑一轮**，不等第一个间隔。
+     *
+     * 为什么：分组名/主账号名要等拿到账号标签（异步解密密钥）才能定下来，而
+     * 注册时只能先用配置里的名字。如果等 15 秒才第一次巡检，用户在这段时间里
+     * 看到的就是"名字没变"（实测反馈"我没有看到改变"）。先跑一轮，标签就绪时
+     * 名字会在启动后一两秒内自动刷新。
+     */
+    tick();
+    const timer = setInterval(tick, config.accountWatchMs);
     // 不要因为这个定时器把进程钉住（dsh 退出时不应被它拖住）
     timer.unref?.();
     ctx.effect(() => () => clearInterval(timer), 'workbuddy.account-watch');
-    log(`账号巡检已启用：每 ${config.accountWatchMs} ms 一次`);
+    log(`账号巡检已启用：每 ${config.accountWatchMs} ms 一次（首轮已立即执行）`);
   }
 
   log(`插件已加载：projectRoot=${projectRoot || '(未找到)'} bridge=${supervisor.baseUrl} console=${consoleSupervisor.url} provider=${state.route.provider}`);

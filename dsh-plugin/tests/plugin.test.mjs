@@ -471,8 +471,11 @@ test('账号巡检：没人开设置页也能发现换账号并广播（回归�
     // 先让巡检看到账号 A。
     // 注意：**不能断言"此刻广播次数为 0"** —— 插件加载时会做一次激活探测
     // （要探明主账号才能排除它），那次探测可能先于本测试的打桩落到真实桥上，
-    // 于是首次观察到 A 就是一次"变化"。所以基线要在 A 稳定之后再取。
+    // 于是首次观察到 A 就是一次"变化"。另外组名刷新（账号标签就绪后 replace）
+    // 也会广播。所以基线必须在**换号之前那一刻**取，而不是更早。
     await waitFor(() => result.state.bridgeAccount === 'A', 2000);
+    // 给加载期的组名刷新留出窗口，避免它的广播落在换号之后被算成"换号广播"
+    await new Promise((r) => setTimeout(r, 400));
     const baseline = calls.adaptersUpdated;
 
     // 预置一份目录，用来断言"换号后目录被作废"
@@ -485,7 +488,7 @@ test('账号巡检：没人开设置页也能发现换账号并广播（回归�
     assert.equal(result.state.bridgeAccount, 'B', '巡检必须发现账号已变化');
     assert.equal(result.adapter.catalogCache.models.length, 0, '换号后目录必须作废（否则模型列表还是旧的）');
     assert.ok(calls.adaptersUpdated > baseline,
-      `巡检发现换号后必须广播 llm/adapters-updated（实际 ${calls.adaptersUpdated} 次）`);
+      `巡检发现换号后必须广播 llm/adapters-updated（换号前 ${baseline} 次 → 现在 ${calls.adaptersUpdated} 次）`);
   } finally {
     // 清理巡检定时器：不清理会在后续用例里继续探测，污染它们的断言
     for (const d of calls.disposers) { try { d?.(); } catch { /* 忽略 */ } }
@@ -1777,6 +1780,51 @@ test('纳管账号分配端口：必须避开控制台端口（回归：抢 8792
     assert.ok(managedGroup, '纳管分组应已注册');
     assert.ok(managedGroup.port > 8792,
       `自动分配的端口应避开已知占用（8790 主桥 / 8791 手写分组 / 8792 控制台），实际 ${managedGroup.port}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * **密钥没就绪时不许把组名刷成 uin。**
+ *
+ * 回归（真机实测）：首轮巡检跑得比取密钥快 —— 那时 `readAuthIdentity` 会退回
+ * `uin` 当 label。原先的判断是 `label !== displayName` 就改名，于是三个路由的
+ * 名字全被刷成了 `330125158554` 这种纯数字，然后**卡在那儿**（下一轮虽然会
+ * 纠正，但要等 15 秒，用户看到的先是"名字变得更难认了"）。
+ *
+ * 判据：label 必须**不等于 uin**（即真解出了手机号/邮箱）才允许改名。
+ */
+test('密钥未就绪时不许把组名刷成 uin（回归：首轮巡检把名字刷成纯数字）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wb-noearly-'));
+  try {
+    // authFile 里的 phoneNumber 是**加密信封**，而测试环境取不到密钥 ——
+    // 正好复现"密钥未就绪"这一态。
+    const authPath = join(dir, 'enc.info');
+    writeFileSync(authPath, JSON.stringify({
+      account: { uin: '330125158554', phoneNumber: { $wbEncrypted: 1, envelope: 'x' } },
+      auth: { domain: 'www.workbuddy.cn', expiresAt: Date.now() + 864e5 },
+    }), 'utf8');
+
+    const { ctx } = fakeCtx();
+    const result = apply(ctx, {
+      projectRoot: dir, dshHome: dir, accountWatchMs: 0,
+      autoStart: false, consoleAutoStart: false, migrateLegacy: false,
+      tools: false, commands: false, routes: false,
+      accounts: [{ id: 'enc', displayName: '我的账号', authFile: authPath, port: 8791 }],
+      accountProviderPrefix: 'workbuddy-',
+    });
+
+    const probe = { state: 'running', health: { authFile: authPath, auth: { userId: 'u1' } } };
+    result.syncGroupNames(probe);
+
+    const group = result.state.accountGroups.find((g) => g.provider === 'workbuddy-enc');
+    assert.equal(group.displayName, '我的账号',
+      '拿不到密钥时必须保持配置里的名字，不能刷成 uin（那比配置名更难认）');
+    assert.notEqual(group.displayName, '330125158554', '尤其不能是一串纯数字 uin');
+    // 主账号同理：它的 authFile 也是加密的，且没有可读的明文 uin → 不该改
+    assert.equal(result.adapter.displayName, 'WorkBuddy',
+      '主账号拿不到标签时也必须保持原名');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
