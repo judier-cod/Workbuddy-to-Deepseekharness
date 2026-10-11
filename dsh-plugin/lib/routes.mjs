@@ -58,6 +58,30 @@ export function createRouteTable(deps) {
    */
   const accountGroups = Array.isArray(deps.accountGroups) ? deps.accountGroups : [];
 
+  /**
+   * `acct`（账本里的账号标签 = provider 名）→ 账号标签（脱敏手机号/邮箱）。
+   *
+   * 账本每行记的是**桥的 provider 名**（`workbuddy` / `workbuddy-ai` …），
+   * 那是路由键、不是账号 —— 用户看到"账号"列写着 `workbuddy` 完全认不出是哪个
+   * 账号（实测反馈"这 2 个页面的名字没有改"）。
+   *
+   * 这里给出对照表，让「用量」「最近请求」两个页面能把 provider 名显示成账号标签。
+   * 只含展示信息，不含任何凭据。
+   *
+   * 查不到的 acct（历史记录里已撤销的分组、`unknown`、早期的手工标签）**如实
+   * 保留原值** —— 面板会标成"历史"，不假装它是当前某个账号。
+   */
+  const accountLabels = () => {
+    // 主账号标签走**函数**取：它在巡检里被刷成账号标签（加载时还是配置里的名字），
+    // 传值会在加载那一刻被快照住，永远是旧名。
+    const primary = typeof deps.primaryLabel === 'function' ? deps.primaryLabel() : (deps.primaryLabel || '');
+    const out = { [provider]: primary || '' };
+    for (const g of accountGroups) {
+      if (g.provider && g.label) out[g.provider] = g.label;
+    }
+    return out;
+  };
+
   /** 写操作的准入检查。 */
   const guard = (req) => req.headers['x-workbuddy-panel'] === '1';
 
@@ -427,7 +451,9 @@ export function createRouteTable(deps) {
           const url = new URL(req.url, 'http://127.0.0.1');
           const days = Math.min(Math.max(Number(url.searchParams.get('days')) || 7, 1), 90);
           const hours = url.searchParams.get('hours') === '1';
-          sendJson(res, 200, { ok: true, ...(await client.usage({ days, hours })) });
+          // 带上 acct → 账号标签的对照表：账本里记的是 provider 名（路由键），
+          // 面板要显示成账号标签才认得出（见 accountLabels 的说明）。
+          sendJson(res, 200, { ok: true, accountLabels: accountLabels(), ...(await client.usage({ days, hours })) });
         } catch (error) {
           sendJson(res, 200, { ok: false, error: String(error?.message || error) });
         }
@@ -441,7 +467,8 @@ export function createRouteTable(deps) {
         try {
           const url = new URL(req.url, 'http://127.0.0.1');
           const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 50, 1), 500);
-          sendJson(res, 200, { ok: true, ...(await client.requests({ limit })) });
+          // 同 /workbuddy/usage：给出 acct → 账号标签的对照表
+          sendJson(res, 200, { ok: true, accountLabels: accountLabels(), ...(await client.requests({ limit })) });
         } catch (error) {
           sendJson(res, 200, { ok: false, error: String(error?.message || error) });
         }

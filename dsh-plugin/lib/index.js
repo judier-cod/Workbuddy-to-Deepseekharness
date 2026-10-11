@@ -2433,6 +2433,11 @@ export function apply(ctx, rawConfig = {}) {
         adapter,
         // 供 restart 连分组桥一起重启（桥 detached，重启 dsh 不会换代码）
         accountGroups,
+        // 主账号的账号标签 —— 传**函数**而不是值：它在巡检里被刷成账号标签
+        // （加载那一刻还是配置里的名字，传值会永远停在旧名）。
+        // 路由层用它建 acct → 标签对照表：账本里记的是 provider 名（路由键），
+        // 面板「用量」「最近请求」要显示成账号标签才认得出。
+        primaryLabel: () => adapter.displayName,
         paths: dshPaths,
         provider: config.provider,
         resolveProvider,

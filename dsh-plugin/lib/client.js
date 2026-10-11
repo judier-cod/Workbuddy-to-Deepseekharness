@@ -555,6 +555,13 @@ body.dark .wb-root,
       '未标注': 'Unlabeled',
       '未标注账号（旧记录）': 'Unlabeled (legacy records)',
       '未标注（本次改动前的旧记录）': 'Unlabeled (records from before this change)',
+      /*
+       * 账本里的账号列：`acct` 是**桥的 provider 名**（路由键），要显示成账号标签。
+       * 查不到对照的是**历史账号**（已撤销的分组、早期手工标签）—— 如实标注，
+       * 不假装它是当前某个账号。
+       */
+      '（历史账号）': ' (legacy account)',
+      '未标注账号': 'Unlabeled account',
       // '默认' 已在上方（低/中/高 那组）有条目，这里不要重复 —— ESLint no-dupe-keys 会拦
       '默认（未下发）': 'Default (not sent)',
       '本次请求下发给上游的 reasoning_effort（选择器里选的「推理等级」）':
@@ -2642,6 +2649,12 @@ body.dark .wb-root,
       // 早期版本套了一层 {usage:{…}}。两种都认，免得版本错配时表格空白。
       // 首帧：数据还没到时给加载态，别先渲染一屏 0 / 空表
       const usage = data && data.usage ? data.usage : data;
+      /**
+       * `acct` → 账号标签（宿主在同一响应里给的对照表）。
+       * 账本记的是 provider 名（`workbuddy` 这类路由键），直接显示用户认不出
+       * 是哪个账号 —— 见「最近请求」页里同一处说明。
+       */
+      const usageLabels = data?.accountLabels || {};
       const total = usage?.total || {};
       const series = hours ? (usage?.hours || []) : (usage?.days || []);
       const points = series.map((d) => ({
@@ -2735,9 +2748,13 @@ body.dark .wb-root,
                   h('th', { className: 'num' }, 'tokens'),
                   h('th', { className: 'num' }, '积分'))),
                 h('tbody', null, (usage.accounts || []).map((a) => h('tr', { key: a.account },
-                  h('td', null, a.account === 'unknown'
-                    ? h('span', { className: 'wb-note', style: { margin: 0 } }, '未标注账号（本次改动前的旧记录）')
-                    : a.account),
+                  h('td', { title: a.account },
+                    a.account === 'unknown'
+                      ? h('span', { className: 'wb-note', style: { margin: 0 } }, '未标注账号（旧记录）')
+                      // 有对照表就用账号标签（手机号/邮箱）；历史 acct 如实标注
+                      : (usageLabels[a.account]
+                        ? usageLabels[a.account]
+                        : h('span', null, a.account, h('span', { className: 'wb-note', style: { margin: '0 0 0 6px' } }, '（历史账号）')))),
                   h('td', { className: 'num' }, fmtInt(a.calls)),
                   h('td', { className: 'num' }, fmtInt(a.failed || 0)),
                   h('td', { className: 'num' }, fmtTokens((a.promptTokens || 0) + (a.completionTokens || 0))),
@@ -2858,6 +2875,18 @@ body.dark .wb-root,
       // 否则换了模型之后旧模型就从下拉里消失了（筛选等于做不了）。
       const { data: directory } = useJson('/workbuddy/models', { interval: 300000 });
       const all = data?.requests || [];
+      /**
+       * `acct` → 账号标签。宿主在同一个响应里给了对照表（`accountLabels`）。
+       *
+       * 为什么需要：账本每行记的是**桥的 provider 名**（`workbuddy` /
+       * `workbuddy-ai`），那是路由键、不是账号 —— 「账号」列写着 `workbuddy`
+       * 用户完全认不出是哪个账号（实测反馈"这 2 个页面的名字没有改"）。
+       *
+       * 查不到的历史 acct（已撤销的分组、`unknown`、早期手工标签）**如实保留
+       * 原值**，并在界面上标成"历史" —— 不假装它是当前某个账号。
+       */
+      const labels = data?.accountLabels || {};
+      const acctLabel = (acct) => labels[acct] || acct || 'unknown';
       const models = useMemo(() => {
         const fromDirectory = (directory?.models || []).map((m) => m.id);
         const seen = new Set(fromDirectory);
@@ -2896,7 +2925,13 @@ body.dark .wb-root,
                 onChange: (e) => setAcctFilter(e.target.value),
                 options: [
                   { value: '', label: `全部账号（${accounts.length}）` },
-                  ...accounts.map((a) => ({ value: a, label: a === 'unknown' ? '未标注账号（旧记录）' : a })),
+                  // 显示**账号标签**（手机号/邮箱），不是 provider 名 —— 用户认不出
+                  // `workbuddy-m6d2b5f6b` 是哪个账号。查不到的历史 acct 如实标注。
+                  ...accounts.map((a) => ({
+                    value: a,
+                    label: a === 'unknown' ? '未标注账号（旧记录）'
+                      : (labels[a] ? `${labels[a]}（${a}）` : `${a}（历史账号）`),
+                  })),
                 ],
               })
               : null,
@@ -2934,7 +2969,7 @@ body.dark .wb-root,
               h('td', { title: r.acct || 'unknown' },
                 (!r.acct || r.acct === 'unknown')
                   ? h('span', { className: 'wb-note', style: { margin: 0 } }, '未标注')
-                  : r.acct),
+                  : acctLabel(r.acct)),
               h('td', null, r.model),
               // 思考档位：空串 = 本次没下发 reasoning_effort（交给上游默认）。
               // 与"显式选了 low"区分开显示 —— 两者语义不同，合并会误导。
