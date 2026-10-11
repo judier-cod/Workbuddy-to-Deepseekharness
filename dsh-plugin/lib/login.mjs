@@ -380,6 +380,14 @@ export function listManagedAccounts(dshHome) {
       out.push({
         uid: name.replace(/\.info$/i, ''),
         path,
+        /**
+         * 账号的 **uin**（形如 `330125158554`）。
+         *
+         * 这是**用户认得出的那个标识** —— 客户端界面上显示的就是它。而 uid 是
+         * 36 字符的 UUID，只取前 8 位当标签的话用户根本对不上"这是哪个账号"
+         * （实测反馈："我现在不知道哪个是哪个账号了"）。不是凭据，可以外传。
+         */
+        uin: raw.account?.uin ? String(raw.account.uin) : '',
         domain: raw.auth?.domain || '',
         expiresAt,
         remainingMs: expiresAt - Date.now(),

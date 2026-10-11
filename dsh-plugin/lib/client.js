@@ -934,6 +934,9 @@ body.dark .wb-root,
        */
       [/^\(未识别账号\) · 端口 (.+)$/, '(unknown account) · port $1'],
       [/^(.+) · 端口 (.+)$/, '$1 · port $2'],
+      // 账号行现在是 `域名 · 端口 8793`，由代码拼出**独立片段** `端口 <n>`；
+      // 它单独出现时上面两条都匹配不上（前面没有 ` · `），所以单独兜一条。
+      [/^端口 (.+)$/, 'port $1'],
 
       /*
        * ── 环境诊断的 detail / hint ──────────────────────────────────────
@@ -2449,7 +2452,8 @@ body.dark .wb-root,
             h('p', { className: 'wb-note', style: { margin: '0 0 4px' } }, '已纳管账号：'),
             ...accounts.map((a) => h('div', { key: a.uid, className: 'wb-account' + (a.expired ? ' bad' : '') },
               h('div', { className: 'wb-account-head' },
-                h('b', { title: a.path }, a.uid.slice(0, 8) + '…'),
+                // 显示 uin（用户认得出的账号）；拿不到才退到 uuid 前 8 位
+                h('b', { title: a.path }, a.uin || (a.uid.slice(0, 8) + '…')),
                 h(Pill, { tone: a.expired ? 'bad' : 'ok', text: a.expired ? '已过期' : '可用' })),
               h('div', { className: 'wb-note', style: { margin: '4px 0 0' } },
                 (a.domain || '(未知域)') + ' · 剩余 '
@@ -2469,8 +2473,25 @@ body.dark .wb-root,
     function AccountsPanel({ onStartConsole, busy, reloadStatus, status: pluginStatus }) {
       const api = useConsoleApi(CONSOLE_API + '/accounts', { interval: 30000 });
       const { data, error, status, reload } = api;
-      // Hooks 必须在任何条件 return 之前调用（React 规则）
+      /*
+       * Hooks 必须在任何条件 return 之前调用（React 规则）。
+       *
+       * 纳管账号列表**必须在这里取**，不能挪到下面 —— 那一段前面有两个 early
+       * return（控制台门控、首帧加载态），hook 排在它们之后会破坏 hook 顺序：
+       * React 抛错并把整棵子树卸载，表现是"点开账号页整个面板空白"
+       * （`__errors` 里也看不到，因为是渲染期异常而非 window.onerror）。
+       */
       const [showDetail, setShowDetail] = useState(false);
+      /*
+       * 纳管账号列表（宿主路由，**不依赖控制台**）。
+       *
+       * 用途有两个：给「纳管账号」区块渲染，以及给**主 provider 那一行**补 uin ——
+       * 主 provider 的身份来自桥的 `/health`（只有 uuid），而当前账号往往也在纳管
+       * 目录里存了一份（滚动更新的那份存档），从那里能拿到 uin。
+       */
+      const managedApi = useJson('/workbuddy/login', { interval: 60000 });
+      const managed = managedApi.data?.accounts || [];
+
       if (api.availability.state !== 'ok' && (status === 503 || status === 404)) {
         /*
          * 控制台没跑 / 宿主是旧构建时，**只把"客户端账号快照"这块换成门控提示**，
@@ -2498,11 +2519,16 @@ body.dark .wb-root,
           displayName: pluginStatus?.config?.displayName || 'WorkBuddy',
           authFile: (pluginStatus?.bridge?.health?.authFile || '').split(/[\\/]/).pop(),
           account: pluginStatus?.bridge?.health?.auth?.userId || '',
+          // 当前账号的存档（滚动更新那份）里有 uin，用它把 uuid 换成用户认得出的标识
+          uin: (() => {
+            const uid = pluginStatus?.bridge?.health?.auth?.userId || '';
+            return uid ? (managed.find((a) => a.uid === uid)?.uin || '') : '';
+          })(),
           port: pluginStatus?.config?.bridgeUrl ? String(pluginStatus.config.bridgeUrl).split(':').pop() : '',
         },
         ...(pluginStatus?.accountGroups || []).map((g) => ({
           provider: g.provider, displayName: g.displayName, authFile: g.authFile, port: g.port, error: g.error,
-          account: g.account || '',
+          account: g.account || '', uin: g.uin || '',
         })),
       ];
       /** 账号快照 → 被哪个分组使用（按文件名匹配）。 */
@@ -2518,17 +2544,27 @@ body.dark .wb-root,
         // "在模型选择器里该选哪个"。原始文件名之类的细节收进折叠，
         // 它们是排障用的，不该和"我该选什么"抢注意力。
         h('div', { style: { marginTop: '4px' } },
-          groups.map((g) => h('div', { key: g.provider, className: 'wb-account' + (g.error ? ' bad' : '') },
-            h('div', { className: 'wb-account-head' },
-              h('b', { title: g.displayName }, g.displayName),
-              h(Pill, { tone: g.error ? 'bad' : 'ok', text: g.error ? '异常' : '使用中' })),
-            h('div', { className: 'wb-pick' },
-              h('span', { className: 'wb-note', style: { margin: 0 } }, '模型选择器里选'),
-              h('code', { className: 'wb-pick-code', title: g.provider }, g.provider)),
-            h('div', { className: 'wb-note', style: { margin: '4px 0 0' } },
-              pickAccountLabel(accounts, g)
-              + (g.port ? ' · 端口 ' + g.port : '')
-              + (g.error ? ' · ' + g.error : ''))))),
+          groups.map((g) => {
+            const snap = accounts.find((a) => a.name === g.authFile);
+            // 账号标识优先级：宿主给的 uin > 客户端快照的 uin > 快照的 userId > 桥的 uid
+            const ident = g.uin || snap?.account || snap?.userId || g.account || '';
+            const domain = g.domain || snap?.domain || '';
+            return h('div', { key: g.provider, className: 'wb-account' + (g.error ? ' bad' : '') },
+              h('div', { className: 'wb-account-head' },
+                /*
+                 * 标题显示**账号标识**（uin，如 `330125158554`），不是 provider 名。
+                 * 用户的问题是"不知道哪个是哪个账号" —— provider 名
+                 * （`workbuddy-m6d2b5f6b`）是模型选择器用的路由键，认不出是哪个账号；
+                 * uin 才是客户端界面上的那个标识。缺 uin 时退回展示名。
+                 */
+                h('b', { title: g.provider }, ident || g.displayName),
+                h(Pill, { tone: g.error ? 'bad' : 'ok', text: g.error ? '异常' : '使用中' })),
+              h('div', { className: 'wb-pick' },
+                h('span', { className: 'wb-note', style: { margin: 0 } }, '模型选择器里选'),
+                h('code', { className: 'wb-pick-code', title: g.provider }, g.provider)),
+              h('div', { className: 'wb-note', style: { margin: '4px 0 0' } },
+                [domain, g.port ? '端口 ' + g.port : '', g.error || ''].filter(Boolean).join(' · ')));
+          })),
 
         // 未被任何分组使用的账号：**会自动启用**（插件扫描到就注册），
         // 这里如实列出它们的状态，不需要用户去改配置文件。
@@ -2563,27 +2599,6 @@ body.dark .wb-root,
 
         h('div', { className: 'wb-actions', style: { marginTop: '10px' } },
           h(Btn, { onClick: () => { reload(); reloadStatus?.(); } }, '刷新')));
-    }
-
-    /**
-     * 分组 → 账号显示名的取值顺序。
-     *
-     *   1. **桥报的 userId**（`group.account`）—— 唯一对纳管账号也成立的来源；
-     *   2. 客户端快照里按登录文件名对照，取其中的 uin / userId 与域名
-     *      （客户端快照有 uin，比 uuid 好认）；
-     *   3. 都拿不到才说「(未识别账号)」。
-     *
-     * 顺序不能反：纳管凭据不在客户端登录目录里，先查快照的话纳管分组永远落到
-     * 第 3 档，页面就会出现「(未识别账号)」（实测）。
-     */
-    function pickAccountLabel(accounts, group) {
-      const hit = accounts.find((a) => a.name === group.authFile);
-      if (hit) {
-        return (hit.account || hit.userId || group.account || '(未识别账号)')
-          + (hit.domain ? ' · ' + hit.domain : '');
-      }
-      if (group.account) return String(group.account).slice(0, 8) + '…';
-      return '(未识别账号)';
     }
 
     // ─────────────────────────── 用量 ───────────────────────────

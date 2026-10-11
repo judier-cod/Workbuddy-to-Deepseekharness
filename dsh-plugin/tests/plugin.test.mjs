@@ -1717,3 +1717,74 @@ test('纳管账号分配端口：必须避开控制台端口（回归：抢 8792
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/**
+ * 账号"升格"为主账号时，它的分组必须被撤销。
+ *
+ * 回归（用户实测）：在客户端切走 A、再切回 A 之后，面板显示 4 行而实际只有 3 个
+ * 账号 —— A 既被主 provider 服务、又留着一条 `workbuddy-mA` 分组（端口 8794）。
+ * 两条桥服务同一账号会让**两个进程并发刷新同一会话**：上游每次刷新都轮换
+ * refresh token，用旧令牌的那个请求可能被判异常、吊销会话 —— 代价是用户被迫
+ * 重新登录。所以这不是"多一行显示"的小问题。
+ */
+test('账号升格为主账号后，原分组必须被撤销（回归：同一账号两条桥）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wb-retire-'));
+  try {
+    const UID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const adir = join(dir, 'workbuddy-accounts');
+    mkdirSync(adir, { recursive: true });
+    writeFileSync(join(adir, `${UID}.info`), JSON.stringify({
+      account: { uin: '330125158554', nickname: '' },
+      auth: { accessToken: { $wbEncrypted: 1, envelope: 'x' }, domain: 'www.workbuddy.cn', expiresAt: Date.now() + 864e5 },
+      managed: true,
+    }), 'utf8');
+
+    const { ctx, calls } = fakeCtx();
+    const result = apply(ctx, {
+      projectRoot: dir, dshHome: dir, accountWatchMs: 0,
+      autoStart: false, consoleAutoStart: false, migrateLegacy: false,
+      tools: false, commands: false, routes: false,
+    });
+
+    /*
+     * 这里有一个**无法消除的竞态**，必须显式处理：
+     * `apply()` 末尾会 fire-and-forget 一次 `activateManagedGroups()`，它内部
+     * `await supervisor.probe()` —— 那个 HTTP 探测**已经飞出去了**（读的是开发机
+     * 上真实运行的桥）。我们之后打桩、并把 bridgeAccount 归零，但**先飞出去的那次
+     * 探测结果会晚于我们落地**，把状态覆盖回真实账号（实测：断言读到 `7ffbd7f5…`）。
+     *
+     * 处理：先给它一个窗口落地，再接管状态。等待是必要的 —— 这不是"睡够就行"的
+     * 偷懒，而是"必须让在途请求先完成"的确定性要求（本机 300ms 足够；CI 上没有
+     * 真实桥时它会快速失败，同样在窗口内结束）。
+     */
+    await new Promise((r) => setTimeout(r, 300));
+    const stubProbe = (userId, authFile) => {
+      result.supervisor.probe = async () => ({ state: 'running', health: { auth: { userId }, authFile } });
+    };
+    stubProbe('other-account', 'C:/x/other.info');
+    result.state.bridgeAccount = null;
+    await result.activateManagedGroups();
+    assert.equal(result.state.bridgeAccount, 'other-account',
+      '前置：主桥身份必须是我们的桩值（不是开发机上真实桥的账号）');
+
+    // 第一幕：主桥服务**别的**账号 → 纳管账号被激活成分组
+    await result.activateManagedGroups();
+    const group = result.state.accountGroups.find((g) => g.authFile.includes(UID));
+    assert.ok(group, '第一幕：纳管账号应先成为分组');
+    const provider = group.provider;
+    assert.equal(group.uin, '330125158554', '分组的展示标识应是 uin（用户认得出的那个）');
+
+    // 第二幕：客户端切回这个账号 → 它成为主账号
+    stubProbe(UID, 'C:/client/workbuddy-desktop.info');
+    // 让主桥身份被对账函数观察到（reconcileAccount 在 snapshot 里跑）
+    await result.snapshot({});
+    assert.equal(result.state.bridgeAccount, UID, '第二幕：主桥身份应已切到该账号');
+
+    await result.activateManagedGroups();
+
+    assert.ok(!result.state.accountGroups.some((g) => g.provider === provider),
+      `升格后 ${provider} 必须从分组列表移除（否则同一账号两条桥，会并发刷新同一会话）`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

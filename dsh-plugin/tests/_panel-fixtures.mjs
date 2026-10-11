@@ -54,6 +54,10 @@ export const FIXTURES = {
      * 客户端登录目录的快照里 —— 凭据在 `$DSH_HOME/workbuddy-accounts/` 下。
      * 面板若只按 authFile 去客户端快照里找，这一行就会显示「(未识别账号)」
      * （曾经的实现就是这样）。`account` 字段是修复的关键（宿主从桥 /health 取）。
+     *
+     * `uin` 是**用户认得出的标识**（客户端界面上那个）。宿主从纳管文件里读它，
+     * 面板拿它当行的标题 —— 只给 uuid 的话用户对不上"这是哪个账号"（实测反馈
+     * "不知道哪个是哪个账号了"，所以这里必须给 uin，否则截图与真实体验不一致）。
      */
     accountGroups: [
       {
@@ -62,8 +66,9 @@ export const FIXTURES = {
         registered: true, error: '',
       },
       {
-        id: 'm7ffbd7f5', provider: 'workbuddy-m7ffbd7f5', displayName: '纳管账号 7ffbd7f5',
+        id: 'm7ffbd7f5', provider: 'workbuddy-m7ffbd7f5', displayName: '纳管账号 330125158554',
         port: 8793, authFile: '7ffbd7f5-36e2-4eed-b911-8cc6a14e0d2b.info', account: '7ffbd7f5-36e2-4eed-b911-8cc6a14e0d2b',
+        uin: '330125158554', domain: 'www.codebuddy.cn',
         registered: true, error: '',
       },
     ],

@@ -1288,8 +1288,13 @@ export function apply(ctx, rawConfig = {}) {
         groupAdapter.setReasoningOverrides({ ...config.reasoningOverrides, ...groupReasoning });
         log(`分组「${account.displayName}」应用推理能力覆盖：${Object.keys(groupReasoning).length} 个模型`);
       }
-      // 每个分组一条独立路由：模型选择器里就是独立的一组
-      llm.registerAdapter([account.provider], groupAdapter);
+      // 每个分组一条独立路由：模型选择器里就是独立的一组。
+      //
+      // **handle 必须留着**：账号从"分组"升格成"主账号"时（用户在客户端切回
+      // 一个已有分组的账号），这条分组路由要能注销掉 —— 否则同一账号会有两条桥
+      // 同时服务，两个进程并发刷新同一会话（上游轮换 refresh token，并发刷新
+      // 可能把会话吊销）。实测踩过：切回旧账号后面板显示 4 行、实际只有 3 个账号。
+      group.handle = llm.registerAdapter([account.provider], groupAdapter);
       group.registered = true;
       log(`已注册分组路由：provider=${account.provider}（${account.displayName}，端口 ${account.port}）`);
     } catch (error) {
@@ -1416,6 +1421,54 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   /**
+   * 撤掉一个"已升格为主账号"的分组：注销路由、停桥、从面板列表移除。
+   *
+   * 触发条件：某个纳管账号的 uid 与**主桥当前服务的账号**相同 —— 即用户在客户端
+   * 切走它、又切回来。它先前作为分组被激活，现在主 provider 已经在服务同一个
+   * 账号，那条分组必须消失。
+   *
+   * 为什么必须做（而不是"留着也无害"）：两条桥服务同一账号会让**两个进程并发
+   * 刷新同一会话**。上游每次刷新都轮换 refresh token，第二个用旧令牌的刷新请求
+   * 可能被判为异常、把会话吊销 —— 代价是用户被迫重新登录。而且面板上会多出一行，
+   * 让"我有几个账号"这件事说不清。
+   *
+   * 幂等：`retired` 标记避免重复注销（注销一个已 disposed 的 handle 会抛
+   * `REGISTRATION_DISPOSED`）。
+   *
+   * @param {string} uid 主桥当前服务的账号 uid
+   * @returns {Promise<boolean>} 是否撤掉了某个分组
+   */
+  async function retirePromotedGroup(uid) {
+    const group = accountGroups.find((g) => g.authFile && g.authFile.includes(String(uid)) && !g.retired);
+    if (!group) return false;
+    group.retired = true;
+    log(`账号 ${String(uid).slice(0, 8)}… 已升格为主账号，撤销它的分组 ${group.provider}（避免同一账号两条桥）`);
+
+    // 1) 注销 dsh 路由 —— 模型选择器里那一组随之消失。
+    //    handle() 即注销整条注册（契约：AdapterRegistrationHandle 可调用）；
+    //    单个分组是独立一次 registerAdapter，所以能单独摘掉。
+    try {
+      if (typeof group.handle === 'function') group.handle();
+    } catch (error) {
+      log(`注销分组路由 ${group.provider} 失败（继续停桥）`, error);
+    }
+    group.registered = false;
+
+    // 2) 停掉它的桥 —— 它读的是纳管目录里的副本，与主桥读的客户端文件是两份，
+    //    不停就一直在消耗同一账号的额度、并参与令牌刷新竞争。
+    try {
+      if (group.supervisor) await group.supervisor.stop();
+    } catch (error) {
+      log(`停止分组桥 ${group.provider} 失败`, error);
+    }
+
+    // 3) 从列表移除（面板据此不再显示这一行）
+    const idx = accountGroups.indexOf(group);
+    if (idx >= 0) accountGroups.splice(idx, 1);
+    return true;
+  }
+
+  /**
    * 把纳管目录里**尚未成为分组**的账号激活成分组。
    *
    * 排除当前主桥服务的那个账号：它已经由主 provider（`workbuddy`）提供，再起一条
@@ -1424,8 +1477,7 @@ export function apply(ctx, rawConfig = {}) {
    *
    * @returns {Promise<number>} 本次新激活的分组数
    */
-  async function activateManagedGroups() {
-    // 主账号未知时先探一次（限时 2 秒）：排除它靠的就是这个身份。
+  async function activateManagedGroups() {    // 主账号未知时先探一次（限时 2 秒）：排除它靠的就是这个身份。
     // 首次调用发生在插件加载后不久，此时桥可能还没起来 —— 探不到就先注册不了，
     // 下一次巡检（15 秒后）会补上。
     if (state.bridgeAccount === null) {
@@ -1436,6 +1488,8 @@ export function apply(ctx, rawConfig = {}) {
       }
     }
     let added = 0;
+    /** 本次撤销的"已升格为主账号"分组数 —— 同样属于拓扑变化，要广播。 */
+    let retired = 0;
     let managed = [];
     /** 本次新注册的分组：循环结束后**并行**起桥（见下方说明）。 */
     const pending = [];
@@ -1447,7 +1501,20 @@ export function apply(ctx, rawConfig = {}) {
     }
     for (const account of managed) {
       if (account.expired) continue;                                  // 过期的不起桥，面板会标红
-      if (account.uid === state.bridgeAccount) continue;              // 主账号：主桥已经在服务
+      if (account.uid === state.bridgeAccount) {
+        /*
+         * 这个账号**已经是主桥在服务的**。
+         *
+         * 但它可能**已经注册过分组**了：用户在客户端切走、又切回来时，它先作为
+         * 分组被激活，然后成为主账号。此时那条分组路由与它的桥必须撤掉 ——
+         * 否则同一账号两条桥并行，两个进程并发刷新同一会话（上游轮换
+         * refresh token，并发刷新可能吊销会话）。实测就是"3 个账号显示 4 行"。
+         *
+         * 幂等：撤过一次后 `retired` 为真，后续巡检直接跳过。
+         */
+        if (await retirePromotedGroup(account.uid)) retired += 1;
+        continue;
+      }
       const id = `m${account.uid.slice(0, 8)}`;
       const provider = `${config.accountProviderPrefix}${id}`;
       if (accountGroups.some((g) => g.provider === provider)) continue;
@@ -1456,13 +1523,16 @@ export function apply(ctx, rawConfig = {}) {
       const group = registerAccountGroup({
         id,
         provider,
-        displayName: `纳管账号 ${account.uid.slice(0, 8)}`,
+        // 展示名用 **uin**（如 `纳管账号 330125158554`）—— 那是用户在客户端里
+        // 认得出的标识；uuid 前 8 位对不上（实测反馈"不知道哪个是哪个账号"）。
+        displayName: `纳管账号 ${account.uin || account.uid.slice(0, 8)}`,
         authFile: account.path,
         port,
         token: '',
       });
       if (!group) continue;
-      log(`检测到新账号 ${account.uid.slice(0, 8)}…，已注册为分组 ${provider}（端口 ${port}）`);
+      group.uin = account.uin || '';
+      log(`检测到新账号 ${account.uin || account.uid.slice(0, 8)}…，已注册为分组 ${provider}（端口 ${port}）`);
       added += 1;
       pending.push(group);
     }
@@ -1472,7 +1542,7 @@ export function apply(ctx, rawConfig = {}) {
      * 只记在自己的 group 上 —— startGroupBridge 自己 catch，不会拖累别的分组。
      */
     if (config.autoStart && pending.length) await Promise.all(pending.map((g) => startGroupBridge(g)));
-    return added;
+    return added + retired;
   }
 
   /**
@@ -1649,6 +1719,12 @@ export function apply(ctx, rawConfig = {}) {
          * 「(未识别账号)」（实测就是这个现象）。
          */
         account: g.account || null,
+        /**
+         * 账号的 uin（如 `330125158554`）—— **用户认得出的那个标识**。
+         * 客户端界面上显示的就是它；uid 是 36 字符 UUID，取前 8 位对不上
+         * （实测反馈"不知道哪个是哪个账号"）。不是凭据，可以外传。
+         */
+        uin: g.uin || '',
         registered: g.registered,
         error: g.error,
       })),

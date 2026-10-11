@@ -260,8 +260,13 @@ try {
   if (beforeExpand.includes('(未识别账号)')) {
     problems.push('账号页把分组显示成了「(未识别账号)」—— 纳管分组必须显示真实账号标识');
   }
-  if (!beforeExpand.includes('7ffbd7f5')) {
-    problems.push('账号页没有显示纳管分组的账号标识（夹具里有 workbuddy-m7ffbd7f5，它靠 group.account 显示）');
+  /*
+   * 行的标题必须是 **uin**（`330125158554`，客户端界面上的那个标识），
+   * 不是 uuid 前 8 位。用户反馈"不知道哪个是哪个账号" —— 拿 `7ffbd7f5` 这种
+   * 截断 uuid 当标题就是根因（它对不上用户在客户端里看到的任何东西）。
+   */
+  if (!beforeExpand.includes('330125158554')) {
+    problems.push('账号页没有显示纳管账号的 uin（330125158554）—— 用户靠它认账号，uuid 对不上');
   }
   // provider 名必须出现 —— 那是"我该在模型选择器里选什么"，本页最重要的一行
   for (const provider of ['workbuddy-ai', 'workbuddy-m7ffbd7f5']) {
