@@ -12,7 +12,7 @@
 # Loader 行会静默跳过而不是报错，所以单一 name 无法同时服务两种形态）：
 #   - 单文件夹分发（把 dsh-plugin/ 拷给别人，vendor 形态）
 #     → 包名 = dsh-plugin-workbuddy（本文件，dsh-plugin/package.json 引用）；
-#   - github 直装（dsh plugin add github:judier-cod/workbuddy-to-dsh）
+#   - github 直装（dsh plugin add github:judier-cod/Workbuddy-to-Deepseekharness）
 #     → npm 装的是**仓库根**，包名 = workbuddy-to-dsh，由根目录自己的
 #       cordis.patch.yml 提供（内容除 name 外与本文件一致 —— 同步改）。
 #

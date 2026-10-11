@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-workbuddy",
-  "version": "1.4.6",
+  "version": "1.5.0",
   "private": false,
   "description": "DeepSeek Harness 插件：把本机 WorkBuddy 桌面端已登录的模型原生接进 dsh —— 自动管理本地桥、以 llm 适配器注册 workbuddy 路由、提供工具/命令，并在设置里带一个 WorkBuddy 面板。",
   "type": "module",
@@ -57,11 +57,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/judier-cod/workbuddy-to-dsh.git",
+    "url": "git+https://github.com/judier-cod/Workbuddy-to-Deepseekharness.git",
     "directory": "dsh-plugin"
   },
-  "homepage": "https://github.com/judier-cod/workbuddy-to-dsh/tree/main/dsh-plugin#readme",
+  "homepage": "https://github.com/judier-cod/Workbuddy-to-Deepseekharness/tree/main/dsh-plugin#readme",
   "bugs": {
-    "url": "https://github.com/judier-cod/workbuddy-to-dsh/issues"
+    "url": "https://github.com/judier-cod/Workbuddy-to-Deepseekharness/issues"
   }
 }

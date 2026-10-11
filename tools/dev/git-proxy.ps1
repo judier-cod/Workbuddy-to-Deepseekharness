@@ -134,5 +134,5 @@ if ($now) {
 }
 Write-Host ("  其它仓库       : 不受影响（只改了 github.com 这一个键）")
 Write-Host "`n实测一下：" -ForegroundColor DarkGray
-Write-Host "  git ls-remote https://github.com/judier-cod/workbuddy-to-dsh.git" -ForegroundColor DarkGray
+Write-Host "  git ls-remote https://github.com/judier-cod/Workbuddy-to-Deepseekharness.git" -ForegroundColor DarkGray
 exit 0

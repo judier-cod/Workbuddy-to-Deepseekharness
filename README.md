@@ -69,7 +69,7 @@
 
 ```sh
 # ── 第 1 步：跑起来（所有用法都需要，与 dsh 无关）──────────────────────
-git clone https://github.com/judier-cod/workbuddy-to-dsh.git
+git clone https://github.com/judier-cod/Workbuddy-to-Deepseekharness.git
 cd workbuddy-to-dsh
 # 然后双击 启动.cmd —— 桥和控制台都会自动起来，不需要 npm install
 
@@ -85,11 +85,11 @@ bridge\start-bridge.cmd
 # 只有用 dsh 的人需要。三种方式装的是同一个插件，任选一种。
 
 # 方式一：一条命令直装（v1.1.0 起，仓库根已声明 dsh.bundle）
-dsh plugin --profile desktop add github:judier-cod/workbuddy-to-dsh
+dsh plugin --profile desktop add github:judier-cod/Workbuddy-to-Deepseekharness
 
 # 方式二：release 附件（tgz 安装包，无构建、无需 allowBuilds 授权）
 #   从 GitHub Releases 下载 dsh-plugin-workbuddy-<版本>.tgz 后：
-dsh plugin --profile desktop add ./dsh-plugin-workbuddy-1.4.6.tgz
+dsh plugin --profile desktop add ./dsh-plugin-workbuddy-1.5.0.tgz
 
 # 方式三：从源码（插件在 dsh-plugin/ 子目录，接第 1 步的 git clone）
 dsh plugin --profile desktop add workbuddy-to-dsh/dsh-plugin
@@ -177,14 +177,14 @@ Claude Code、opencode…），它会替你完成判定 → 安装 → 验证，
 1. 环境判定：确认 Node.js 18+（node -v）；确认 WorkBuddy 桌面端已安装并登录过
    （Windows 下检查 %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\ 里是否有
    .info 登录文件；没有就先打开 WorkBuddy 登录一次）。
-2. 获取代码：git clone https://github.com/judier-cod/workbuddy-to-dsh 并进入目录。
+2. 获取代码：git clone https://github.com/judier-cod/Workbuddy-to-Deepseekharness 并进入目录。
    本项目零依赖，不需要 npm install。
 3. 启动：Windows 双击根目录的 启动.cmd（或 node dashboard/server.mjs）——它会自动
    启动桥并打开控制台（http://127.0.0.1:8792）。
 4. 验证：运行 node tools/doctor.mjs 自检全部通过；再请求
    curl -H "Authorization: Bearer wb-local-bridge" http://127.0.0.1:8790/v1/models
    确认返回模型目录。
-5. 若我是 DeepSeek Harness 用户：改用 dsh plugin add github:judier-cod/workbuddy-to-dsh
+5. 若我是 DeepSeek Harness 用户：改用 dsh plugin add github:judier-cod/Workbuddy-to-Deepseekharness
    直装插件，然后在 dsh 设置页的 WorkBuddy 分区完成模型注册并重启 dsh。
 6. 遇到问题先读 docs/TROUBLESHOOTING.md，按里面的处置试过再带报错来问我。
 全程只允许 127.0.0.1 本机回环，不要尝试改绑 0.0.0.0 或暴露到局域网。

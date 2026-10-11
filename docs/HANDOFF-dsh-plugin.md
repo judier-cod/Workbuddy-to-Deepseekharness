@@ -12,7 +12,7 @@
 ## 0. 本轮更新（多账号 + 计费时段 + 两个桥的真实 bug）
 
 > 本轮起点：单账号插件（27 项测试）。终点：**157 项测试全绿**、CI 7/7 通过、
-> 已推到 `judier-cod/workbuddy-to-dsh`（Public）。下面按"新能力 → 新契约 →
+> 已推到 `judier-cod/Workbuddy-to-Deepseekharness`（Public）。下面按"新能力 → 新契约 →
 > 修掉的 bug"组织，每条都带可复核的证据。
 
 ### 0.1 新增能力
@@ -91,7 +91,7 @@ node dsh-plugin/scripts/verify-standalone.mjs# ✅ 12 项全过
 - **Node v25.2.1**（`C:\Program Files\nodejs\node.exe`）；CI 用 22；DSH 自带 24.21.0。
 - dsh CLI：`D:\Apps\DeepSeekHarness\resources\runtime\cli\bin\dsh.cmd`（ELECTRON_RUN_AS_NODE 包装）。
 - `DSH_HOME=%USERPROFILE%\.dsh`；profile `desktop`；DSH 0.2.0-rc.2。
-- 仓库检出：`D:\deepseek\workbuddy-to-dsh`；远程 `judier-cod/workbuddy-to-dsh`（Public）。
+- 仓库检出：`D:\deepseek\workbuddy-to-dsh`；远程 `judier-cod/Workbuddy-to-Deepseekharness`（Public）。
 - **git 走代理**：系统代理 `127.0.0.1:7890`（Clash），但 git 不读系统代理。
   已配 `http.https://github.com.proxy`（只对 GitHub 生效，不动全局）。
   **换网络后跑 `tools/dev/git-proxy.ps1`** —— 它实测直连/代理哪条通再调配置。
