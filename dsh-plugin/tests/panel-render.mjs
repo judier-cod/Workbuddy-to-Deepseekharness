@@ -523,6 +523,24 @@ try {
   if (filterOptions < 5) problems.push(`请求页模型筛选只有 ${filterOptions} 项（应来自完整目录）`);
   else console.log(`请求页模型筛选：${filterOptions} 项`);
 
+  /*
+   * 账号筛选下拉只显示**账号标签**，不补 provider 名。
+   *
+   * 回归（用户实测）：原先写成 `judier-cod（workbuddy-mc62d4b4b）` —— 括号里那个
+   * 路由键是纯噪音，用户认账号只看标签（"括号里面的不需要出现"）。
+   * 这条断言防的是"以后有人觉得补个 id 更好排障"又把它加回来。
+   */
+  const acctOptions = await page.cdp.evaluate(`(() => {
+    const sel = [...document.querySelectorAll('select.wb-select')].find((s) => /全部账号/.test(s.options[0] ? s.options[0].textContent : ''));
+    return sel ? [...sel.options].map((o) => o.textContent) : [];
+  })()`);
+  for (const opt of acctOptions) {
+    if (/（workbuddy/.test(opt)) {
+      problems.push(`请求页账号筛选里带着 provider 名：「${opt}」—— 括号里的内容不需要显示`);
+    }
+  }
+  if (acctOptions.length > 1) console.log(`请求页账号筛选：${acctOptions.length} 项（${acctOptions.slice(1).join(' / ')}）`);
+
   // 账号页落一张图：7 列的数据表最容易出"挤在一起/胶囊压邻居"，值得人工看
   await page.cdp.evaluate(`(() => { const b=[...document.querySelectorAll('.wb-tab')].find(x=>x.textContent==='账号'); b && b.click(); })()`);
   await sleep(700);

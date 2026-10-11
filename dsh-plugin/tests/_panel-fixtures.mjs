@@ -411,11 +411,28 @@ window.__ModuleLoader__ = {
  * @param {object} data gather() 的产物，或内置的 FIXTURES
  */
 export function buildRoutes(data) {
-  /** 一条合成的失败请求：用来**稳定**触发概览页的「最近有失败」待办（真实数据里不一定正好有）。 */
+  /**
+   * 一条合成的失败请求：用来**稳定**触发概览页的「最近有失败」待办
+   * （真实数据里不一定正好有）。
+   *
+   * `acct` 是**必须**的：请求页的「账号」列与账号筛选下拉都读它。
+   * 早先夹具里没有这个字段，于是那个下拉从来不渲染 —— 相关断言形同虚设
+   * （实测：新加的"不许带 provider 名"断言一次都没被触发）。
+   */
   const syntheticFailure = {
     t: Date.now() - 60_000, model: 'deepseek-v4.1-flash', stream: true, ok: false, ms: 812,
     promptTokens: 100, completionTokens: 0, credit: 0, status: 429, code: 'RATE_LIMIT',
     error: '您的使用量已超出频率限制（harness 合成样例）',
+    acct: 'workbuddy',
+  };
+  /**
+   * `acct`（账本里的 provider 名）→ 账号标签。
+   * 宿主在 /workbuddy/usage 与 /workbuddy/requests 的响应里一并给出。
+   * 夹具给两个账号，好让"账号筛选下拉"真的渲染出来（只有一个账号时它被隐藏）。
+   */
+  const ACCOUNT_LABELS = {
+    workbuddy: '185****0760',
+    'workbuddy-ai': 'a3****72@gmail.com',
   };
 
   const routes = {
@@ -424,7 +441,11 @@ export function buildRoutes(data) {
     '/workbuddy/models': data.models,
     // 运行中的宿主可能还是旧构建（宿主改动要重启 dsh 才生效）：早期 /workbuddy/usage
     // 套了一层 {usage:{…}}，这里按**当前契约**摊平，保证面板拿到的形状与新代码一致。
-    '/workbuddy/usage': (data.usage && data.usage.usage) ? { ok: true, ...data.usage.usage } : data.usage,
+    '/workbuddy/usage': {
+      ...((data.usage && data.usage.usage) ? { ok: true, ...data.usage.usage } : data.usage),
+      // 宿主给的 acct → 账号标签对照表（面板靠它把 provider 名显示成账号）
+      accountLabels: ACCOUNT_LABELS,
+    },
     // 签到固定成"今日未签到"（真实数据取决于今天签没签），好让概览待办与签到页都可断言
     '/workbuddy/checkin': { ok: true, status: { todayCheckedIn: false, streakDays: 3, todayCredit: 0 }, auto: { auto: true, lastAt: now - 3600000, lastResult: 'ok', lastError: null, lastSource: 'manual' } },
     '/workbuddy/log': data.log,
@@ -434,7 +455,15 @@ export function buildRoutes(data) {
       firstStatus: 404,
       payload: {
         ok: true,
-        requests: [syntheticFailure, ...((data.requests && Array.isArray(data.requests.requests)) ? data.requests.requests : [])],
+        // 对照表：面板用它把「账号」列与筛选下拉显示成账号标签（不是 provider 名）
+        accountLabels: ACCOUNT_LABELS,
+        // 至少两条**不同账号**的记录：只有一个账号时账号筛选下拉会被隐藏，
+        // 那样相关断言（"不许带 provider 名"）就永远不会被触发。
+        requests: [
+          syntheticFailure,
+          { t: Date.now() - 120_000, model: 'deepseek-v4.1-flash', stream: true, ok: true, ms: 900, promptTokens: 50, completionTokens: 10, credit: 0.02, acct: 'workbuddy-ai' },
+          ...((data.requests && Array.isArray(data.requests.requests)) ? data.requests.requests : []),
+        ],
         /*
          * 进行中请求必须给一条 **runningMs 超过 activeAlertMs** 的 ——
          * 「 · 流式 · 已运行 」与「 · 疑似卡死（超过 …）—— …」这两行的文案是拼接串，

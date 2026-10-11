@@ -908,6 +908,12 @@ body.dark .wb-root,
       // ── 计数（括号里带数字）──
       [/^全部（(\d+)）$/, 'All ($1)'],
       [/^全部模型（(\d+)）$/, 'All models ($1)'],
+      /*
+       * 请求页的账号筛选下拉。它以前**从不渲染**（夹具里没有 `acct` 字段，
+       * 于是 `accounts.length > 1` 恒假、下拉被隐藏），所以这条规则一直缺着也
+       * 没被发现 —— 补上夹具之后 i18n 门禁立刻抓到了。
+       */
+      [/^全部账号（(\d+)）$/, 'All accounts ($1)'],
       [/^仅看失败（(\d+)）$/, 'Failures only ($1)'],
       [/^只看不可用（(\d+)）$/, 'Unavailable only ($1)'],
       [/^只看未测（(\d+)）$/, 'Not tested only ($1)'],
@@ -2785,7 +2791,14 @@ body.dark .wb-root,
                   h('td', { title: a.account },
                     a.account === 'unknown'
                       ? h('span', { className: 'wb-note', style: { margin: 0 } }, '未标注账号（旧记录）')
-                      // 有对照表就用账号标签（手机号/邮箱）；历史 acct 如实标注
+                      /*
+                       * 有对照表就用账号标签（手机号/邮箱）。
+                       *
+                       * 没有对照的是**历史账号**（已撤销的分组、早期手工标签）——
+                       * 这里**保留**「（历史账号）」标注：它说的不是"这是哪个 provider"，
+                       * 而是"这一行不属于当前任何账号"。去掉它，用户会以为那是个
+                       * 现在还在用的账号（`workbuddy-m7ffbd7f5` 这种名字看着就像）。
+                       */
                       : (usageLabels[a.account]
                         ? usageLabels[a.account]
                         : h('span', null, a.account, h('span', { className: 'wb-note', style: { margin: '0 0 0 6px' } }, '（历史账号）')))),
@@ -2959,12 +2972,20 @@ body.dark .wb-root,
                 onChange: (e) => setAcctFilter(e.target.value),
                 options: [
                   { value: '', label: `全部账号（${accounts.length}）` },
-                  // 显示**账号标签**（手机号/邮箱），不是 provider 名 —— 用户认不出
-                  // `workbuddy-m6d2b5f6b` 是哪个账号。查不到的历史 acct 如实标注。
+                  /*
+                   * 只显示**账号标签**（手机号/邮箱），不补 provider 名。
+                   *
+                   * 原先写成 `judier-cod（workbuddy-mc62d4b4b）` —— 括号里那个路由键
+                   * 是纯噪音：标签本身已经唯一，用户认账号也只看标签（实测反馈
+                   * "括号里面的不需要出现"）。
+                   *
+                   * `value` 仍用原始 `acct`（筛选靠它精确匹配），只是不显示。
+                   * 没有标签的历史 acct（已撤销的分组、早期手工标签）原样显示 ——
+                   * 那就是账本里真实记录的值，不编造也不加装饰。
+                   */
                   ...accounts.map((a) => ({
                     value: a,
-                    label: a === 'unknown' ? '未标注账号（旧记录）'
-                      : (labels[a] ? `${labels[a]}（${a}）` : `${a}（历史账号）`),
+                    label: a === 'unknown' ? '未标注账号（旧记录）' : (labels[a] || a),
                   })),
                 ],
               })
