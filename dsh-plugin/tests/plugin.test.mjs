@@ -372,6 +372,18 @@ test('换账号后积分/签到缓存必须作废（回归：面板把 A 账号�
       state: 'running',
       health: { auth: { userId: currentAccount, expiresAt: new Date(Date.now() + 864e5).toISOString() } },
     });
+    /*
+     * 排干 apply() 末尾那次 fire-and-forget 探测。
+     *
+     * `apply()` 会立刻发起一次 `activateManagedGroups()`，它 `await
+     * supervisor.probe()` —— 那次探测**在打桩之前就飞出去了**，读的是这台机器上
+     * 真实运行的桥（开发机 8790 上通常真有），回来会把 `bridgeAccount` 设成真实
+     * 账号，污染下面的"首次观察"断言。等它落地再归零，后续就完全受控。
+     *
+     * （这是测试竞态，不是产品缺陷：真实运行时探到真桥本来就是对的。）
+     */
+    await new Promise((r) => setTimeout(r, 300));
+    state.bridgeAccount = null;
 
     // 桩：quota/checkin 也打桩 —— **不能依赖真实桥**（CI 上没有桥在跑，
     // 之前本地能过只是因为 8790 上恰好有一个）。返回值随账号变化，
@@ -1765,6 +1777,64 @@ test('纳管账号分配端口：必须避开控制台端口（回归：抢 8792
     assert.ok(managedGroup, '纳管分组应已注册');
     assert.ok(managedGroup.port > 8792,
       `自动分配的端口应避开已知占用（8790 主桥 / 8791 手写分组 / 8792 控制台），实际 ${managedGroup.port}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * 分组标签必须能从 uin **刷新**成手机号/邮箱。
+ *
+ * 回归（用户实测："重启了但没看到改变"）：标签要解密，而解密密钥是异步取的
+ * （要拉起一次客户端二进制，约 340ms）。分组创建发生在密钥就绪**之前** —— 那时
+ * 只能退回 uin。而原先的激活循环看到分组已存在就 `continue`，于是那个 uin 被
+ * **永久冻结**：之后每 15 秒的巡检都跳过它，标签永远不更新。
+ *
+ * 用**明文手机号**（旧版客户端格式）来验证刷新路径 —— 这样不需要密钥，直接
+ * 覆盖"已存在的分组也要重算标签"这条逻辑本身。
+ */
+test('分组标签会重算并刷新展示名（回归：创建时的标签被永久冻结）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wb-label-'));
+  try {
+    const UID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const adir = join(dir, 'workbuddy-accounts');
+    mkdirSync(adir, { recursive: true });
+    const authPath = join(adir, `${UID}.info`);
+    // 第一版：没有手机号 → 标签只能是 uin
+    writeFileSync(authPath, JSON.stringify({
+      account: { uin: '330125158554' },
+      auth: { accessToken: { $wbEncrypted: 1, envelope: 'x' }, domain: 'www.workbuddy.cn', expiresAt: Date.now() + 864e5 },
+      managed: true,
+    }), 'utf8');
+
+    const { ctx } = fakeCtx();
+    const result = apply(ctx, {
+      projectRoot: dir, dshHome: dir, accountWatchMs: 0,
+      autoStart: false, consoleAutoStart: false, migrateLegacy: false,
+      tools: false, commands: false, routes: false,
+    });
+    result.supervisor.probe = async () => ({
+      state: 'running',
+      health: { auth: { userId: 'some-other-account' }, authFile: 'C:/x/other.info' },
+    });
+    await result.activateManagedGroups();
+
+    const group = result.state.accountGroups.find((g) => g.authFile.includes(UID));
+    assert.ok(group, '前置：分组应已注册');
+    assert.equal(group.label, '330125158554', '前置：没有手机号时标签是 uin');
+
+    // 第二版：客户端刷新后文件里有了**明文**手机号（不需要密钥，纯逻辑验证）
+    writeFileSync(authPath, JSON.stringify({
+      account: { uin: '330125158554', phoneNumber: '19157621006' },
+      auth: { accessToken: { $wbEncrypted: 1, envelope: 'x' }, domain: 'www.workbuddy.cn', expiresAt: Date.now() + 864e5 },
+      managed: true,
+    }), 'utf8');
+
+    await result.activateManagedGroups();
+    assert.equal(group.label, '191****1006',
+      '账号信息变了以后标签必须重算 —— 冻结在旧值就是"重启了也没看到改变"的根因');
+    assert.match(group.displayName, /191\*\*\*\*1006/, '展示名也要跟着更新');
+    assert.equal(group.uin, '330125158554', 'uin 仍然保留（它是明文兜底）');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

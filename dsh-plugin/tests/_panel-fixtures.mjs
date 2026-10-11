@@ -46,6 +46,11 @@ export const FIXTURES = {
     config: { provider: 'workbuddy', configuredProvider: 'workbuddy', displayName: 'WorkBuddy', bridgeUrl: 'http://127.0.0.1:8790', consoleUrl: 'http://127.0.0.1:8792', projectRoot: 'D:\\workbuddy-to-dsh', autoStart: true, consoleAutoStart: true, logPath: 'bridge\\bridge.log' },
     /** 控制台状态：这一页的主入口。 */
     console: { state: 'running', url: 'http://127.0.0.1:8792', error: '', managed: false, autoStart: true },
+    /**
+     * 主账号的脱敏标签（宿主读桥正在用的 authFile 解出来的）。
+     * **所有**账号行都显示这种标签 —— 主账号也只有 uuid 的话，用户照样认不出。
+     */
+    bridgeIdentity: { label: '185****0760', uin: '330125158554', labelKind: 'phone' },
     route: { registered: true, provider: 'workbuddy', error: '', fallback: false },
     /**
      * 账号分组：一个手写分组 + 一个**纳管分组**。
@@ -63,17 +68,19 @@ export const FIXTURES = {
       {
         id: 'ai', provider: 'workbuddy-ai', displayName: 'WorkBuddy 国际版',
         port: 8791, authFile: 'workbuddy-desktop-ai.info', account: '450000000000',
+        // 国际版那个账号的"昵称"字段里就是邮箱（实测），所以标签是脱敏邮箱
+        uin: '450702377403', label: 'a3****72@gmail.com', domain: 'www.workbuddy.ai',
         registered: true, error: '',
       },
       {
-        id: 'm7ffbd7f5', provider: 'workbuddy-m7ffbd7f5', displayName: '纳管账号 330125158554',
+        id: 'm7ffbd7f5', provider: 'workbuddy-m7ffbd7f5', displayName: '纳管账号 191****1006',
         port: 8793, authFile: '7ffbd7f5-36e2-4eed-b911-8cc6a14e0d2b.info', account: '7ffbd7f5-36e2-4eed-b911-8cc6a14e0d2b',
-        uin: '330125158554', domain: 'www.codebuddy.cn',
         /*
-         * 脱敏后的手机号 —— 面板显示这个（用户一眼认得出，又不泄露完整号码）。
-         * 夹具里必须是**脱敏值**：截图会进公开仓库，塞真号码就等于泄漏。
+         * 与主账号**不同**的手机号 —— 夹具必须反映真实情况（主账号是 185…、
+         * 纳管那个是 191…）。两边填同一个号会截出一张"两个账号看着一样"的图，
+         * 而那**正是**我们修掉的 bug 的样子，会误导看截图的人。
          */
-        label: '185****0760',
+        uin: '330125867807', label: '191****1006', domain: 'www.codebuddy.cn',
         registered: true, error: '',
       },
     ],

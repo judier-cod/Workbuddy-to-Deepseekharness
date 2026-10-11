@@ -463,6 +463,37 @@ export function maskEmail(email) {
 }
 
 /**
+ * 从**任意**登录文件读出账号身份（脱敏标签 + uin）。
+ *
+ * 与 {@link listManagedAccounts} 的区别：那个只扫纳管目录，而**客户端登录目录里
+ * 的账号**（例如国际版 `workbuddy-desktop-ai.info`）也需要标签 —— 它们同样有
+ * `nickname` / `phoneNumber` 加密字段。面板上"WorkBuddy 国际版"那一行原来只有
+ * uin，就是因为它不经过纳管目录。
+ *
+ * 只读、不写、不改任何文件；解不开就退回 uin（绝不抛）。
+ *
+ * @param {string} authFilePath 登录文件绝对路径
+ * @param {(value: unknown) => string|null} [decrypt] 信封解密（见 createIdentityDecoder）
+ * @returns {{uin: string, label: string, labelKind: string, domain: string, expiresAt: number} | null}
+ *   null = 文件不存在 / 不是登录文件
+ */
+export function readAuthIdentity(authFilePath, decrypt = null) {
+  try {
+    const raw = JSON.parse(readFileSync(authFilePath, 'utf8'));
+    const resolved = resolveAccountLabel(raw, decrypt);
+    return {
+      uin: raw?.account?.uin ? String(raw.account.uin) : '',
+      label: resolved.label,
+      labelKind: resolved.kind,
+      domain: raw?.auth?.domain || '',
+      expiresAt: Number(raw?.auth?.expiresAt || 0),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 把任意账号标识（手机号 / 邮箱 / 昵称）脱敏成"能认出来但不泄露"的形式。
  *
  * 判据只看形状，不看字段名 —— 因为 WorkBuddy 把手机号放在 `phoneNumber`，

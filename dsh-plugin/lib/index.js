@@ -25,7 +25,7 @@
  * （只调用 providerInfo / providerRetryPolicy，没有 instanceof 检查）。
  */
 
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -36,7 +36,7 @@ import { WorkBuddyAdapter } from './adapter.mjs';
 import { toDirectory, pickDefaultModel } from './models.mjs';
 import { createTools } from './tools.mjs';
 import { createRouteTable, mountRoutes } from './routes.mjs';
-import { archiveSnapshot, createIdentityDecoder, listManagedAccounts } from './login.mjs';
+import { archiveSnapshot, createIdentityDecoder, listManagedAccounts, readAuthIdentity } from './login.mjs';
 import { cleanLegacyRoutes, detectLegacyRoutes } from './legacy.mjs';
 
 export const name = 'workbuddy';
@@ -801,11 +801,75 @@ export function apply(ctx, rawConfig = {}) {
   /**
    * 账号标签的惰性解密器（见 login.mjs 的 `createIdentityDecoder`）。
    *
-   * 惰性 + 单例：取密钥要拉起一次客户端二进制（约 340ms），所以只在真正要用
-   * 标签时才创建、且整个插件周期只创建一次。`decrypt` 是同步的 —— 密钥没就绪
-   * 时返回 null，调用方退回到明文 uin，绝不阻塞也不报错。
+   * 惰性 + 单例：取密钥要拉起一次客户端二进制（约 340ms），所以整个插件周期只
+   * 创建一次。`decrypt` 是**同步**的 —— 密钥没就绪时返回 null，调用方退回到明文
+   * uin，绝不阻塞也不报错。
+   *
+   * `decoderRef.value` 是可变的：`createIdentityDecoder()` 本身是 async（要
+   * `await import()`），而快照路径是同步的 —— 所以先放一个 Promise，等它落地后
+   * 把解构出来的同步 `decrypt` 塞进 `value`。在那之前快照只能拿 uin，这是对的：
+   * 宁可先显示 uin，也不为了标签把首帧卡住 340ms。
    */
-  const identityDecoder = createIdentityDecoder();
+  const decoderRef = { value: null };
+  const identityDecoder = createIdentityDecoder().then((d) => {
+    decoderRef.value = d;
+    return d;
+  });
+
+  /**
+   * 预热账号标签的密钥（**按需**，不是无条件）。
+   *
+   * 取密钥要拉起一次客户端二进制（约 340ms），所以只在"真有纳管账号要看标签"时
+   * 才预热 —— 没有纳管账号的机器（例如只用客户端快照的用户）不该为此多跑一个进程。
+   * 幂等：内部自己缓存，重复调用没有额外代价。
+   */
+  async function warmupIdentityIfNeeded() {
+    try {
+      if (!listManagedAccounts(dshPaths.home).length) return;
+      const d = await identityDecoder;
+      await d.warmup();
+    } catch { /* 预热失败不影响任何功能：标签退回 uin */ }
+  }
+
+  /**
+   * 手写分组的标签缓存（authFile 路径 → 脱敏标签）。
+   *
+   * 为什么缓存：`readAuthIdentity()` 每轮快照都会被调到（而快照每 8 秒一次），
+   * 每次都读盘 + 尝试解密没必要。标签只随登录文件变化，按 mtime 失效即可 ——
+   * 这里简化成"读一次就记住"，配合下面的 `resolveGroupLabel` 只在 mtime 变化时重读。
+   */
+  const identityCache = new Map();
+
+  /**
+   * 读一个手写分组（cordis.patch.yml 的 `accounts`）的账号标签。
+   *
+   * 手写分组的凭据在**客户端**登录目录（例如国际版 `workbuddy-desktop-ai.info`），
+   * 不经过纳管流程，所以原先面板那一行只有 uin —— 而它的 `nickname` 字段里
+   * 就是邮箱。这里读它自己的 authFile 拿到脱敏标签。
+   *
+   * 按 mtime 缓存；解密器可能还没拿到密钥（那时返回 uin），下一轮会自然重试 ——
+   * **不能缓存"解不出"的结果**，否则会和分组标签一样被永久冻结。
+   */
+  function resolveGroupLabel(group) {
+    try {
+      const file = group.authFile;
+      if (!file || !existsSync(file)) return '';
+      const mtime = statSync(file).mtimeMs;
+      const cached = identityCache.get(file);
+      if (cached && cached.mtime === mtime && cached.label) return cached.label;
+      // 解密器是同步接口；密钥没就绪时它返回 null → 标签退化成 uin，不阻塞
+      const decrypt = decoderRef.value ? (v) => decoderRef.value.decrypt(v) : null;
+      const id = readAuthIdentity(file, decrypt);
+      const label = id?.label || '';
+      // 只在真的解出"比 uin 更好"的标签时才缓存，否则下一轮重试
+      // （缓存"解不出"的结果会把它永久冻结在 uin —— 实测踩过）
+      if (label && label !== id?.uin) identityCache.set(file, { mtime, label });
+      return label;
+    } catch {
+      return '';
+    }
+  }
+
 
   // 项目根 `.env` 补默认值：优先级 = 插件 config（显式）> .env > 进程环境变量 > 内置默认。
   // 只在用户**没有显式**在 config 里写这一项时才补，避免覆盖用户意图。
@@ -1636,13 +1700,11 @@ export function apply(ctx, rawConfig = {}) {
     /** 本次新注册的分组：循环结束后**并行**起桥（见下方说明）。 */
     const pending = [];
     try {
-      /*
-       * 账号标签要解密（手机号/邮箱在文件里是加密信封）。密钥现取自客户端，
-       * 首次可能还没就绪 —— 那时 `decrypt` 返回 null，标签退化成 uin，
-       * 下一次巡检（15 秒后）补上；`warmup()` 让它在后台把钥取回来。
-       */
+      // 标签要解密（手机号/邮箱在文件里是加密信封）。这里按需预热密钥
+      // （仅在真有纳管账号时才会拉起客户端）；密钥若仍未就绪，decrypt 返回 null
+      // → 标签退化成 uin，下一轮巡检补上。
+      await warmupIdentityIfNeeded();
       const decoder = await identityDecoder;
-      void decoder.warmup();
       managed = listManagedAccounts(dshPaths.home, { decrypt: decoder.decrypt });
     } catch (error) {
       log('读取纳管账号失败（跳过激活）', error);
@@ -1672,7 +1734,25 @@ export function apply(ctx, rawConfig = {}) {
       }
       const id = `m${account.uid.slice(0, 8)}`;
       const provider = `${config.accountProviderPrefix}${id}`;
-      if (accountGroups.some((g) => g.provider === provider)) continue;
+      /*
+       * 分组已存在：**刷新它的标签**，不要直接 continue。
+       *
+       * 为什么必须刷：标签要解密（密钥现取自客户端），而分组创建发生在密钥就绪
+       * **之前** —— 那时解不开、只能退回 uin，然后就被永久冻结在这儿，之后每 15 秒
+       * 的巡检看到分组已存在就跳过，标签永远是 uin（实测："重启了但没看到改变"）。
+       * 每轮巡检顺手更新一次，密钥一旦就绪标签就会自动变成手机号/邮箱。
+       */
+      const existing = accountGroups.find((g) => g.provider === provider);
+      if (existing) {
+        if (account.label && existing.label !== account.label) {
+          existing.label = account.label;
+          existing.uin = account.uin || existing.uin || '';
+          existing.displayName = `纳管账号 ${account.label}`;
+        } else if (!existing.label && account.label) {
+          existing.label = account.label;
+        }
+        continue;
+      }
       const port = nextFreeGroupPort();
       if (!port) { log('没有空闲端口，无法为新账号起桥'); continue; }
       const group = registerAccountGroup({
@@ -1890,8 +1970,12 @@ export function apply(ctx, rawConfig = {}) {
         /**
          * 用户认得出的账号标签（**已脱敏**的手机号/邮箱，退回 uin）。
          * 面板优先显示它 —— 一串 12 位 uin 不如手机号好认。
+         *
+         * 手写分组（cordis.patch.yml 里的 `accounts`，例如国际版）也在这里补上：
+         * 它们的凭据在**客户端**登录目录，不经过纳管流程，所以原先那一行只有
+         * uin。用 `readAuthIdentity()` 读它自己的 authFile 拿到标签。
          */
-        label: g.label || '',
+        label: g.label || (g.authFile ? (identityCache.get(g.authFile) ?? resolveGroupLabel(g)) : ''),
         registered: g.registered,
         error: g.error,
       })),
@@ -1914,6 +1998,20 @@ export function apply(ctx, rawConfig = {}) {
       quotaAccount: state.quotaCache.account,
       /** 桥当前登录的账号（本快照探测到的）——重启 dsh 后可在面板核对它与 quotaAccount 一致 */
       bridgeAccount: state.bridgeAccount,
+      /**
+       * 主账号的脱敏标签（手机号/邮箱）+ uin。
+       *
+       * 主桥的凭据是**客户端**登录文件，不经过纳管流程，所以面板原先只能拿到
+       * uuid。这里直接读桥正在用的那个 authFile 解析出来 —— 与分组行同一套口径，
+       * 免得"分组显示手机号、主账号显示 uuid"。
+       */
+      bridgeIdentity: (() => {
+        const file = probe?.health?.authFile;
+        if (!file || !existsSync(file)) return null;
+        const decrypt = decoderRef.value ? (v) => decoderRef.value.decrypt(v) : null;
+        const id = readAuthIdentity(file, decrypt);
+        return id ? { label: id.label, uin: id.uin, labelKind: id.labelKind } : null;
+      })(),
       /**
        * 各分组的积分（多账号概览用）：每个账号一份，互不影响。
        * 只回传展示所需字段，不含任何凭据。

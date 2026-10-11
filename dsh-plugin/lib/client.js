@@ -2488,15 +2488,6 @@ body.dark .wb-root,
        * （`__errors` 里也看不到，因为是渲染期异常而非 window.onerror）。
        */
       const [showDetail, setShowDetail] = useState(false);
-      /*
-       * 纳管账号列表（宿主路由，**不依赖控制台**）。
-       *
-       * 用途有两个：给「纳管账号」区块渲染，以及给**主 provider 那一行**补 uin ——
-       * 主 provider 的身份来自桥的 `/health`（只有 uuid），而当前账号往往也在纳管
-       * 目录里存了一份（滚动更新的那份存档），从那里能拿到 uin。
-       */
-      const managedApi = useJson('/workbuddy/login', { interval: 60000 });
-      const managed = managedApi.data?.accounts || [];
 
       if (api.availability.state !== 'ok' && (status === 503 || status === 404)) {
         /*
@@ -2526,17 +2517,12 @@ body.dark .wb-root,
           authFile: (pluginStatus?.bridge?.health?.authFile || '').split(/[\\/]/).pop(),
           account: pluginStatus?.bridge?.health?.auth?.userId || '',
           /*
-           * 当前账号的标识：优先用**脱敏后的手机号/邮箱**（从纳管目录那份滚动
-           * 存档里解出来），退回 uin。`label` 已经是脱敏值 —— 可以直接进截图。
+           * 主账号的标识：宿主已经在 `bridgeIdentity` 里解析好了（读的是**桥正在
+           * 用的那个 authFile**，所以客户端目录里的账号也有标签 —— 不再依赖
+           * 纳管目录，那对主账号本来就不适用）。拿不到就退回 uin。
            */
-          uin: (() => {
-            const uid = pluginStatus?.bridge?.health?.auth?.userId || '';
-            return uid ? (managed.find((a) => a.uid === uid)?.uin || '') : '';
-          })(),
-          label: (() => {
-            const uid = pluginStatus?.bridge?.health?.auth?.userId || '';
-            return uid ? (managed.find((a) => a.uid === uid)?.label || '') : '';
-          })(),
+          uin: pluginStatus?.bridgeIdentity?.uin || '',
+          label: pluginStatus?.bridgeIdentity?.label || '',
           port: pluginStatus?.config?.bridgeUrl ? String(pluginStatus.config.bridgeUrl).split(':').pop() : '',
         },
         ...(pluginStatus?.accountGroups || []).map((g) => ({
