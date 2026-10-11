@@ -136,7 +136,21 @@ export class BridgeClient {
     let parsed;
     try { parsed = JSON.parse(text); } catch { parsed = undefined; }
     if (!res.ok) {
-      const message = parsed?.error?.message || parsed?.msg || parsed?.message || text || `HTTP ${res.status}`;
+      /*
+       * 错误消息的取值顺序。**`error` 可能是字符串，也可能是对象** ——
+       * 桥自己返回的是 `{"ok":false,"error":"fetch failed"}`（字符串），
+       * 而上游网关返回的是 `{"error":{"message":"…"}}`（对象）。
+       *
+       * 只写 `parsed?.error?.message` 会漏掉前一种，于是一路落到 `text` ——
+       * 面板上就会出现**整段 JSON 原文**：
+       *
+       *     读取失败：{"ok":false,"error":"fetch failed"}
+       *
+       * 用户看到这个没法行动（实测反馈"读取失败了"）。这里把字符串形态也接住。
+       */
+      const rawError = parsed?.error;
+      const message = (typeof rawError === 'string' ? rawError : rawError?.message)
+        || parsed?.msg || parsed?.message || text || `HTTP ${res.status}`;
       const error = new Error(String(message).slice(0, 400));
       error.status = res.status;
       error.payload = parsed;

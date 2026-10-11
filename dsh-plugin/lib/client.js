@@ -1404,6 +1404,36 @@ body.dark .wb-root,
       const d = parseDate(ts);
       return d ? d.toLocaleTimeString('zh-CN', { hour12: false }) : '—';
     }
+    /**
+     * 把上游/桥的原始错误翻译成**用户能行动**的一句话。
+     *
+     * 为什么需要：桥在上游网络层失败时回的是 `{"ok":false,"error":"fetch failed"}`，
+     * 面板原样显示成「读取失败：{"ok":false,"error":"fetch failed"}」—— 用户看到
+     * 这个既不知道发生了什么、也不知道该做什么（实测反馈"读取失败了"）。
+     *
+     * 这里只翻译**已知的几种**，其余原样返回（不编造原因）。判断依据是错误文本里
+     * 的关键字，因为桥展开后的形态是 `fetch failed (ECONNRESET: …)`。
+     *
+     * @param {string} raw 原始错误文本
+     * @returns {string} 用户可读的一句话
+     */
+    function explainFetchError(raw) {
+      const s = String(raw || '');
+      if (!s) return '读取失败';
+      // 网络层失败（桥已展开 cause）：给出"这是网络问题 + 怎么办"
+      if (/fetch failed|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|socket hang up|UND_ERR/i.test(s)) {
+        const code = (s.match(/\b(ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED)\b/) || [])[1];
+        return '网络暂时不通，读不到积分'
+          + (code ? `（${code}）` : '')
+          + '。积分不影响对话，稍后会自动重试；持续失败请检查代理 / VPN。';
+      }
+      // 凭据问题：引导去重新登录
+      if (/401|403|unauthor|invalid.?token|expired/i.test(s)) {
+        return '凭据已失效，读不到积分。请在客户端重新登录该账号（或在本页「添加账号」补登）。';
+      }
+      if (/429|rate.?limit|too many/i.test(s)) return '上游限流了，稍后自动重试。';
+      return s; // 认不出的原样显示 —— 不编造原因
+    }
     function downloadCsv(name, header, rows) {
       const esc = (v) => {
         const s = v === null || v === undefined ? '' : String(v);
@@ -2231,7 +2261,7 @@ body.dark .wb-root,
                 + ' · provider ' + g.provider
                 + (g.at ? ' · 更新于 ' + fmtClock(g.at) : '')),
               g.error
-                ? h('div', { className: 'wb-note', style: { margin: '2px 0 0' } }, '读取失败：' + g.error)
+                ? h('div', { className: 'wb-note', style: { margin: '2px 0 0' } }, '读取失败：' + explainFetchError(g.error))
                 : null,
               empty
                 ? h('div', { className: 'wb-note', style: { margin: '2px 0 0' } },
@@ -2320,7 +2350,7 @@ body.dark .wb-root,
             h('div', { className: 'wb-quota-total' }, total === null ? '—' : fmtInt(total)),
             h('div', { className: 'wb-note', style: { margin: '2px 0 0' } },
               error
-                ? '读取失败：' + error
+                ? '读取失败：' + explainFetchError(error)
                 : (packages.length
                   ? `${packages.length} 种套餐${status?.quotaAt ? ' · 更新于 ' + fmtClock(status.quotaAt) : ''}`
                   : '还没有读到套餐明细')),

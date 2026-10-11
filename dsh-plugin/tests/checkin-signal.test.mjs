@@ -45,6 +45,7 @@ import { createContext, Script } from 'node:vm';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..', '..');
 const CLIENT = join(HERE, '..', 'lib', 'client.js');
+const BRIDGE = join(ROOT, 'bridge', 'workbuddy-bridge.mjs');
 const CONSOLE_SERVER = join(ROOT, 'dashboard', 'server.mjs');
 const CONSOLE_HTML = join(ROOT, 'dashboard', 'public', 'index.html');
 
@@ -170,3 +171,57 @@ test('插件 client.js：签到面板用 refreshKey 接上桥侧自动签到信�
   assert.match(src, /autoCheckinAt:\s*status\?\.bridge\?\.health\?\.autoCheckin\?\.at/,
     '应当从宿主快照的 bridge.health.autoCheckin.at 取值（那里才有桥的真实签到时刻）');
 });
+
+/**
+ * 桥的失败日志必须**展开 `e.cause`**。
+ *
+ * ## 背景（实测踩出来的）
+ *
+ * 用户报"积分读取失败"，面板显示：
+ *
+ *     读取失败：{"ok":false,"error":"fetch failed"}
+ *
+ * 于是去翻桥日志 —— 429 行里 **quota 相关 0 行**。两个问题叠在一起：
+ *
+ *   1. `/v1/quota` 的 catch 只 `return json(res, 502, ...)`，**什么都不记**；
+ *   2. 别处（catalog / refresh / checkin）记的是 `e.message`，而 Node 的 `fetch`
+ *      在网络层失败时 message 永远是 `"fetch failed"` —— 真正的原因
+ *      （`ECONNRESET` / `ETIMEDOUT` / `ENOTFOUND`）只在 `e.cause` 里。
+ *
+ * 结果就是：**日志有几十条 "fetch failed"，却完全无法定位是断网、DNS 还是上游挂了**。
+ * 这类"观测缺口"比 bug 本身更麻烦 —— 它让下一次排查同样卡住。
+ *
+ * 这个测试钉住两条：错误描述函数存在且读 `cause`；quota 的失败分支有日志。
+ */
+test('桥：失败日志必须展开 e.cause（否则 "fetch failed" 无法诊断）', () => {
+  const src = read(BRIDGE);
+
+  // ① 必须有展开 cause 的助手
+  const fn = src.match(/function describeFetchError\([\s\S]*?\n\}/);
+  assert.ok(fn, '桥里应当有 describeFetchError()（把 e.cause 展开成可诊断的一行）');
+  assert.match(fn[0], /\.cause/, 'describeFetchError 必须读 e.cause —— 真正的原因在那里');
+  assert.match(fn[0], /code/, 'describeFetchError 应当取出 cause.code（ECONNRESET 等）');
+
+  // ② /v1/quota 的失败分支必须记日志（原先一条都不记）
+  const quotaBlock = src.match(/url\.pathname === '\/v1\/quota'[\s\S]*?\n    \}/);
+  assert.ok(quotaBlock, '应当能定位到 /v1/quota 的处理块');
+  assert.match(quotaBlock[0], /log\(/, '/v1/quota 失败时必须记日志（否则日志里查不到这次失败）');
+  assert.match(quotaBlock[0], /describeFetchError/, '/v1/quota 的日志应当用 describeFetchError 展开原因');
+
+  /*
+   * ③ 其它**网络**失败路径也应当展开（catalog / refresh / checkin）。
+   *
+   * 只查这三个 —— 它们是打上游的。别处（流中断、记账失败、body 过大）不是网络
+   * 错误，`e.message` 本身就够用；对它们套 describeFetchError 是没必要的噪音
+   * （第一版断言写成"全文件不许出现 e.message"，被这四处误报，是断言太宽）。
+   */
+  for (const marker of ['catalog fetch failed', 'refresh error', 'auto checkin']) {
+    const idx = src.indexOf(marker);
+    assert.ok(idx > 0, `应当能找到「${marker}」这条日志`);
+    const line = src.slice(idx, src.indexOf('\n', idx));
+    if (/e\.message/.test(line) && !/describeFetchError/.test(line)) {
+      assert.fail(`「${marker}」是网络路径，日志必须展开 cause：${line.trim()}`);
+    }
+  }
+});
+

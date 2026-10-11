@@ -309,6 +309,32 @@ const ACCOUNT_LABEL = (() => {
 
 const log = (...a) => { if (LOG) console.error(`[${new Date().toISOString()}]`, ...a); };
 
+/**
+ * 把 `fetch` 的错误展开成**可诊断**的一行。
+ *
+ * 为什么需要：Node 的 `fetch` 在网络层失败时统一抛 `TypeError: fetch failed`，
+ * 真正的原因在 `err.cause` 里（`ECONNRESET` / `ETIMEDOUT` / `ENOTFOUND` /
+ * `UND_ERR_CONNECT_TIMEOUT` …）。只记 `e.message` 的话，日志里全是
+ * `fetch failed`，**看不出是断网、DNS、还是上游挂了** —— 实测排查"读取失败"
+ * 时就卡在这里：日志有几十条 `fetch failed`，却完全无法定位。
+ *
+ * `cause` 在 `catch (e)` 里是 `unknown`（TS 严格模式），所以逐层收窄而不是直接取属性。
+ *
+ * @param {unknown} e
+ * @returns {string} 形如 `fetch failed (ECONNRESET: read ECONNRESET)`
+ */
+function describeFetchError(e) {
+  /** @type {any} */
+  const err = e;
+  const msg = err?.message || String(e);
+  const cause = err?.cause;
+  if (!cause) return msg;
+  const code = cause.code || cause.errno || '';
+  const detail = cause.message || '';
+  if (!code && !detail) return msg;
+  return `${msg} (${[code, detail].filter(Boolean).join(': ')})`;
+}
+
 // ── At-rest credential opener (WorkBuddy desktop 5.6.0+) ─────────────────
 // 5.6.0+ seals auth fields in an AES-256-GCM envelope
 // ({"$wbEncrypted":1,"envelope":"<base64 of {suite,keyId,nonce,authTag,ciphertext}>"}).
@@ -820,7 +846,7 @@ async function refreshAuth(auth) {
     return memoryAuth;
   } catch (e) {
     lastRefreshFailedAt = Date.now();
-    log('refresh error', e.message);
+    log('refresh error', describeFetchError(e));
     return null;
   }
 }
@@ -2366,7 +2392,7 @@ function refreshCatalog() {
   catalogRefreshing = fetchCatalog()
     .then((r) => ({ ok: r.upstreamOk, at: catalogCache.at }))
     .catch((e) => {
-      log('catalog fetch failed', e.message);
+      log('catalog fetch failed', describeFetchError(e));
       return { ok: false, at: catalogCache.at };
     })
     .finally(() => { catalogRefreshing = null; });
@@ -2701,7 +2727,7 @@ async function fetchCatalog() {
     } else if (hardError) {
       log('catalog refresh failed; keeping cached catalog');
     }
-  } catch (e) { log('catalog fetch failed', e.message); hardError = true; }
+  } catch (e) { log('catalog fetch failed', describeFetchError(e)); hardError = true; }
   return { models: catalogCache.models, upstreamOk: upstreamOk && !hardError };
 }
 
@@ -2857,7 +2883,15 @@ function maybeAutoCheckin() {
       autoCheckinDoneDay = localDay(Date.now());
       log('auto checkin', autoCheckinState.result, autoCheckinState.credit);
     } catch (e) {
-      const msg = shortError(e);
+      /*
+       * 展开 cause 再截断。
+       *
+       * `shortError` 只负责"单行 + 截断"（防上游异常里夹带整段 HTML），
+       * 它**不展开 `e.cause`** —— 而网络层失败时真正的码（ECONNRESET /
+       * ETIMEDOUT / ENOTFOUND）只在 cause 里，message 永远是 `fetch failed`。
+       * 两个函数职责不同，串起来用。
+       */
+      const msg = shortError(describeFetchError(e));
       // 国际版网关没有积分系统：这不是「失败」，如实区分开
       const noActivity = /no.?activity|not.?support|无.?签到|不存在|not.?found/i.test(msg);
       autoCheckinState = {
@@ -3356,7 +3390,15 @@ async function handleRequest(req, res) {
         const quota = await fetchQuota(readStoredAuth());
         return json(res, 200, { ok: true, ...quota });
       } catch (e) {
-        return json(res, 502, { ok: false, error: e.message });
+        /*
+         * **必须记日志**：原先这里只回 502、什么都不记 —— 于是面板报
+         * "读取失败：fetch failed" 时，桥的日志里**一条都没有**（实测：
+         * 排查时 429 行日志里 quota 相关 0 行，完全无法定位是断网还是上游挂了）。
+         * 用 describeFetchError 展开 cause，才能看出 ECONNRESET / ETIMEDOUT 等。
+         */
+        const detail = describeFetchError(e);
+        log(`quota fetch failed: ${detail}`);
+        return json(res, 502, { ok: false, error: detail });
       }
     }
 
