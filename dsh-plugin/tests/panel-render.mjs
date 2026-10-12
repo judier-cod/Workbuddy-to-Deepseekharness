@@ -455,7 +455,28 @@ try {
     if (valueAfterRoundTrip !== chatSelect.target) problems.push(`切标签页后模型选择被重置（期望 ${chatSelect.target}，实际 ${valueAfterRoundTrip}）`);
     console.log(`对话模型下拉：${chatSelect.count} 个选项，选择 ${chatSelect.target} 生效并保持`);
   }
-  shot = await page.cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
+  /*
+   * 对话测试页截图。
+   *
+   * 先**切回概览再切回来**，并等页面尺寸稳定后再抓 —— 否则
+   * `captureBeyondViewport` 会在"页面高度还没收敛"时按当前 scrollHeight 出图，
+   * 结果就是**上下重复一份页头与页签**（实测踩过：图高 1484px，内容只占上半）。
+   * 重复的页头看起来像渲染坏了，而它只是截图时机问题。
+   */
+  await page.cdp.evaluate(`(() => { const b=[...document.querySelectorAll('.wb-tab')].find(x=>x.textContent==='概览'); b && b.click(); })()`);
+  await sleep(250);
+  await page.cdp.evaluate(`(() => { const b=[...document.querySelectorAll('.wb-tab')].find(x=>x.textContent==='对话测试'); b && b.click(); })()`);
+  await sleep(600);
+  // 量一次实际内容高度，作为截图高度的依据（避免超出内容导致的重复）
+  const chatBox = await page.cdp.evaluate(`(() => {
+    const root = document.querySelector('.wb-root');
+    return root ? Math.ceil(root.getBoundingClientRect().height) : 0;
+  })()`);
+  shot = await page.cdp.send('Page.captureScreenshot', {
+    format: 'png',
+    captureBeyondViewport: true,
+    ...(chatBox > 0 ? { clip: { x: 0, y: 0, width: 885, height: chatBox, scale: 1 } } : {}),
+  });
   writeFileSync(join(OUT_DIR, 'plugin-panel-chat.png'), Buffer.from(shot.result.data, 'base64'));
 
   // 交互：概览页「启动控制台」必须真的发出带面板头的 POST
