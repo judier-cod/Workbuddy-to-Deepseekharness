@@ -243,6 +243,53 @@ try {
   if (beforeExpand.includes('CodeBuddyExtension')) {
     problems.push('账号页默认就显示了登录目录 —— 细节应收起（这正是"看着不方便"的来源）');
   }
+  /*
+   * **面板文案里的 `**粗体**` 必须渲染成真加粗，不能字面显示星号。**
+   *
+   * 回归（实测从面板截图里发现）：文案里写了 70 处 markdown 式强调
+   * （`**重启一次 dsh**`、`**同时可用**`、`**30 天**`…），但面板没有 markdown
+   * 渲染器 —— 于是用户看到的是带星号的原始文本。文案越长越明显。
+   *
+   * 判据：整棵面板的可见文本里**不该出现 `**`**；且确实存在 <b> 元素
+   * （否则可能是有人把星号删了了事 —— 那会丢掉强调，不是修复）。
+   */
+  const boldProbe = await page.cdp.evaluate(`(() => {
+    const root = document.querySelector('.wb-root');
+    const text = root ? root.innerText : '';
+    /*
+     * 只数**成对的 markdown 强调**（\`**文字**\`，文字里不含星号）。
+     *
+     * 不能简单数 \`**\` 出现次数：**脱敏标签本身就含星号**
+     * （\`185****0760\`、\`a3****72@gmail.com\`），那样会把正常的掩码误报成
+     * "没渲染"（实测第一版断言就这么误报了 14 处）。
+     */
+    const stars = (text.match(/\\*\\*[^*\\n]+\\*\\*/g) || []).length;
+    const bolds = [...root.querySelectorAll('b')].map((b) => b.textContent);
+    // 找出残留强调的元素路径（排查用）
+    const where = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = walker.nextNode())) {
+      if (!/\\*\\*[^*\\n]+\\*\\*/.test(n.textContent)) continue;
+      let el = n.parentElement;
+      const path = [];
+      for (let i = 0; i < 3 && el; i += 1) {
+        path.push(el.tagName.toLowerCase() + (el.className ? '.' + String(el.className).split(' ')[0] : ''));
+        el = el.parentElement;
+      }
+      where.push({ t: n.textContent.trim().slice(0, 60), p: path.join(' < ') });
+    }
+    return { stars, bolds: bolds.slice(0, 12), where: where.slice(0, 8) };
+  })()`);
+  if (boldProbe.stars > 0) {
+    problems.push(`面板里有 ${boldProbe.stars} 处字面 \`**\` —— markdown 强调没被渲染成加粗（用户看到的是带星号的原文）`);
+    for (const w of boldProbe.where) console.log(`    · ${JSON.stringify(w.t)}\n      ${w.p}`);
+  }
+  if (boldProbe.bolds.length === 0) {
+    problems.push('面板里一个 <b> 都没有 —— 文案里的 `**强调**` 应当渲染成加粗，不是删掉星号');
+  } else {
+    console.log(`加粗渲染：${boldProbe.bolds.length} 处 <b>（如「${boldProbe.bolds[0]}」）`);
+  }
   await page.cdp.evaluate(`(() => { const b=[...document.querySelectorAll('.wb-btn')].find(x=>x.textContent==='详细信息'); if(b) b.click(); return !!b; })()`);
   await sleep(400);
   const afterExpand = await page.cdp.evaluate("document.querySelector('.wb-root') ? document.querySelector('.wb-root').innerText : ''");

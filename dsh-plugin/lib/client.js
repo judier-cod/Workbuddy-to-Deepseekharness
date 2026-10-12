@@ -38,8 +38,40 @@ window.__ModuleLoader__.load({
      * **数据不能翻**（对话正文、日志行、上游错误原文）：用 `h(Raw, { text })`
      * 包一层，它内部走 `h0`，绕过翻译。
      */
+    /**
+     * 把文本里的 `**粗体**` 变成真的加粗节点。
+     *
+     * 为什么需要：面板文案里写了大量 markdown 式强调（`**重启一次 dsh**`、
+     * `**同时可用**`、`**30 天**`），但面板**没有 markdown 渲染器** ——
+     * 于是星号**字面显示**给用户（实测从面板截图里发现：那一整段读起来是
+     * 「**国际版账号会自动出现在这里**（…）」，星号全在）。
+     *
+     * 为什么不直接删星号：它们标的是"这句里最该注意的部分"，删了就丢了强调；
+     * 而且**翻译表里的英文词条也带星号**，删中文就得同步删英文，两边容易分叉。
+     * 渲染出来才是原本的意图。
+     *
+     * 只处理**行内** `**x**` —— 面板文案只用这一种强调，最小实现比引 markdown
+     * 库合适。没有星号时原样返回（绝大多数文案走这条，零开销）。
+     */
+    function renderBold(text) {
+      const s = String(text);
+      if (!s.includes('**')) return s;
+      const out = [];
+      const re = /\*\*([^*]+)\*\*/g;
+      let last = 0;
+      let m;
+      while ((m = re.exec(s)) !== null) {
+        if (m.index > last) out.push(s.slice(last, m.index));
+        out.push(h0('b', { key: `b${out.length}` }, m[1]));
+        last = m.index + m[0].length;
+      }
+      if (last < s.length) out.push(s.slice(last));
+      // 单个片段就不用包数组，保持返回类型尽量简单
+      return out.length === 1 ? out[0] : out;
+    }
+
     function trChild(c) {
-      if (typeof c === 'string') return translateText(c);
+      if (typeof c === 'string') return renderBold(translateText(c));
       if (Array.isArray(c)) return c.map(trChild);
       return c;
     }
@@ -905,6 +937,18 @@ body.dark .wb-root,
       // ── 计数（括号里带数字）──
       [/^全部（(\d+)）$/, 'All ($1)'],
       [/^全部模型（(\d+)）$/, 'All models ($1)'],
+      /*
+       * 诊断页「登录文件」的账号摘要：`<uin>@<domain> · …（N 个账号，各自独立使用与计费）`。
+       *
+       * 这是**宿主生成的拼接串**（`summarizeAccounts()`），前面的账号列表是数据
+       * （uin 与域名，不该翻），只有括号里那句是界面文案。所以规则只替换括号部分，
+       * 前面的账号原样保留。
+       *
+       * 不写这条的话，英文模式下这一整行会露中文 —— i18n 门禁抓到的正是它
+       * （改夹具让它显示账号之后才暴露：旧夹具给的是文件名，不含这句）。
+       */
+      [/^(.+)（(\d+) 个账号，各自独立使用与计费）$/, (m, list, n) => `${list} (${n} accounts, each billed separately)`],
+      [/^(.+)（(\d+) 个都可用，多账号分组各自独立使用与计费）$/, (m, list, n) => `${list} (${n} available; each account group is billed separately)`],
       /*
        * 请求页的账号筛选下拉。它以前**从不渲染**（夹具里没有 `acct` 字段，
        * 于是 `accounts.length > 1` 恒假、下拉被隐藏），所以这条规则一直缺着也

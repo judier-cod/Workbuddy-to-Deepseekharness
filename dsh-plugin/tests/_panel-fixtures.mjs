@@ -203,7 +203,17 @@ FIXTURES.consoleDiagnose = {
   items: [
     // 真实机器上出现过的误报：诊断库只认 settings.yaml，原生路由它不认识
     { id: 'settings', label: 'dsh 模型路由', status: 'fail', detail: '尚未配置 workbuddy 路由', hint: '在「可用模型」里勾选后保存。DSH Desktop 0.2.0 会在下次启动时把 settings.yaml 导入 profile 的 patch 层' },
-    { id: 'auth', label: '登录文件', status: 'warn', detail: 'workbuddy-desktop-ai.info  ·  workbuddy-desktop.info' },
+    /*
+     * 登录文件：显示的是**账号**，不是文件名。
+     *
+     * 回归：夹具原先给的是 `workbuddy-desktop-ai.info · workbuddy-desktop.info`
+     * （旧行为：把登录文件名拼起来），而代码已经改成按账号去重后显示
+     * `uin@domain`。夹具不跟着改，**截图就会展示一个已经不存在的行为** ——
+     * 看文档的人会以为插件还在堆文件名（实测就是从截图里发现的）。
+     *
+     * 内容要与 `lib/diagnostics.mjs` 的 summarizeAccounts() 同口径。
+     */
+    { id: 'auth', label: '登录文件', status: 'ok', detail: '330000000000@www.codebuddy.cn  ·  450702377403@www.workbuddy.ai（2 个账号，各自独立使用与计费）' },
     { id: 'exe', label: 'WorkBuddy 客户端', status: 'ok', detail: 'E:\\App\\WorkBuddy\\WorkBuddy.exe' },
     { id: 'atrest', label: 'AtRest 密钥', status: 'ok', detail: 'keyId=9127dea1b44020a7（与信封一致）' },
     { id: 'cred', label: '凭据解密', status: 'ok', detail: '账号 330000000000 · 剩余 44 天 9 小时' },
@@ -211,7 +221,7 @@ FIXTURES.consoleDiagnose = {
     { id: 'ref', label: '凭据引用', status: 'ok', detail: '.credentials.yaml 已含 WORKBUDDY_BRIDGE_KEY' },
     { id: 'bundles', label: 'profile bundles', status: 'ok', detail: '4 个，缺失 0 个 · DSH 0.2.0-rc.2' },
   ],
-  summary: { fail: 1, warn: 1, ok: 6 },
+  summary: { fail: 1, warn: 0, ok: 7 },
 };
 FIXTURES.consoleProbe = {
   updatedAt: now - 60000,
