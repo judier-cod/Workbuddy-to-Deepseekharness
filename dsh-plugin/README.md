@@ -372,8 +372,8 @@ npm run panel:check                    # 上面两个一起跑
 | 项 | 结果 |
 |---|---|
 | 纯逻辑测试 | `node --test dsh-plugin/tests/` **30 项全绿**（流协议、工具调用、错误/取消、wire 转换与净化、日志尾部读取、**方法/权限矩阵**、旧路由手术、装配、路由鉴权、.env 优先级、控制台识别与复用、console-api 白名单透传） |
-| 安装 | `plugin_manager install_bundle` 成功，profile 依赖为 `link:E:/workbuddy-to-dsh/dsh-plugin`（源码改动直接可见） |
-| 桥复用 | 复用已在运行的桥（pid 31840，已运行 12h+），未重复拉起 |
+| 安装 | `plugin_manager install_bundle` 成功，profile 依赖为 `link:<你的检出目录>/dsh-plugin`（源码改动直接可见） |
+| 桥复用 | 复用已在运行的桥（不重复拉起） |
 | 控制台复用 | 控制台已在 8792 运行（首页结构标记匹配）→ 插件判定 `running` 并复用，不再拉起第二个 |
 | 原生路由 | `route.registered=true provider=workbuddy`，目录 30 个模型 |
 | **真实模型调用** | 以 `provider: workbuddy` + `model: deepseek-v4.1-flash` 跑通一次真实 agent 轮次，返回「桥已接通。」；桥日志同时出现该请求 |

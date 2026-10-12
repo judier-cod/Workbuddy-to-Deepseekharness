@@ -70,7 +70,7 @@
 ```sh
 # ── 第 1 步：跑起来（所有用法都需要，与 dsh 无关）──────────────────────
 git clone https://github.com/judier-cod/Workbuddy-to-Deepseekharness.git
-cd workbuddy-to-dsh
+cd Workbuddy-to-Deepseekharness
 # 然后双击 启动.cmd —— 桥和控制台都会自动起来，不需要 npm install
 
 # 或者只要桥、不开控制台：
@@ -92,7 +92,7 @@ dsh plugin --profile desktop add github:judier-cod/Workbuddy-to-Deepseekharness
 dsh plugin --profile desktop add ./dsh-plugin-workbuddy-1.5.0.tgz
 
 # 方式三：从源码（插件在 dsh-plugin/ 子目录，接第 1 步的 git clone）
-dsh plugin --profile desktop add workbuddy-to-dsh/dsh-plugin
+dsh plugin --profile desktop add Workbuddy-to-Deepseekharness/dsh-plugin
 # 装完重启一次 dsh；之后：设置 → WorkBuddy
 ```
 

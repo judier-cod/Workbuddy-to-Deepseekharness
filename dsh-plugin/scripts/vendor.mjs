@@ -44,11 +44,17 @@ const ENTRIES = [
  * `usage.jsonl` 是本地用量账本（含用户每次调用的时间/模型/token），
  * `bridge.log` / `console.log` 是日志，`.state.json` 是状态 —— 这些属于使用者本人，
  * 绝不能进分发包（`npm pack` 会把它一起发出去，等于泄漏使用记录）。
+ *
+ * `console.pid` 是**插件自己写的**控制台进程号（用来认领活过 dsh 重启的控制台）。
+ * 它有两个问题：① 是运行时状态，内容是本机 pid，发出去毫无意义；② 它**只在
+ * 本机存在**（`.gitignore` 里也忽略了），于是 `npm pack` 时"本地有、CI 没有"，
+ * 造成**发布产物与门禁验的不是同一份**（实测：本地包 35 项、CI 包 34 项）。
  */
 const SKIP = [
   /\.log$/i,
   /\.jsonl$/i,          // 用量账本
   /\.bak($|-)/i,        // 备份（index.html.bak 之类）
+  /\.pid$/i,            // 控制台进程号（运行时状态，且本地/CI 不一致）
   // **测试文件不进分发包**：bridge.test.mjs 是仓库里的合约测试（要起真桥、
   // 用随机端口），复制进 vendor 既没用又会让 vendor:check 在 CI 上永远不同步
   //（CI 从 git checkout 拿不到它 —— 它不在 ENTRIES 的清单里，是整目录复制时

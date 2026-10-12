@@ -86,13 +86,19 @@ node dsh-plugin/scripts/verify-standalone.mjs# ✅ 12 项全过
 端到端（真实账号）：两个分组各自调模型分别返回 `CN` / `AI`；按 provider 的
 可见性与倍率互不干扰（实测改 A 组不动 B 组）。
 
-### 0.5 环境备忘（本机，覆盖第 10 节的旧记录）
+### 0.5 环境备忘
 
-- **Node v25.2.1**（`C:\Program Files\nodejs\node.exe`）；CI 用 22；DSH 自带 24.21.0。
-- dsh CLI：`D:\Apps\DeepSeekHarness\resources\runtime\cli\bin\dsh.cmd`（ELECTRON_RUN_AS_NODE 包装）。
-- `DSH_HOME=%USERPROFILE%\.dsh`；profile `desktop`；DSH 0.2.0-rc.2。
-- 仓库检出：`D:\deepseek\workbuddy-to-dsh`；远程 `judier-cod/Workbuddy-to-Deepseekharness`（Public）。
-- **git 走代理**：系统代理 `127.0.0.1:7890`（Clash），但 git 不读系统代理。
+> 本节是**交接备注**，里面的绝对路径都是**示例形态**（`C:\Users\demo\…` /
+> `<你的安装目录>\…`）—— 请按你本机的实际位置替换。**它们不参与任何代码逻辑**，
+> 只是告诉你"东西通常在哪"。
+
+- **Node 22+**（CI 用 22；dsh 自带 24.x）。本项目零运行时依赖，Node 版本只需满足
+  dsh 自身要求。
+- dsh CLI：在 `<DeepSeekHarness 安装目录>\resources\runtime\cli\bin\dsh.cmd`
+  （ELECTRON_RUN_AS_NODE 包装）。
+- `DSH_HOME=%USERPROFILE%\.dsh`（Windows）/ `~/.dsh`（macOS、Linux）；profile `desktop`。
+- 仓库检出：`<你的检出目录>`；远程 `judier-cod/Workbuddy-to-Deepseekharness`（Public）。
+- **git 走代理**（如果你在受限网络里）：系统代理如 `127.0.0.1:7890`，但 git 不读系统代理。
   已配 `http.https://github.com.proxy`（只对 GitHub 生效，不动全局）。
   **换网络后跑 `tools/dev/git-proxy.ps1`** —— 它实测直连/代理哪条通再调配置。
 - GitHub 凭据已由 GCM 缓存（`C:\Program Files\Git\mingw64\bin\git-credential-manager.exe`，
