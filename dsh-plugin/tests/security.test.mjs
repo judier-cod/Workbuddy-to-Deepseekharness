@@ -19,6 +19,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -38,6 +39,24 @@ writeFileSync(join(home, 'profiles', 'desktop', 'cordis.patch.yml'), '# 用户�
 const dsh = await import('../../lib/dsh.mjs');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 向内核要一个**空闲端口**（不用随机数）。
+ *
+ * 随机端口不检查占用，撞上就 `EADDRINUSE` —— 那是环境噪声，不是代码问题，
+ * 但会让测试变红。让内核分配端口号能把这个概率降到极低（实测桥测试在 CI 上
+ * 就因为随机端口红过一次）。
+ */
+async function freePort() {
+  const srv = createServer();
+  await new Promise((resolve, reject) => {
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', resolve);
+  });
+  const { port } = srv.address();
+  await new Promise((resolve) => srv.close(resolve));
+  return port;
+}
 
 // ── 1. YAML 注入 ────────────────────────────────────────────────────────
 
@@ -234,7 +253,13 @@ test('分发包卫生：插件 files 清单声明的文件都存在，且许可�
 // ── 3. 控制台：跨站来源 / 静态备份 / 安全头 ──────────────────────────────
 
 test('安全：控制台拒绝外来 Origin、拒绝备份文件、带基础安全头（起真进程打真 HTTP）', { timeout: 60_000 }, async () => {
-  const port = 23000 + Math.floor(Math.random() * 5000);
+  /*
+   * 端口由**内核分配**，不用随机数。
+   *
+   * `23000 + Math.random()*5000` 不检查占用 —— 撞上就 `EADDRINUSE`，测试变红，
+   * 而那不是代码问题（实测桥测试在 CI 上就这么红过一次）。
+   */
+  const port = await freePort();
   const child = spawn(process.execPath, [join(REPO, 'dashboard', 'server.mjs')], {
     cwd: REPO,
     env: {

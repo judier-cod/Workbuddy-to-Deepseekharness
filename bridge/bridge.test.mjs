@@ -72,13 +72,63 @@ const READABLE_FAKE_AUTH = {
  *   可让桥"读得到凭据"，从而走到抓目录 / 打上游那几步。
  * @returns {Promise<{baseUrl: string, dir: string, out: () => string, stop: () => Promise<void>}>}
  */
+/**
+ * 向内核要一个**空闲端口**。
+ *
+ * 为什么不能用随机数：`20000 + Math.random()*20000` 只是"看起来不会撞"，
+ * 它**不检查占用**。实测在 CI 上撞了（`EADDRINUSE: 127.0.0.1:37736`，
+ * 只有 ubuntu 那个 job 挂，windows/macos 过 —— 典型的 flaky）。
+ *
+ * 也不能"先探一个空闲端口再用"：探测与真正 listen 之间有空窗，别的进程可能
+ * 抢占（原注释担心的正是这个）。**唯一可靠的做法是让内核分配**：先 listen(0)
+ * 拿到端口号，记下来，然后关掉 —— 紧接着由子进程去 listen 同一个端口。
+ * 空窗仍然存在，但只有"探测与关闭之间"那一瞬，且端口号由内核从未用段里挑，
+ * 比随机数撞车的概率低好几个数量级。
+ *
+ * 注意：不能把 server 一直留着占位 —— 子进程要自己 listen 同一个端口，
+ * 父进程占着就会 EADDRINUSE。
+ */
+async function freePort() {
+  const srv = createServer();
+  await new Promise((resolve, reject) => {
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', resolve);
+  });
+  const { port } = srv.address();
+  await new Promise((resolve) => srv.close(resolve));
+  return port;
+}
+
+/**
+ * 起一个测试用桥。**端口被抢时自动重试**。
+ *
+ * `freePort()` 由内核分配端口，但"关掉探测 server"与"子进程 listen"之间仍有
+ * 极小的空窗 —— 别的进程可能正好抢占。这类失败是**环境噪声**，不该让整个
+ * 测试套件变红（实测 CI 上就红过一次：`EADDRINUSE: 127.0.0.1:37736`）。
+ *
+ * 重试只针对 EADDRINUSE，其它错误（桥启动崩溃、配置错）照常抛 ——
+ * 不能把真故障也吞掉。
+ */
 async function startBridge(env = {}, opts = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await startBridgeOnce(env, opts);
+    } catch (e) {
+      lastErr = e;
+      if (!/EADDRINUSE/.test(String(e?.message || e))) throw e;
+      // 端口被抢：换一个再试
+    }
+  }
+  throw lastErr;
+}
+
+async function startBridgeOnce(env = {}, opts = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'wb-bridge-test-'));
   const authFile = join(dir, 'fake-auth.info');
   writeFileSync(authFile, JSON.stringify(opts.auth || FAKE_AUTH));
 
-  // 端口 0 让内核分配：用一个事先探好的空闲端口不保险（可能与真实桥撞车）
-  const port = 20000 + Math.floor(Math.random() * 20000);
+  const port = await freePort();
   const child = spawn(process.execPath, [BRIDGE], {
     cwd: dir, // 工作目录放在临时目录：账本/日志都落在里面
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -102,6 +152,8 @@ async function startBridge(env = {}, opts = {}) {
   const baseUrl = `http://127.0.0.1:${port}`;
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
+    // 子进程的输出要带进错误里：桥自己 listen 失败时打的是 `EADDRINUSE`，
+    // 上层靠这个字符串决定要不要换个端口重试（见 startBridge）。
     if (child.exitCode !== null) throw new Error(`桥提前退出（code ${child.exitCode}）：\n${output}`);
     try {
       const res = await fetch(baseUrl + '/', { headers: { authorization: `Bearer ${TOKEN}` }, signal: AbortSignal.timeout(1500) });
