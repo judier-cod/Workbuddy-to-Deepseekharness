@@ -172,6 +172,38 @@ test('分发包卫生：vendor.mjs 的 SKIP 覆盖了每一类运行期数据', 
 });
 
 /**
+ * 两份 `cordis.patch.yml` 必须保持同步（只允许 `name` 不同）。
+ *
+ * 为什么有两份：dsh 对 Loader 行里 **unknown name 是静默跳过**（不报错），
+ * 所以 patch 里的 `name` 必须与"实际安装的那个包"一致：
+ *   - 仓库根（github 直装）→ `workbuddy-to-dsh`
+ *   - `dsh-plugin/`（单文件夹分发 / tgz）→ `dsh-plugin-workbuddy`
+ *
+ * 文件注释里写着"改动时同步两份"—— 但**靠人记着同步迟早会漏**，而且漏了的
+ * 后果很隐蔽：用户装完插件"什么都没发生"，日志里也看不出原因（静默跳过）。
+ * 所以这里机器校验：除 name 行外必须逐行一致。
+ */
+test('两份 cordis.patch.yml 除 name 外必须一致（dsh 对 unknown name 是静默跳过）', () => {
+  const rootPatch = readFileSync(join(REPO, 'cordis.patch.yml'), 'utf8');
+  const pluginPatch = readFileSync(join(PLUGIN_DIR, 'cordis.patch.yml'), 'utf8');
+
+  /** 取「非注释、非空」的有效配置行，并把 name 归一化 —— 注释允许各写各的。 */
+  const effective = (text) => text.split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'))
+    .map((l) => l.replace(/^name:\s*\S+$/, 'name: <PACKAGE>'));
+
+  assert.deepEqual(effective(pluginPatch), effective(rootPatch),
+    '两份 cordis.patch.yml 的有效配置不一致 —— 改一份必须同步另一份（漏了会导致插件装完静默不生效）');
+
+  // 各自 name 必须与实际包名一致
+  assert.match(pluginPatch, /name:\s*dsh-plugin-workbuddy/,
+    'dsh-plugin/cordis.patch.yml 的 name 必须是 dsh-plugin-workbuddy（否则 dsh 静默跳过）');
+  assert.match(rootPatch, /name:\s*workbuddy-to-dsh/,
+    '根 cordis.patch.yml 的 name 必须是 workbuddy-to-dsh（github 直装装的是根包）');
+});
+
+/**
  * 插件的 `files` 清单里声明的每一项都必须**真实存在**。
  *
  * 回归（实测踩到）：清单里写了 `LICENSE` 与 `NOTICE.md`，但 `dsh-plugin/` 下没有
