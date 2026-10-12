@@ -34,7 +34,7 @@
  */
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
@@ -87,13 +87,30 @@ async function download(directUrl, dest, { owner, repo, tag: tg, asset: name }) 
 console.log(`目标：${OWNER}/${REPO}  ${tag}  ${asset}\n`);
 
 // ── 1. 取发布产物（带本地缓存）──────────────────────────────────────────
+/*
+ * 缓存**必须能自己失效**，否则会把"重新上传过附件"这件事藏起来。
+ *
+ * 实测踩到：修完包重新 `gh release upload --clobber` 之后跑 verify:release，
+ * 它复用了缓存里**旧的 35 项包**，报"与本地打包产物不一致" —— 看起来像发布
+ * 有问题，其实是验了个过期的副本。反过来更危险：如果本地包恰好没变、而上游
+ * 附件被换成了别的东西，缓存会报"一致"，等于**验了个假的**。
+ *
+ * 判据：本地打包产物的 mtime 比缓存新 → 缓存作废、重新下载。
+ * 本地没有产物时保持缓存（那种情况下只能验上游那份）。
+ */
 mkdirSync(CACHE, { recursive: true });
 const cached = join(CACHE, `${tag}-${asset}`);
+const localPath = join(ROOT, 'dsh-plugin', asset);
+const localNewer = (() => {
+  if (!existsSync(cached) || !existsSync(localPath)) return false;
+  return statSync(localPath).mtimeMs > statSync(cached).mtimeMs;
+})();
 let pub;
-if (!refresh && existsSync(cached)) {
+if (!refresh && existsSync(cached) && !localNewer) {
   pub = readFileSync(cached);
   console.log(`（复用缓存 ${cached}）`);
 } else {
+  if (localNewer) console.log('（本地产物比缓存新 —— 缓存作废，重新下载）');
   pub = await download(url, cached, { owner: OWNER, repo: REPO, tag, asset });
   writeFileSync(cached, pub);
 }
@@ -101,7 +118,6 @@ const sha = (b) => createHash('sha256').update(b).digest('hex');
 console.log(`发布产物：${pub.length} 字节  sha256 ${sha(pub)}\n`);
 
 // ── 2. 与本地打包产物逐字节比对 ─────────────────────────────────────────
-const localPath = join(ROOT, 'dsh-plugin', asset);
 if (!existsSync(localPath)) {
   console.log(`· 本地没有 ${asset}（没跑过 npm run pack:plugin？），跳过逐字节比对`);
 } else if (pub.equals(readFileSync(localPath))) {
