@@ -76,6 +76,44 @@ const CHANNEL_BLOCK_DELAYS = [1500, 5000];
  * 30 秒是常见中间层默认空闲超时（60s）的一半，留足余量。
  */
 const SSE_HEARTBEAT_MS = Number(process.env.WORKBUDDY_SSE_HEARTBEAT_MS ?? 30_000);
+
+/**
+ * 从上游 429 的文案里解析「什么时候恢复」，返回距现在多少秒（解析不出返回 null）。
+ *
+ * 为什么值得解析：上游的频率限制**不是按秒级窗口**，而是「到某个时刻重置」
+ * （实测 code 6004 的原文：`…your usage will reset at 2026-10-23 15:14:30 UTC+8…`）。
+ * 它却**不返回 Retry-After 头** —— 客户端因此完全不知道该等多久：智能退避只能瞎猜，
+ * 简单的客户端则直接报错给用户。本机 4599 次请求里有 100 次（2.2%）撞上它，
+ * 所以这不是理论问题。
+ *
+ * 解析出来就转成标准 `Retry-After`（秒），让任何 OpenAI/Anthropic 兼容客户端都能
+ * 按规范退避。解析失败**不编造**：返回 null，由调用方退化成「不给该头」——
+ * 宁可没有，也不要给一个错的等待时间（那会让客户端等错方向）。
+ *
+ * 只认文案里明确带时区/UTC 偏移的时刻；纯文本「稍后重试」这类**不猜**。
+ */
+function retryAfterSecondsFromUpstream(text) {
+  if (typeof text !== 'string' || !text) return null;
+  // 形如 `2026-10-23 15:14:30 UTC+8` / `2026-10-23T15:14:30+08:00` / `… UTC`
+  const m = /(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})\s*(?:UTC|GMT)?\s*([+-]\d{1,2})?/.exec(text);
+  if (!m) return null;
+  const [, y, mo, d, h, mi, sec, offRaw] = m;
+  /**
+   * 偏移的两种写法都要认：`UTC+8`（小时）与 `+08:00`（时:分）。
+   * 缺失偏移时**不猜本地时区** —— 服务器时区与本机不一定一致，猜错就是让客户端
+   * 等错方向。这种情况按「解析不出」处理。
+   */
+  if (!offRaw) return null;
+  const offNum = Number(offRaw);
+  if (!Number.isFinite(offNum)) return null;
+  const target = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(sec))
+    - offNum * 3600_000;
+  const delta = target - Date.now();
+  if (!Number.isFinite(delta)) return null;
+  // 已经过去/明显不合理（>30 天）的一律不采信
+  if (delta <= 0 || delta > 30 * 86_400_000) return null;
+  return Math.max(1, Math.ceil(delta / 1000));
+}
 const UPSTREAM_TIMEOUT_MS = Number(process.env.WORKBUDDY_TIMEOUT_MS || 0); // 0 = unlimited (long answers need it)
 
 // ── Upstream keep-alive connection pool ────────────────────────────────────
@@ -3834,7 +3872,22 @@ async function handleRequest(req, res) {
             code: typeof parsed?.code === 'number' ? parsed.code : null,
             error: parsed?.msg || parsed?.message || parsed?.error?.message || text,
           });
-          return json(res, up.status === 200 ? 502 : up.status, parsed || { error: { message: text || `upstream HTTP ${up.status}` } });
+          /*
+           * 上游 429 没有 Retry-After 头，但文案里写着恢复时刻（见
+           * retryAfterSecondsFromUpstream 的注释）。解析出来补上标准头，客户端就能
+           * 按规范退避，而不是盲目重试或直接把错误甩给用户。
+           */
+          const extraHeaders = {};
+          if (up.status === 429) {
+            const seconds = retryAfterSecondsFromUpstream(text);
+            if (seconds !== null) extraHeaders['Retry-After'] = String(seconds);
+          }
+          return json(
+            res,
+            up.status === 200 ? 502 : up.status,
+            parsed || { error: { message: text || `upstream HTTP ${up.status}` } },
+            extraHeaders,
+          );
         }
 
         if (wantStream) {
@@ -4065,13 +4118,23 @@ async function handleRequest(req, res) {
             error: parsed?.msg || parsed?.message || text,
           });
           // 错误体也必须是 Anthropic 的形状，否则客户端只会显示「未知错误」
-          return json(res, up.status === 200 ? 502 : up.status, {
-            type: 'error',
-            error: {
-              type: 'api_error',
-              message: parsed?.msg || parsed?.message || text || `upstream HTTP ${up.status}`,
+          const extraHeaders = {};
+          if (up.status === 429) {
+            const seconds = retryAfterSecondsFromUpstream(text);
+            if (seconds !== null) extraHeaders['Retry-After'] = String(seconds);
+          }
+          return json(
+            res,
+            up.status === 200 ? 502 : up.status,
+            {
+              type: 'error',
+              error: {
+                type: 'api_error',
+                message: parsed?.msg || parsed?.message || text || `upstream HTTP ${up.status}`,
+              },
             },
-          });
+            extraHeaders,
+          );
         }
 
         if (wantStream) {

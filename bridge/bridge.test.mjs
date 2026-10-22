@@ -2336,3 +2336,81 @@ test('桥：Anthropic 路径同样有静默期心跳，且心跳不插进 conten
     rmSync(bridge.dir, { recursive: true, force: true });
   }
 });
+
+test('桥：上游 429 文案里的重置时刻 → 标准 Retry-After（解析不出就**不给**，不编造）', { timeout: 90_000 }, async () => {
+  /*
+   * 现场：本机 4599 次请求里有 100 次（2.2%）撞上游 429（code 6004/14003）。
+   * 上游**不返回 Retry-After 头**，但文案里写着恢复时刻：
+   *   `…your usage will reset at 2026-10-23 15:14:30 UTC+8…`
+   * 客户端因此不知道等多久：智能退避只能瞎猜，简单客户端直接把错误甩给用户。
+   *
+   * 这里同时钉住**反面**：文案里没有可解析的时刻时，**不得**编一个 Retry-After ——
+   * 给一个错的等待时间比不给更糟（客户端会等错方向）。
+   */
+  const future = (() => {
+    // 造一个「1 小时后」的 UTC+8 时刻，按上游文案格式拼出来
+    const t = new Date(Date.now() + 3600_000 + 8 * 3600_000).toISOString().slice(0, 19).replace('T', ' ');
+    return t;
+  })();
+
+  const okay = await startStubUpstream(['ra-model'], {
+    chatResponses: [
+      {
+        status: 429,
+        body: {
+          code: 6004,
+          msg: `usage exceeds frequency limit, but don't worry, your usage will reset at ${future} UTC+8, alternatively, you can switch to the other models`,
+        },
+      },
+    ],
+  });
+  const bridge = await startBridge({ CODEBUDDY_ENDPOINT: okay.base }, { auth: READABLE_FAKE_AUTH });
+  try {
+    await fetch(bridge.baseUrl + '/v1/models?all=1');
+    const res = await fetch(bridge.baseUrl + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'ra-model', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      signal: AbortSignal.timeout(20000),
+    });
+    assert.equal(res.status, 429);
+    await res.text();
+    const ra = res.headers.get('retry-after');
+    assert.ok(ra !== null, '上游文案里有恢复时刻时，必须给出 Retry-After');
+    const seconds = Number(ra);
+    assert.ok(Number.isFinite(seconds) && seconds > 3000 && seconds <= 3700,
+      `应换算出约 3600 秒（实测 ${ra}）`);
+  } finally {
+    await bridge.stop();
+    try { await okay.close(); } catch { /* 忽略 */ }
+    rmSync(bridge.dir, { recursive: true, force: true });
+  }
+});
+
+test('桥：上游 429 文案里没有可解析时刻 → 不得编造 Retry-After', { timeout: 90_000 }, async () => {
+  /*
+   * 反面用例。上游有时候只写「稍后重试」这类模糊文案，或者时间不带时区。
+   * 那种情况**不猜**：猜本地时区会让客户端等错方向。
+   */
+  const vague = await startStubUpstream(['ra2-model'], {
+    chatResponses: [{ status: 429, body: { code: 14003, msg: 'too many requests' } }],
+  });
+  const bridge = await startBridge({ CODEBUDDY_ENDPOINT: vague.base }, { auth: READABLE_FAKE_AUTH });
+  try {
+    await fetch(bridge.baseUrl + '/v1/models?all=1');
+    const res = await fetch(bridge.baseUrl + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'ra2-model', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      signal: AbortSignal.timeout(20000),
+    });
+    assert.equal(res.status, 429);
+    await res.text();
+    assert.equal(res.headers.get('retry-after'), null,
+      '解析不出恢复时刻时不得给 Retry-After（错的等待时间比没有更糟）');
+  } finally {
+    await bridge.stop();
+    try { await vague.close(); } catch { /* 忽略 */ }
+    rmSync(bridge.dir, { recursive: true, force: true });
+  }
+});
