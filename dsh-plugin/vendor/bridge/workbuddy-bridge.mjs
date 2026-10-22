@@ -3553,6 +3553,14 @@ async function handleRequest(req, res) {
         // 自动签到的内存态：桥重启后清空、重新判定（上游幂等兜底）
         autoCheckinEnabled: AUTO_CHECKIN_ENABLED,
         autoCheckin: autoCheckinState,
+        /*
+         * 流式保活的**实际生效值**（不是「配置里写了什么」，而是本进程真的会用多少）。
+         *
+         * 为什么要暴露：心跳间隔默认 30 秒，短请求根本触发不到 —— 想验证「配置到底有没有
+         * 被读到」就只能等一个超过 30 秒的请求，很被动。回传生效值即可一眼确认；
+         * `0` 明确表示**已关闭**（排查「心跳是否干扰某客户端」时用的正是它）。
+         */
+        stream: { heartbeatMs: SSE_HEARTBEAT_MS },
       });
     }
 

@@ -2274,6 +2274,11 @@ test('桥：上游长时间静默时必须发 SSE 心跳，且响应头要立刻
     assert.equal(res.status, 200);
     assert.ok(headerAt < 2000, `响应头必须立刻到（实测 ${headerAt}ms），不能等上游首字节`);
 
+    // 生效值必须可从 /health 读到：心跳默认 30s，短请求触发不到，
+    // 没有这个字段就只能靠「等一个超过 30 秒的请求」来确认配置有没有被读取。
+    const health = await fetch(bridge.baseUrl + '/health', { headers: auth }).then((r) => r.json());
+    assert.equal(health.stream?.heartbeatMs, 400, '/health 必须回传心跳生效值（本用例设了 400ms）');
+
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     const chunks = [];
