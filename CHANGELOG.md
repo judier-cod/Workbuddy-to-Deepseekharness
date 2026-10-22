@@ -61,6 +61,16 @@
 
 ### Fixed
 
+- **诊断把「插件原生路由」误判成「尚未配置 workbuddy 路由」（红点无从修起）**。
+  `readDshStatus()` 原先只认两种手写路由：`settings.yaml` 与 `cordis.patch.yml` 里的
+  `llm-pi-ai` + `workbuddy:`。但插件的**原生路由**根本不需要 `llm-pi-ai` —— 它自己
+  注册 provider，模型也由插件在运行时从桥的 `/v1/models` 取（**不写进 yaml**）。
+  于是用原生路由的用户会一直看到一个红点，被指去改一个不需要改的文件；更糟的是文案
+  还会显示「已注册 0 个模型」（而模型选择器里明明有），进一步误导。
+  修法：新增第三种生效形态判定 —— patch 层配了 `dsh-plugin-workbuddy` 且该 bundle
+  确实装上了（只在 yaml 写名字没装包时 profile 起不来，路由也不存在）；判定抽成可测的
+  纯函数 `isPluginRouteLive(patchText, bundles)`。文案按形态区分：原生路由下不再提模型
+  数量（那是运行时的，不是配置里的）。修后本机诊断 **11 项全绿（0 fail / 0 warn）**。
 - **`check-fingerprint` 的内存炸弹（曾两次把宿主 DSH 一起带崩）**。早期版本把整个
   会话文件解压成一个字符串再 `split('\n')`；实际会话可达 23MB / 14725 帧，解压后
   字符量巨大，直接把机器内存打满（DSH 与它同机，一起被 OOM 杀掉）。改为**逐帧解压、
