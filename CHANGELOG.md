@@ -48,6 +48,15 @@
   漏掉 —— 覆盖检查于是「假装它在、实际从没检查过」。现两种引号都认。
 - **`powered by …` 粗粒度正则的假警报**：改写后的形态（`built on …`）会被再抓一遍。
   现按「黑名单是整句匹配」的事实，只保留整句级候选（自称开头或 > 60 字符）。
+- **两个长期失败的单元测试（测试环境问题，非产品缺陷）**：
+  `findWorkBuddyExe` / `findDshRuntime` 的「文件被删后不复用陈旧缓存」用例一直红。
+  排查结论：某台 Windows 机器上（Node v25.2.1）`fs.rmSync(p, { force: true })` 对该
+  临时目录里的文件**既不删也不报错** —— 删完 `existsSync` 仍是 true、`readdirSync`
+  仍能列出。于是「删掉假安装」这一步实际没生效，缓存当然还命中，断言失败却被读成
+  「产品有陈旧缓存 bug」。改法：测试改用 `unlinkSync` 并**断言删除确实生效**
+  （删不掉就明确报告「环境删不掉文件」，不让业务断言背锅）。
+  产品代码**不使用 `rmSync`**（它只出现在测试清理里），因此对运行时无影响。
+  修完后 `npm run test:lib` 28 pass / 0 fail（此前 26 pass / 2 fail）。
 - **真正修复：国内版把 DSH 的 system 两句开场指纹逐字拉黑 → 桥出站最小改写**。
   症状：2026-10-21 起国内版（copilot.tencent.com）上 DSH **每一轮 agent 请求**都报
   `400 code 11128 Illegal API invocation from an unapproved channel`（上游 displayMsg
