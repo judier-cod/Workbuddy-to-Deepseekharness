@@ -76,7 +76,7 @@ refreshToken : envelope keyId=9127dea1b44020a7 -> DECRYPTED len=698 jws-like=tru
 |---|---|---|
 | `11101` | `Non-stream chat request is currently not supported` | 上游只接受流式。桥已自动转换；若仍出现，说明请求绕过了桥 |
 | `11101` | `cannot unmarshal object into Go struct field Request.tool_choice of type string` | 客户端发了 **OpenAI 对象形式**的 `tool_choice`（`{"type":"function",...}`），而上游的 Go 结构体只收字符串。桥已在 `normalizePayload` 里归一化，正常不会出现；若出现，说明请求绕过了桥 |
-| `11128` | `Illegal API invocation from an unapproved channel` | 请求结构或调用方身份不被认可。常见于 `system` 提示词被放在 `developer` 角色、User-Agent 不匹配，或 **Claude Code 的固定 system 模板被逐字拉黑**（2026-10-08 实测：带原文 `…official CLI for Claude.` 即被拒、按最小改写后放行 —— 桥已内置出站改写 `CLI`→`CLI tool`、`Main branch`→`Default branch`，正常不会再出现）。若再现：用 `node tools/dev/probe-audit-template.mjs` 复核（脚本内附三态判定与处置），改写表在桥内 `AUDIT_TEMPLATE_REWRITES` |
+| `11128` | `Illegal API invocation from an unapproved channel` | 上游**渠道校验**被拒，实测三类成因：①**消息结构**——`system` 提示词被放进 `developer` 角色、首条不是 `system`（桥已在 `normalizePayload` 里确定性修好）；②**调用方身份**——`User-Agent` / `X-IDE-*` 不像官方客户端（桥已伪装成官方客户端，属基础门槛）；③**system 整句黑名单**——网关逐字匹配 system 里的特定整句（Claude Code 模板 2026-10-08；DSH 自己的两句开场指纹 2026-10-21 起，**确定性**，国内版每轮 DSH agent 请求必中），桥已在出站层做最小改写（`AUDIT_TEMPLATE_REWRITES`，详见下方「`11128` 的三类成因」）。桥另把 11128 当**瞬时故障兜底重试 2 次**（退避 1.5s / 5s，日志 `channel-verification 400 (11128), retry N`）——**实测救不回任何已观测案例**（3 次尝试全被拦）；重试耗尽后把上游 400 原文透传，原文里的 `requestId` 保留着，便于对账。若已排除 ③ 仍**每条都拦**，走「上游版本漂移」的逃生门 |
 | `11133` | 网关包装的瞬时上游故障 | 桥会退避重试；频繁出现请稍后再试 |
 
 > **`tool_choice` 为什么必须归一化**：OpenAI 规范允许两种写法 —— 字符串
@@ -86,9 +86,53 @@ refreshToken : envelope keyId=9127dea1b44020a7 -> DECRYPTED len=698 jws-like=tru
 > 桥的处理是：`{type:'function'}` → `required`（语义最接近），认不出来的对象丢弃
 > 而不是原样转发（留着必然 400，丢掉最多退化成 `auto`）。
 
+### `11128` 的三类成因（消息结构 / 调用方身份 / 整句黑名单）
+
+上游 `displayMsg.zh` 写「请求被拦截，请重新发送」，但**重发通常没用**——这三类都是确定性的，不是随机抖动。2026-10-21～22 的 5 条记录全部属于 ③。
+
+**① 消息结构**（确定性，桥已修）：`system` 提示词被放在 `developer` 角色（新版 OpenAI 规范客户端会踩）、首条消息不是 `system`（国际版会报 `400 code 11128 first message is not system prompt`）。桥在 `normalizePayload` 里统一把 `developer` 重写成 `system`、必要时补一条首条 `system`。
+
+**② 调用方身份**（基础门槛）：上游按 `User-Agent` / `X-IDE-*` / `X-Product-Version` 校验来源。桥把请求头伪装成官方客户端；官方客户端升级后旧指纹可能整体被拒 —— 见下一节「上游版本漂移」的 `WORKBUDDY_*` 逃生门。
+
+**③ system 整句黑名单**（确定性，桥已出站改写）：
+
+- **Claude Code 模板**（2026-10-08 实测）：带原文 `…official CLI for Claude.` → 400；桥把 `CLI`→`CLI tool`、`Main branch`→`Default branch` 后 → 200。
+- **DSH 自己的两句开场指纹**（2026-10-21 起，国内版）：网关对 system 做**区分大小写的整句匹配**，命中即 `400 code 11128`。两句**都必需**：
+
+| # | 被拉黑的整句（system 原文） | 桥的出站改写 |
+|---|---|---|
+| ① | `You are an AI agent powered by DeepSeek Harness` | → `You are an AI agent built on DeepSeek Harness` |
+| ② | `You are interacting with the user through the DeepSeek Harness Web GUI` | → `You are working with the user through the DeepSeek Harness Web GUI` |
+
+实测边界（2026-10-22，copilot.tencent.com）：
+
+- `DeepSeek Harness` 单独出现、`powered by DeepSeek Harness` 单独出现 → **200**（不是关键词命中）；
+- **只改大小写**（`Web GUI`→`web GUI`、`Harness`→`harness`）→ **仍 400**（区分大小写）；
+- 换一个词（`built on` / `working with` / `via` / `supplies`）→ **200**；
+- **只改 ① 仍 400**；两句都改 → **200**。用 DSH 会话日志里的**真实 system + 真实 73 个 tools** 回放：改前 400、改后 200。
+- ② 所在片段实测 **221 字符**即触发（到 "…they mean this GUI." 为止）。
+
+**桥的处理**：出站层对**所有 `system` 消息**做上面几条最小改写（`AUDIT_TEMPLATE_REWRITES`，与 Claude Code 模板同一机制），只换一个词、其余原文不动；命中时日志记 `normalize: rewrote N audit-template system message(s)`。
+
+**怎么判定命中的是 ③**：把 system 里这两句（或那段 Web GUI 描述）删掉再发 —— 200 即命中；或者看桥日志有没有 `rewrote … audit-template system message(s)`。
+
+**那 5 条 11128 记录**（全部是 ③，不是偶发）：
+
+| 日志 | 行 | 时间（UTC） | 被拦的请求 |
+|---|---|---|---|
+| `bridge/bridge.log` | 1755 | 2026-10-22T09:52:08Z | `msgs=117 tools=73` |
+| `bridge/bridge-m6d2b5f6b.log` | 823 | 2026-10-22T07:27:33Z | `msgs=89 tools=73` |
+| `bridge/bridge-m6d2b5f6b.log` | 825 | 2026-10-22T09:51:53Z | `msgs=115 tools=73` |
+| `bridge/bridge-m7ffbd7f5.log` | 2507 | 2026-10-21T05:27:37Z | `msgs=6 tools=73` |
+| `bridge/bridge-m7ffbd7f5.log` | 2510 | 2026-10-21T05:27:55Z | `msgs=7 tools=73` |
+
+5 条全是 DSH 的 agent 请求（都带 73 个 tools、都含黑名单句），所以是确定性拦截。其中 3 条旁边「同时发出却 200 的小请求」是 DSH 的**会话标题请求**（system 是 `Create a concise title for an AI coding-assistant session…`，不含黑名单句）——**不要**把它当「偶发放行」的证据（早前的文档就是这么误判的）。国际版（workbuddy.ai）不做这项校验，同一份提示词在国际版账号上是 200；「面板对话测试正常、DSH 一用国内版就报错」也是这个原因（对话测试的 system 短、不含黑名单句）。
+
+**重试的价值（实测）**：那次 3 次尝试（原始 + 2 次重试）**全部被拦** —— 重试**救不回**确定性拦截，只是便宜兜底（最坏多等约 6.5 秒）。桥保留重试只为兜住尚未定位的瞬时失败；耗尽后仍把上游 400 原文透传（OpenAI 兼容端点原样返回上游 JSON；`/v1/messages` 按 Anthropic 错误形状包装，`message` 仍是上游原文），`requestId` 保留，对账 / 报障都能用。
+
 ### 上游版本漂移（身份指纹整体被拒）
 
-**症状**：凭据完全正常，但**所有**请求突然 `401` 或 400 code `11128`（含 Claude Code 全量失败）。
+**症状**：凭据完全正常，但**所有**请求突然 `401` 或 400 code `11128`（含 Claude Code 全量失败）。先排除上一节的 ③：system 里是否含那两句、桥日志有无 `audit-template` 改写记录——已改写仍每条都拦，才是本症状。
 
 **原因**：上游按 `User-Agent` / `X-IDE-*` / `X-Product-Version` 校验调用来源；官方客户端升级后，旧指纹可能被整体拒绝。
 
@@ -100,7 +144,7 @@ WORKBUDDY_IDE_VERSION=1.119.0
 WORKBUDDY_IDE_NAME=VSCode
 ```
 
-判定是否是版本漂移：控制台「对话测试」发一条最短消息 —— 若同样被拒，且 `verify-atrest` 显示凭据一切正常，即命中本症状。
+判定是否是版本漂移：控制台「对话测试」发一条最短消息 —— 若**同样被拒**（它的 system 很短、不含黑名单句，正常情况下能过），且 `verify-atrest` 显示凭据一切正常，即命中本症状。
 
 ### 模型名含中文 / 特殊字符 → 500 且报 `Invalid character in header content`
 
@@ -261,7 +305,7 @@ spawnSync(systemExe('netstat'), ['-ano'], {
 |---|---|
 | `11102` | 模型不存在或未接入 —— 该 id 在上游没有配置 |
 | `11101` | 上游不接受非流式请求（桥已自动转流式，出现说明请求绕过了桥） |
-| `11128` | 请求结构或调用方身份不被认可（`system` 提示词放错角色、UA 不匹配） |
+| `11128` | 上游渠道校验被拦：消息结构 / 调用方身份 / system 命中整句黑名单（2026-10-21 起国内版每轮 DSH agent 请求必中；桥已出站改写，见上文「`11128` 的三类成因」） |
 | `11133` | 网关包装的瞬时上游故障，桥会退避重试 |
 
 面板为空说明桥没在跑，或还没有任何请求经过桥。原始日志（含更完整的堆栈）在

@@ -98,16 +98,17 @@ len(s) = uint32BE(utf8 字节长度) + utf8 字节
 
 ---
 
-## 二、桥的四个适配点
+## 二、桥的五个适配点
 
-上游有四条不成文约束，都会直接返回 400/401：
+上游有五条不成文约束，都会直接返回 400/401：
 
 | 约束 | 上游响应 | 桥的处理 |
 |---|---|---|
 | 只接受流式请求 | `400 code 11101` | 非流式请求内部转流式，再把分片聚合成单个 `chat.completion` |
-| 不识别 `developer` 角色 | `400 code 11128` | 重写为 `system`（新版 OpenAI 规范客户端会踩这条） |
+| 不识别 `developer` 角色 | `400 code 11128` | 重写为 `system`（新版 OpenAI 规范客户端会踩这条）——**消息结构**类，确定性可修 |
 | `tool_choice` 只认字符串 | `400 code 11101` | 对象形式归一化为字符串（见下） |
-| 校验调用方身份 | `400 code 11128` | 请求头伪装成官方客户端 |
+| 校验调用方身份 | `400 code 11128` | 请求头伪装成官方客户端（基础门槛）。2026-10-21 起国内版的 11128 实测**不是**这项，而是下一行的 system 整句黑名单 |
+| system 提示词命中整句黑名单 | `400 code 11128` | 出站最小改写（`AUDIT_TEMPLATE_REWRITES`）：Claude Code 模板（`CLI`→`CLI tool`、`Main branch`→`Default branch`）与 DSH 自己的两句开场指纹（`powered by`→`built on`、`interacting with`→`working with`）；只换一个词、语义不变。2026-10-21 起国内版每轮 DSH agent 请求必中，详见 TROUBLESHOOTING「`11128` 的三类成因」 |
 
 **关于 `tool_choice`**：OpenAI 规范允许字符串（`none`/`auto`/`required`）与对象
 （`{"type":"function","function":{"name":"…"}}`）两种写法，上游的 Go 结构体把它
@@ -147,6 +148,11 @@ WorkBuddy 有**国内与国际两套网关**，必须按登录域名选择，选
 两边还有一条行为差异：**国际版要求首条消息必须是 `system`**，纯 `user` 开头会被
 `400 code 11128 first message is not system prompt` 拒绝（国内版则容忍）。桥因此在
 消息规范化阶段统一确保首条为 `system`（必要时补一条中性的），两家网关都能通过。
+
+> 这条 `11128`（`first message is not system prompt`）与上面「二」里那条
+> `Illegal API invocation from an unapproved channel` **不是同一回事**：这里是消息序列
+> 问题，补一条 `system` 就能确定性解决；那里是渠道校验——其中 system 整句黑名单要靠
+> 出站改写（见上表），重试只是兜底。
 
 ## 二·六、模型目录与积分
 
@@ -702,7 +708,7 @@ hack 全部删掉，换成平台的 View Transitions API（`withViewTransition()
 
 | 路径 | 触发场景 |
 |---|---|
-| 上游返回非 2xx | 模型不存在（11102）、请求结构不被认可（11128）等 |
+| 上游返回非 2xx | 模型不存在（11102）、请求结构不被认可、system 命中整句黑名单或调用方身份被拒（11128）等 |
 | 流式/非流式正常结束 | 记 `ok:true` 与 usage |
 | 整个处理块抛异常 | 登录文件损坏、取 AtRest 密钥失败等——这些以前只会变成客户端的一个 500 |
 

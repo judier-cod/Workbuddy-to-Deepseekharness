@@ -204,6 +204,7 @@ function rawStatus(port, path, headers = {}) {
  */
 async function startStubUpstream(models = ['stub-model'], opts = {}) {
   const seen = [];
+  let chatCallIndex = 0;
   const srv = createServer((req, res) => {
     const path = new URL(req.url, 'http://127.0.0.1').pathname;
     if (path === '/v2/enterprises/personal/models') {
@@ -221,7 +222,7 @@ async function startStubUpstream(models = ['stub-model'], opts = {}) {
       let body = '';
       req.on('data', (c) => { body += c; });
       req.on('end', () => {
-        seen.push({ headers: req.headers, body });
+        seen.push({ headers: req.headers, body, at: Date.now() });
         /*
          * `opts.chatRaw`：模拟「上游 HTTP 200，但返回的不是 SSE」。
          * 网关把错误包成 200 的 HTML 是真实会发生的（见 BUG-2 的用例）。
@@ -229,6 +230,23 @@ async function startStubUpstream(models = ['stub-model'], opts = {}) {
         if (opts.chatRaw !== undefined) {
           res.writeHead(opts.chatStatus || 200, { 'content-type': opts.chatType || 'text/html' });
           return res.end(opts.chatRaw);
+        }
+        /*
+         * `opts.chatResponses`：**按次序**脚本化聊天响应，用来打「上游先失败、重试后成功」这类
+         * 重试」这类时序行为。数组元素二选一：
+         *   - 字符串 `'sse'`      → 正常流式回答
+         *   - `{ status, body }`  → 指定状态码与响应体（对象会被 JSON 序列化）
+         * 用完后**重复最后一个元素**（所以「一直 11128」只写一条即可）。
+         * 每条请求都带 `at`（毫秒时间戳），供断言重试真的等过退避。
+         */
+        if (Array.isArray(opts.chatResponses) && opts.chatResponses.length > 0) {
+          const idx = Math.min(chatCallIndex, opts.chatResponses.length - 1);
+          chatCallIndex += 1;
+          const step = opts.chatResponses[idx];
+          if (step !== 'sse') {
+            res.writeHead(step.status || 400, { 'content-type': 'application/json' });
+            return res.end(typeof step.body === 'string' ? step.body : JSON.stringify(step.body));
+          }
         }
         res.writeHead(200, { 'content-type': 'text/event-stream' });
         res.write('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n');
@@ -917,7 +935,7 @@ test('桥：客户端可控的 model 必须收敛类型与长度（账本/日志
     const over = await post({ model: huge, messages: [{ role: 'user', content: 'hi' }] });
     assert.equal(over.status, 400, '超长 model 必须被本地拒绝');
     const overText = await over.text();
-    assert.ok(overText.length < 1000, `400 响应体必须短（实际 ${overText.length} 字符）—— 不能回显客户端输入`);
+    assert.ok(overText.length < 1000, `400 响应体必须短（实际 ${overText.length} 字符）-- 不能回显客户端输入`);
     assert.ok(!overText.includes(huge), '响应体里不得原样回显超长 model');
 
     // ② 账本行必须有界，否则反复打就能把磁盘灌爆
@@ -1126,6 +1144,75 @@ test('桥：出站 system 已做审计模板最小改写（黑名单原文不得
   }
 });
 
+test('桥：DSH 自己的开场指纹句被逐字拉黑 → 出站必须已改写成非黑名单形态', { timeout: 90_000 }, async () => {
+  /*
+   * 背景（2026-10-22 实测，copilot.tencent.com / 账号 6d2b5f6b）：DSH 的 system
+   * 提示词里有**两句**被逐字拉黑，命中即回
+   *   `400 code 11-128 Illegal API invocation from an unapproved channel`：
+   *   ① `You are an AI agent powered by DeepSeek Harness`
+   *   ② `You are interacting with the user through the DeepSeek Harness Web GUI`
+   * 只改一句仍 400（两句都必需）；改一个词即 200；**只改大小写无效**
+   * （上游做的是区分大小写的整句匹配，不是关键词命中）。
+   *
+   * 这两句在 DSH 每轮 agent 请求里都有，所以症状是「面板对话测试正常、DSH 一用
+   * 国内版就报错」。本用例把「出站不含这两句、且含最小改写后的形态」钉死为回归。
+   */
+  const stub = await startStubUpstream(['dsh-model']);
+  const bridge = await startBridge({ CODEBUDDY_ENDPOINT: stub.base }, { auth: READABLE_FAKE_AUTH });
+  try {
+    await fetch(bridge.baseUrl + '/v1/models?all=1'); // 预热目录，让预校验认识 dsh-model
+
+    const res = await fetch(bridge.baseUrl + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'dsh-model',
+        stream: true,
+        messages: [
+          {
+            role: 'system',
+            // content 用 parts 数组：这正是 DSH 实际发出的形状（会话日志实测）
+            content: [
+              {
+                type: 'text',
+                text: 'You are an AI agent powered by DeepSeek Harness.\n\n'
+                  + 'You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names.\n\n'
+                  + 'Keep the rest of this prompt intact.',
+              },
+            ],
+          },
+          { role: 'user', content: 'ping' },
+        ],
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    assert.equal(res.status, 200);
+    await res.text();
+
+    assert.equal(stub.seen.length, 1, '桥应向上游发出恰好一条聊天请求');
+    const outbound = JSON.parse(stub.seen[0].body);
+    const sysText = outbound.messages
+      .filter((m) => m.role === 'system')
+      .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content)))
+      .join('\n');
+    assert.ok(!sysText.includes('You are an AI agent powered by DeepSeek Harness'),
+      '出站 system 不得含黑名单整句 ①（…powered by DeepSeek Harness）');
+    assert.ok(!sysText.includes('You are interacting with the user through the DeepSeek Harness Web GUI'),
+      '出站 system 不得含黑名单整句 ②（…interacting with the user through … Web GUI）');
+    assert.ok(sysText.includes('You are an AI agent built on DeepSeek Harness'),
+      '应含 ① 的最小改写形态（built on）');
+    assert.ok(sysText.includes('You are working with the user through the DeepSeek Harness Web GUI'),
+      '应含 ② 的最小改写形态（working with）');
+    assert.ok(sysText.includes('Keep the rest of this prompt intact.'),
+      '改写必须是最小改写：提示词其余内容不得被动');
+  } finally {
+    await bridge.stop();
+    try { await stub.close(); } catch { /* 忽略 */ }
+    rmSync(bridge.dir, { recursive: true, force: true });
+  }
+});
+
+
 test('桥：出站身份指纹可用 env 覆盖（上游版本漂移时的逃生门）', { timeout: 90_000 }, async () => {
   // 上游按 UA / X-IDE-* / X-Product-Version 校验调用来源；官方客户端升级后
   // 旧指纹可能整体被拒。三个值必须能用 .env（→ bridgeEnv → 桥）覆盖，
@@ -1193,7 +1280,7 @@ test('桥：本地限流 reject 模式 —— 上限 N 时上游恰好收到 N �
     assert.equal(r2.status, 200);
     assert.equal(r3.status, 429, '第 3 条必须被限流拒绝');
     assert.ok(Number(r3.headers.get('retry-after')) >= 1, 'Retry-After 头必须存在且 ≥1 秒');
-    assert.equal(stub.seen.length, 2, '上游恰好收到 2 条 —— 被限流的请求不得打上游');
+    assert.equal(stub.seen.length, 2, '上游恰好收到 2 条 -- 被限流的请求不得打上游');
 
     // 账本归因：被限流的请求要留下 rate_limited 痕迹（控制台据此可见）
     await new Promise((r) => setTimeout(r, 100)); // 等账本落盘
@@ -1486,7 +1573,7 @@ test('桥：畸形 Host 头回 400，且进程不被带走', { timeout: 30_000 }
     const health = await fetch(`${bridge.baseUrl}/health`, {
       headers: { authorization: `Bearer ${TOKEN}` }, signal: AbortSignal.timeout(3000),
     });
-    assert.ok(health.status > 0, '桥必须还活着 —— 畸形 Host 不该让进程退出');
+    assert.ok(health.status > 0, '桥必须还活着 -- 畸形 Host 不该让进程退出');
     assert.ok(
       !/ERR_INVALID_URL|Unhandled/i.test(bridge.out()),
       `输出里不该有未捕获异常：\n${bridge.out().slice(-300)}`,
@@ -1528,7 +1615,7 @@ test('桥：上游 200 但不是 SSE → 记失败，不回「空回答成功」
     const ledger = readFileSync(join(bridge.dir, 'usage.jsonl'), 'utf8')
       .split('\n').filter(Boolean).map((l) => JSON.parse(l));
     const last = ledger[ledger.length - 1];
-    assert.equal(last.ok, false, '账本必须记失败 —— 否则控制台把它算作成功（静默错数据）');
+    assert.equal(last.ok, false, '账本必须记失败 -- 否则控制台把它算作成功（静默错数据）');
   } finally {
     await bridge.stop();
     try { await stub.close(); } catch { /* 忽略 */ }
@@ -1964,7 +2051,7 @@ test('桥：推理档位记进账本并可从接口读出（回归：面板看�
 
     // ② /v1/requests 回传（新的在前）
     const reqs = await (await fetch(`${bridge.baseUrl}/v1/requests?limit=10`, { headers: auth })).json();
-    assert.equal(reqs.requests[0].effort, '', '不带档位的那条应回空串（前端显示 —）');
+    assert.equal(reqs.requests[0].effort, '', '不带档位的那条应回空串（前端显示 -）');
     const highRow = reqs.requests.find((r) => r.effort === 'high');
     assert.ok(highRow, '/v1/requests 必须回传 effort，否则面板无法显示"思考档位"');
 
@@ -1977,6 +2064,97 @@ test('桥：推理档位记进账本并可从接口读出（回归：面板看�
     assert.equal(byKey['(默认)'], 1, '没发档位的归 "(默认)"，与显式选 low 不是一回事');
     const sum = usage.efforts.reduce((n, e) => n + e.calls, 0);
     assert.equal(sum, usage.total.calls, '各档位之和必须等于 total.calls');
+  } finally {
+    await bridge.stop();
+    try { await stub.close(); } catch { /* 忽略 */ }
+    rmSync(bridge.dir, { recursive: true, force: true });
+  }
+});
+
+test('桥：11-128 一次后重试成功 → 客户端无感（兜底重试）', { timeout: 90_000 }, async () => {
+  /*
+   * 说明：11-128 的已知成因都是**确定性**的（黑名单整句 / 消息结构 / 身份校验），
+   * 桥在出站层已把 DSH 的两句指纹改写成非黑名单形态（见 AUDIT_TEMPLATE_REWRITES）。
+   * 这里的重试只是**兜底**（集群节点间生效时间可能不同步）—— 实测它救不回
+   * 确定性拦截，所以只给 2 次、不指望它解决问题。
+   *
+   * 以下 stub 模拟「先回 11-128、重试即成功」：
+   *   400 {"code":11128,"msg":"Illegal API invocation from an unapproved channel",
+   *        "displayMsg":{"zh":"请求被拦截，请重新发送"}}
+   * 上游自己让你「重新发送」，而它以前是直接透传给客户端的 —— 用户在 DSH 里看到
+   * 一次拦截就得自己再发一遍。本用例钉死：桥自己重试一次，客户端只看到 200。
+   */
+  const stub = await startStubUpstream(['flaky-model'], {
+    chatResponses: [
+      {
+        status: 400,
+        // 用**上游原文**：code 是裸的 11-128（不是合法 JSON），桥按文本匹配错误码。
+        // 若写成对象 { code: 11-128 }，JS 会把它求值成 -117 —— 测的就不是真实行为了。
+        body: "{\"code\":11-128,\"msg\":\"Illegal API invocation from an unapproved channel\",\"requestId\":\"stub-11-128-1\",\"displayMsg\":{\"en\":\"Request blocked. Please send it again\",\"zh\":\"请求被拦截，请重新发送\"}}",
+      },
+      'sse',
+    ],
+  });
+  const bridge = await startBridge({ CODEBUDDY_ENDPOINT: stub.base }, { auth: READABLE_FAKE_AUTH });
+  try {
+    await fetch(bridge.baseUrl + '/v1/models?all=1'); // 预热目录，让预校验认识 flaky-model
+
+    const res = await fetch(bridge.baseUrl + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'flaky-model', messages: [{ role: 'user', content: 'hi' }] }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const bodyText = await res.text();
+
+    assert.equal(res.status, 200, '11128 一次后重试成功：客户端必须拿到 200，而不是那个 400');
+    assert.match(bodyText, /ok/, '重试成功的内容要真的回给客户端');
+    assert.equal(stub.seen.length, 2, '上游应收到恰好 2 条聊天请求（原始 + 1 次重试）');
+    const gap = stub.seen[1].at - stub.seen[0].at;
+    assert.ok(gap >= 1200, `重试必须真的等过一次退避（约 1.5s），实测间隔 ${gap}ms`);
+  } finally {
+    await bridge.stop();
+    try { await stub.close(); } catch { /* 忽略 */ }
+    rmSync(bridge.dir, { recursive: true, force: true });
+  }
+});
+
+test('桥：11128 持续拦截 → 只重试 2 次就如实透传上游 400（不拖成 40 秒）', { timeout: 90_000 }, async () => {
+  /*
+   * 边界：身份若被**整体**拒绝（见 TROUBLESHOOTING「上游版本漂移」），11128 会一直回。
+   * 那时多试无益 —— 契约是只重试 2 次（退避 1.5s / 5s），然后把上游 400 原文
+   * 照原样交给客户端（含 requestId，用户可对账），**不得**吞成 500 或空响应，
+   * 也**不得**退化成 11133 那样的 4 次长退避（1+4+10+25 秒）。
+   */
+  const stub = await startStubUpstream(['blocked-model'], {
+    chatResponses: [
+      {
+        status: 400,
+        // 用**上游原文**：code 是裸的 11-128（不是合法 JSON），桥按文本匹配错误码。
+        // 若写成对象 { code: 11-128 }，JS 会把它求值成 -117 —— 测的就不是真实行为了。
+        body: "{\"code\":11-128,\"msg\":\"Illegal API invocation from an unapproved channel\",\"requestId\":\"stub-11-128-persistent\",\"displayMsg\":{\"en\":\"Request blocked. Please send it again\",\"zh\":\"请求被拦截，请重新发送\"}}",
+      },
+    ],
+  });
+  const bridge = await startBridge({ CODEBUDDY_ENDPOINT: stub.base }, { auth: READABLE_FAKE_AUTH });
+  try {
+    await fetch(bridge.baseUrl + '/v1/models?all=1');
+
+    const startedAt = Date.now();
+    const res = await fetch(bridge.baseUrl + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'blocked-model', messages: [{ role: 'user', content: 'hi' }] }),
+      signal: AbortSignal.timeout(60000),
+    });
+    const bodyText = await res.text();
+    const elapsed = Date.now() - startedAt;
+
+    assert.equal(res.status, 400, '持续 11128 时必须如实回 400，不得包装成 200/500');
+    assert.ok(bodyText.includes('unapproved channel'), '上游原文（unapproved channel 那句）要透传给客户端');
+    assert.ok(bodyText.includes('persistent'), 'requestId 也要透传，用户才能对账');
+    assert.equal(stub.seen.length, 3, '只重试 2 次：上游总计应收到 3 条聊天请求');
+    assert.ok(elapsed < 20_000, `两次退避合计约 6.5s，不能拖到 11133 那样的 40s+，实测 ${elapsed}ms`);
   } finally {
     await bridge.stop();
     try { await stub.close(); } catch { /* 忽略 */ }

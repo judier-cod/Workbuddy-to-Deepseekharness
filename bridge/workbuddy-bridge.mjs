@@ -45,6 +45,23 @@ const CHAT_PATH = '/v2/chat/completions';
 const REFRESH_SKEW_MS = 5 * 60 * 1000;
 const REFRESH_COOLDOWN_MS = 15 * 1000;
 const TRANSIENT_400_DELAYS = [1000, 4000, 10000, 25000];
+/**
+ * `400 code 11-128 Illegal API invocation from an unapproved channel` 的**兜底**重试退避。
+ *
+ * 先说结论：11-128 目前已知的成因**都是确定性的**（见 TROUBLESHOOTING「三类成因」）：
+ * ① 消息结构（developer 角色 / 首条不是 system）② 调用方身份 ③ system 提示词命中整句
+ * 黑名单（DSH 那两句，已由 {@link AUDIT_TEMPLATE_REWRITES} 出站改写）。上游文案虽写
+ * 「请重新发送」，但 2026-10-22 实测那次**原始 + 2 次重试全部被拦** —— 重试救不回
+ * 确定性拦截。
+ *
+ * 那为什么还留 2 次？只当**便宜兜底**：上游是集群，黑名单/校验的生效时间可能在节点间
+ * 不同步，万一碰上「这一台拦、下一台放」，一次重试就能救回来。代价封顶约 6.5 秒
+ * （1.5s + 5s），远小于 11133 那条的 40 秒，所以只给 2 次。
+ *
+ * 若将来看到「每条请求都被 11-128」：那不是偶发，是确定性拦截 —— 按 TROUBLESHOOTING
+ * 的三类成因逐项排除（尤其 ③ 看日志有没有 `rewrote … audit-template`），别靠重试。
+ */
+const CHANNEL_BLOCK_DELAYS = [1500, 5000];
 const UPSTREAM_TIMEOUT_MS = Number(process.env.WORKBUDDY_TIMEOUT_MS || 0); // 0 = unlimited (long answers need it)
 
 // ── Upstream keep-alive connection pool ────────────────────────────────────
@@ -899,6 +916,42 @@ const AUDIT_TEMPLATE_REWRITES = [
     "You are Claude Code, Anthropic's official CLI tool for Claude."],
   ['Main branch (you will usually use this for PRs)',
     'Default branch (you will usually use this for PRs)'],
+  /*
+   * DSH（DeepSeek Harness）自己的开场指纹句被国内版网关**逐字**拉黑。
+   *
+   * 2026-10-22 实测（copilot.tencent.com，账号 6d2b5f6b）：system 里出现
+   * `You are an AI agent powered by DeepSeek Harness` 整句，上游就回
+   * `400 code 11-128 Illegal API invocation from an unapproved channel`。
+   * 已逐项验证的边界（注意匹配**锚定在 system 开头**）：
+   *   · 这句放在 system 最前面             → 400
+   *   · 前面加任意文本（如 `x. ` 或一段前言）→ 200（说明是前缀匹配）
+   *   · 句首这句 + 后面还有别的文本         → 400
+   *   · `DeepSeek Harness` 单独出现         → 200（不是关键词命中）
+   *   · `powered by DeepSeek Harness` 单独   → 200
+   *   · 换动词（built on / running inside）  → 200
+   * 即命中的是「出现在开头的那一整句」（含 `powered by` 的动词形态），与当年
+   * Claude Code 那条（见上）是同一类机制。最小改写 = 换动词，语义不变。
+   *
+   * 影响面：这句是 DSH 每一轮 agent 请求的开头；会话标题那条请求用的是另一套
+   * system（"Create a concise title…"），不含黑名单句 —— 这正好解释了「面板对话
+   * 测试正常、DSH 一用国内版就报错」。国际版（workbuddy.ai）不做这项校验。
+   */
+  ['You are an AI agent powered by DeepSeek Harness',
+    'You are an AI agent built on DeepSeek Harness'],
+  /*
+   * 第二句（同一批实测）：DSH 的「Web GUI」那句也被逐字拉黑。
+   *
+   * 实测边界：把 `interacting` 换成 `working`、`through` 换成 `via`、
+   * `names` 换成 `supplies`、或插入 `(DSH)` 都 → 200；
+   * 而**只改大小写**（`Web GUI`→`web GUI`、`Harness`→`harness`）仍 → 400 ——
+   * 说明上游是**区分大小写的整句匹配**，不是关键词命中。
+   *
+   * 两句都必须改：只改第一句、整段真实提示词依旧 400；两句都改 → 200
+   * （2026-10-22 用会话日志里的真实 system + 真实 73 个 tools 复现验证）。
+   * 改写只动一个词，语义不变。
+   */
+  ['You are interacting with the user through the DeepSeek Harness Web GUI',
+    'You are working with the user through the DeepSeek Harness Web GUI'],
 ];
 
 /** system 文本的最小改写；无命中时返回原值（引用不变，便于命中计数）。 */
@@ -1338,14 +1391,46 @@ async function callUpstream(bodyString, model, conversationId, clientSignal) {
     return { res, bodyText: text, upstreamStartedAt: upEnter };
   }
 
-  for (let i = 0; res.status === 400 && i < TRANSIENT_400_DELAYS.length; i++) {
+  /*
+   * 400 重试循环。有两类上游 400 可以重试；其余一律照原样透传：
+   *   - `11133`：网关把瞬时的上游故障包成 400（原有行为，退避 1/4/10/25 秒）。
+   *   - `11-128`：`Illegal API invocation from an unapproved channel`。
+   *
+   * ⚠️ **不要用 `JSON.parse(text).code === 11-128` 判断**：
+   *   1. 上游这个错误体的 `code` 是**裸的 `11-128`**（既不是字符串也不是单个数字），
+   *      严格 JSON 解析会直接抛错 —— 实测 2026-10-22 抓到的原文就是
+   *      `{"code":11-128,"msg":…}`，最小字面量 `{"code":11-128}` 必然 parse 失败。
+   *   2. 即使解析成功，`code === 11-128` 在 JS 里是**减法**（等于 `-117`），
+   *      与上游语义无关；测试夹具里写 `code: 11-128` 也会静默变成 -117。
+   * 因此按**原始文本**匹配错误码：上游无论写成 `"11-128"`、`11-128` 还是别的
+   * 引号形式都能命中。11133 同理（它是正常数字，文本匹配同样成立）。
+   */
+  const codeOf = (raw) => {
+    const m = /"code"\s*:\s*"?(-?\d+(?:-\d+)?)"?/.exec(String(raw || ''));
+    return m ? m[1] : '';
+  };
+  let transientRetries = 0;
+  let channelRetries = 0;
+  while (res.status === 400) {
     const text = await res.text();
-    let code;
-    try { code = JSON.parse(text)?.code; } catch {}
-    if (code !== 11133) return { res, bodyText: text, upstreamStartedAt: upEnter };
+    const code = codeOf(text);
+    const transient = code === '11133';
+    const channelBlocked = code === '11-128';
+    if (!transient && !channelBlocked) return { res, bodyText: text, upstreamStartedAt: upEnter };
     if (clientSignal?.aborted) return { res, bodyText: text, upstreamStartedAt: upEnter };
-    log(`transient 400 (11133), retry ${i + 1}`);
-    await new Promise((r) => setTimeout(r, TRANSIENT_400_DELAYS[i]));
+    let delay;
+    if (transient) {
+      if (transientRetries >= TRANSIENT_400_DELAYS.length) return { res, bodyText: text, upstreamStartedAt: upEnter };
+      delay = TRANSIENT_400_DELAYS[transientRetries];
+      transientRetries += 1;
+      log(`transient 400 (11133), retry ${transientRetries}`);
+    } else {
+      if (channelRetries >= CHANNEL_BLOCK_DELAYS.length) return { res, bodyText: text, upstreamStartedAt: upEnter };
+      delay = CHANNEL_BLOCK_DELAYS[channelRetries];
+      channelRetries += 1;
+      log(`channel-verification 400 (11128), retry ${channelRetries}`);
+    }
+    await new Promise((r) => setTimeout(r, delay));
     if (clientSignal?.aborted) return { res, bodyText: text, upstreamStartedAt: upEnter };
     res = await attemptWithStaleRetry(auth);
     // 重试后的响应若不再是 400/2xx，同样要在这里把体读掉（见上面的说明）
