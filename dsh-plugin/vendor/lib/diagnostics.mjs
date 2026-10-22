@@ -86,6 +86,23 @@ export function humanDuration(ms) {
   return `${m} 分`;
 }
 
+/**
+ * 格式化「间隔」类时长（与 humanDuration 分工不同）。
+ *
+ * 为什么不能复用 humanDuration：它最小单位是**分**，且 0 会显示成「已过期」——
+ * 那是为「令牌剩余有效期」写的语义。拿它显示「30 秒心跳间隔」会得到「每 0 分」
+ * 这种既错又容易吓到人的文案（实测踩过）。间隔类时长应当保留秒。
+ */
+function humanInterval(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '—';
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s} 秒`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return s % 60 ? `${m} 分 ${s % 60} 秒` : `${m} 分`;
+  const h = Math.floor(m / 60);
+  return m % 60 ? `${h} 小时 ${m % 60} 分` : `${h} 小时`;
+}
+
 // ── 桥探测 ──────────────────────────────────────────────────────────────
 
 async function bridgeFetch(path, timeoutMs = 5000) {
@@ -564,6 +581,68 @@ export async function diagnose() {
   push('bridge', '桥服务', health.ok ? 'ok' : health.running ? 'warn' : 'fail',
     health.running ? `${config.bridge.host}:${config.bridge.port} 已响应` : `${config.bridge.host}:${config.bridge.port} 未监听`,
     health.ok ? '' : '点「启动桥服务」');
+
+  /*
+   * 下面三项是**运行时健康信号**，把原先只能敲命令/看日志才知道的事搬到面板上。
+   * 数据全部来自桥的 /health（`fp` / `st` / `proc`），不额外发请求、不耗额度。
+   *
+   * 只在桥确实在响应时展示：桥没起来时这些字段本来就是 undefined，硬渲染会变成
+   * 一排「未知」的红点，反而淹没真正的问题（「桥服务」那条已经报了 fail）。
+   */
+  const hb = health.body || null;
+  if (health.ok && hb) {
+    /*
+     * ① 指纹改写命中：上游「悄悄加黑名单」的最早信号。
+     *    rewrites 只增不减；它由 0 变正说明改写表在干活（正常）。
+     *    若某条**不该命中**的规则开始涨，或 rewrites 猛涨，就该去查是不是上游改了规则。
+     */
+    const fp = hb.fingerprints;
+    if (fp && typeof fp.rewrites === 'number') {
+      const hot = (fp.byRule || []).filter((r) => r.hits > 0);
+      push('fingerprint', '指纹改写', 'ok',
+        fp.rewrites > 0
+          ? `已改写 ${fp.rewrites} 次${hot.length ? `（${hot.map((r) => `#${r.rule}×${r.hits}`).join(' ')}）` : ''}`
+          : '本次进程尚未命中（正常：没遇到黑名单句就不改写）',
+        fp.rewrites > 0
+          ? '上游加黑名单是悄悄做的；若 rewrites 突然持续增长，跑 npm run check:fingerprint 复核改写表是否仍覆盖'
+          : '');
+    }
+
+    /*
+     * ② 流式心跳：上游静默时靠它保活，避免「答到一半断/转圈报网络错误」。
+     *    0 表示**已关闭**——那是排查「心跳是否干扰某客户端」时才该有的状态，
+     *    平时见到 0 要给个警告，否则用户不知道自己失去了这层保护。
+     */
+    const st = hb.stream;
+    if (st && typeof st.heartbeatMs === 'number') {
+      push('heartbeat', '流式心跳',
+        st.heartbeatMs > 0 ? 'ok' : 'warn',
+        st.heartbeatMs > 0 ? `每 ${humanInterval(st.heartbeatMs)} 发一帧注释保活` : '已关闭（0）',
+        st.heartbeatMs > 0
+          ? ''
+          : '上游长时间静默时客户端可能被判超时；除非在排查客户端兼容问题，建议恢复默认（WORKBUDDY_SSE_HEARTBEAT_MS=30000）');
+    }
+
+    /*
+     * ③ 进程级请求计数：一眼看出「桥到底有没有在干活」以及失败占比。
+     *    失败数按 byStatus 里非 2xx 的总和算——它与 errors 的口径不同
+     *    （errors 只记真正的异常路径），所以两个都报，避免用户以为数字打架。
+     */
+    const proc = hb.process;
+    if (proc && typeof proc.requests === 'number') {
+      const failed = Object.entries(proc.byStatus || {})
+        .filter(([k]) => !/^2/.test(k))
+        .reduce((n, [, v]) => n + (Number(v) || 0), 0);
+      const rate = proc.requests > 0 ? Math.round((failed / proc.requests) * 100) : 0;
+      push('requests', '请求计数',
+        failed === 0 ? 'ok' : rate >= 30 ? 'warn' : 'ok',
+        `成功 ${proc.requests - failed} · 失败 ${failed}（${rate}%）`
+          + (proc.rateLimited ? ` · 本地限流 ${proc.rateLimited} 次` : ''),
+        rate >= 30
+          ? '失败占比偏高：看「最近请求」里的错误码（11128 见 docs/TROUBLESHOOTING.md，429 多为按模型的频率限制）'
+          : '');
+    }
+  }
 
   const dsh = readDshStatus();
   push('settings', 'dsh 模型路由', dsh.routeLive ? 'ok' : 'fail',
