@@ -130,6 +130,52 @@ refreshToken : envelope keyId=9127dea1b44020a7 -> DECRYPTED len=698 jws-like=tru
 
 **重试的价值（实测）**：那次 3 次尝试（原始 + 2 次重试）**全部被拦** —— 重试**救不回**确定性拦截，只是便宜兜底（最坏多等约 6.5 秒）。桥保留重试只为兜住尚未定位的瞬时失败；耗尽后仍把上游 400 原文透传（OpenAI 兼容端点原样返回上游 JSON；`/v1/messages` 按 Anthropic 错误形状包装，`message` 仍是上游原文），`requestId` 保留，对账 / 报障都能用。
 
+#### 怎么尽早发现「上游又加了新黑名单」
+
+黑名单是上游**悄悄加的** —— 2026-10-21 那两句上线时没有任何公告，表现只是「突然全报 11-128」。为此桥和工具链各加了一道哨兵：
+
+**① 桥的运行时计数（在线，随时可看）**
+
+`GET /health` 新增 `fingerprints` 段：
+
+```json
+"fingerprints": {
+  "rewrites": 2,
+  "byRule": [
+    { "rule": 1, "preview": "You are Claude Code, Anthropic's official CLI for …", "hits": 0 },
+    { "rule": 2, "preview": "Main branch (you will usually use this for PRs)", "hits": 0 },
+    { "rule": 3, "preview": "You are an AI agent powered by DeepSeek Harness", "hits": 2 },
+    { "rule": 4, "preview": "You are interacting with the user through the DeepS…", "hits": 1 }
+  ]
+}
+```
+
+- `rewrites`：本进程累计改写次数（**只增不减**，按 `from` 原文分桶，规则增删不串位）。
+- `byRule`：逐条列出**每条规则**（含 0 命中的），排查时才知道总共有几条在守、是哪条在命中。
+- 只回命中数与句子**摘要**（前 48 字符），不回原文、不记对话内容。
+
+**怎么用**：平时它是个「改写表在干活」的健康信号；一旦某天 `rewrites` 突然从 0 变成持续增长，或某条你没预期的规则开始命中，就是上游改了黑名单 —— 此时用下面的工具复核。
+
+**② 离线覆盖检查（不花额度，适合升级后/发版前跑）**
+
+```cmd
+npm run check:fingerprint
+```
+
+它从**本机最新的 DSH 会话日志**里取出真实 system 提示词，逐条比对改写表：命中说明改写表对得上；同时报告 system 里**仍未覆盖**的自称类句子（候选新黑名单）。退出码 1 = 疑似有新黑名单，需要真机复核。
+
+> 内存安全：会话文件可达 20MB+ / 上万帧。本工具**逐帧解压、拿到 system 就停**（实测 23MB 文件只扫 5 帧），并有 `--max-frames` 与堆内存闸；早期的整文件解压版本会吃满内存（曾连 DSH 一起带崩两次，已修）。
+
+**③ 真机二分定位（确认候选句子真的会被拦）**
+
+```cmd
+npm run probe:fingerprint -- --system-file <system.txt> --port 8790 --model deepseek-v4.1-flash
+```
+
+对运行中的桥发真实请求（**会消耗账号额度**），用二分把触发片段压到最短。它会把「429 限流」和「没触发」分开处理 —— 限流不会被误读成「这句不是黑名单」（那会产生假阴性，把二分边界全部带偏）。
+
+定位到新句子后，按**最小改写**加进 `bridge/workbuddy-bridge.mjs` 的 `AUDIT_TEMPLATE_REWRITES`（只动一个词、语义不变），补一条回归用例，再 `npm run vendor` 同步快照。
+
 ### 上游版本漂移（身份指纹整体被拒）
 
 **症状**：凭据完全正常，但**所有**请求突然 `401` 或 400 code `11128`（含 Claude Code 全量失败）。先排除上一节的 ③：system 里是否含那两句、桥日志有无 `audit-template` 改写记录——已改写仍每条都拦，才是本症状。

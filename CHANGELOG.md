@@ -19,8 +19,35 @@
 
 ## [Unreleased] - 2026-10-22
 
+### Added
+
+- **黑名单哨兵：指纹改写命中计数经 `/health` 暴露**。`/health` 新增 `fingerprints`
+  段：`rewrites`（本进程累计改写次数，只增不减）+ `byRule`（逐条规则的命中数与句子
+  摘要，含 0 命中的）。上游加黑名单是**悄悄的**（2026-10-21 那两句上线时没有任何
+  公告，表现只是「突然全报 11-128」），有了这个计数，rewrites 由 0 变正就是最早
+  信号，byRule 还能直接指出是哪条在命中，省掉重新二分定位。只回摘要不回原文，
+  不记对话内容。
+- **`npm run check:fingerprint`**（`tools/dev/check-fingerprint-coverage.mjs`）：
+  从本机最新 DSH 会话日志取出**真实 system 提示词**，离线比对改写表是否仍覆盖；
+  并报告 system 里未被覆盖的自称类句子（候选新黑名单）。适合 DSH 升级后、发版前跑。
+  退出码 1 = 疑似新黑名单。
+- **`npm run probe:fingerprint`**（`tools/dev/probe-dsh-fingerprint.mjs`）：
+  对运行中的桥做真机二分，把触发片段压到最短。**把 429 与「没触发」严格区分**，
+  限流不会被误读成「这句不是黑名单」（那种假阴性会把二分边界全部带偏）。
+
 ### Fixed
 
+- **`check-fingerprint` 的内存炸弹（曾两次把宿主 DSH 一起带崩）**。早期版本把整个
+  会话文件解压成一个字符串再 `split('\n')`；实际会话可达 23MB / 14725 帧，解压后
+  字符量巨大，直接把机器内存打满（DSH 与它同机，一起被 OOM 杀掉）。改为**逐帧解压、
+  逐帧解析、立刻丢弃**，且**拿到完整 system 就停**（DSH 的 system 在每轮开头，不必
+  扫全文件）；另有 `--max-frames` 与堆内存硬闸。实测同一 23MB 文件：**只扫 5 帧**、
+  在 `--max-old-space-size=200` 下正常退出。
+- **改写表规则解析漏掉双引号条目**。`AUDIT_TEMPLATE_REWRITES` 里单双引号混用
+  （Claude Code 那条含撇号，只能用双引号包），原先只认单引号的解析器会把那条整条
+  漏掉 —— 覆盖检查于是「假装它在、实际从没检查过」。现两种引号都认。
+- **`powered by …` 粗粒度正则的假警报**：改写后的形态（`built on …`）会被再抓一遍。
+  现按「黑名单是整句匹配」的事实，只保留整句级候选（自称开头或 > 60 字符）。
 - **真正修复：国内版把 DSH 的 system 两句开场指纹逐字拉黑 → 桥出站最小改写**。
   症状：2026-10-21 起国内版（copilot.tencent.com）上 DSH **每一轮 agent 请求**都报
   `400 code 11128 Illegal API invocation from an unapproved channel`（上游 displayMsg

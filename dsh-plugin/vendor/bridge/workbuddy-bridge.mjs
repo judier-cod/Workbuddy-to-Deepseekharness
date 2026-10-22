@@ -955,11 +955,26 @@ const AUDIT_TEMPLATE_REWRITES = [
 ];
 
 /** system 文本的最小改写；无命中时返回原值（引用不变，便于命中计数）。 */
+/*
+ * 每条约定的命中次数（进程级，只增不减）。
+ *
+ * 为什么要计数：黑名单是**上游悄悄加的** —— 2026-10-21 那两句上线时没有任何公告，
+ * 表现只是「突然全报 11-128」。有了计数，/health 里 `fingerprints.rewrites` 一旦
+ * 由 0 变正，就说明上游又拉黑了新句子（或旧句子复活），能在用户报错之前发现；
+ * 而 `fingerprints.byRule` 直接指出是**哪一条**在命中，省掉重新二分定位的功夫。
+ *
+ * 按 `from` 原文做键（不用下标）：改写表将来增删条目时，历史计数不会串位。
+ */
+const fingerprintHits = new Map();
+
 function rewriteAuditTemplate(text) {
   if (typeof text !== 'string' || text === '') return text;
   let out = text;
   for (const [from, to] of AUDIT_TEMPLATE_REWRITES) {
-    if (out.includes(from)) out = out.split(from).join(to);
+    if (!out.includes(from)) continue;
+    const occurrences = out.split(from).length - 1;
+    fingerprintHits.set(from, (fingerprintHits.get(from) || 0) + occurrences);
+    out = out.split(from).join(to);
   }
   return out;
 }
@@ -3485,6 +3500,21 @@ async function handleRequest(req, res) {
         },
         // 客户端凭据分层（B2）：只暴露启用状态与数量，**绝不回显 key 或哈希**
         clients: { enabled: CLIENT_KEY_HASHES.size > 0, count: CLIENT_KEY_HASHES.size },
+        /*
+         * 指纹改写的命中情况 —— 上游「悄悄加黑名单」的最早信号。
+         *
+         * 只回「命中了几次」与「命中的是哪条规则的**序号和摘要**」，不回原文：
+         * 这些句子本身不是秘密（就在 AUDIT_TEMPLATE_REWRITES 里），但把它们整段
+         * 回显到 HTTP 上没有任何好处，摘要足够用户和排查者对号入座。
+         */
+        fingerprints: {
+          rewrites: [...fingerprintHits.values()].reduce((a, b) => a + b, 0),
+          byRule: AUDIT_TEMPLATE_REWRITES.map(([from], i) => ({
+            rule: i + 1,
+            preview: from.slice(0, 48),
+            hits: fingerprintHits.get(from) || 0,
+          })),
+        },
         // 自动签到的内存态：桥重启后清空、重新判定（上游幂等兜底）
         autoCheckinEnabled: AUTO_CHECKIN_ENABLED,
         autoCheckin: autoCheckinState,

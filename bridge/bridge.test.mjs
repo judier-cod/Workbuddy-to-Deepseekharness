@@ -2161,3 +2161,69 @@ test('桥：11128 持续拦截 → 只重试 2 次就如实透传上游 400（�
     rmSync(bridge.dir, { recursive: true, force: true });
   }
 });
+
+test('桥：指纹改写命中计数经 /health 暴露（上游悄悄加黑名单的最早信号）', { timeout: 90_000 }, async () => {
+  /*
+   * 为什么需要这个计数：黑名单是**上游悄悄加的**（2026-10-21 那两句上线时没有任何
+   * 公告），表现只是「突然全报 11-128」。有了计数，/health 的 fingerprints.rewrites
+   * 一旦由 0 变正，说明上游又拉黑了新句子 —— 能在用户报错之前发现；byRule 还能
+   * 直接指出是哪条规则在命中，省掉重新二分定位的功夫。
+   *
+   * 本用例钉三件事：① 没命中时计数是 0（不能瞎报）；② 命中后计数与 byRule 都对；
+   * ③ 计数是**进程级累加**，第二次请求继续涨（不是每次重置）。
+   */
+  const stub = await startStubUpstream(['fp-model']);
+  const bridge = await startBridge({ CODEBUDDY_ENDPOINT: stub.base }, { auth: READABLE_FAKE_AUTH });
+  try {
+    await fetch(bridge.baseUrl + '/v1/models?all=1');
+
+    const healthOf = () => fetch(bridge.baseUrl + '/health', { headers: auth, signal: AbortSignal.timeout(10000) }).then((r) => r.json());
+
+    // ① 冷启动：还没人带指纹请求，计数必须为 0
+    const before = await healthOf();
+    assert.ok(before.fingerprints, '/health 必须带 fingerprints 段');
+    assert.equal(before.fingerprints.rewrites, 0, '没有带指纹的请求时，rewrites 必须是 0（不得瞎报）');
+    assert.ok(Array.isArray(before.fingerprints.byRule) && before.fingerprints.byRule.length > 0,
+      'byRule 必须逐条列出改写规则（含 0 命中的），排查时才知道总共有几条在守');
+
+    // ② 带指纹的请求：命中一次
+    const chat = (sys) => fetch(bridge.baseUrl + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'fp-model',
+        stream: true,
+        messages: [{ role: 'system', content: sys }, { role: 'user', content: 'ping' }],
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+
+    const res1 = await chat('You are an AI agent powered by DeepSeek Harness.');
+    assert.equal(res1.status, 200);
+    await res1.text();
+
+    const after1 = await healthOf();
+    assert.equal(after1.fingerprints.rewrites, 1, '命中一次后 rewrites 应为 1');
+    const dshRule = after1.fingerprints.byRule.find((r) => r.preview.startsWith('You are an AI agent powered by'));
+    assert.ok(dshRule, 'byRule 里应能找到 DSH 开场白那条规则');
+    assert.equal(dshRule.hits, 1, '该条规则命中数应为 1');
+
+    // ③ 再发一次：进程级累加，不是重置
+    const res2 = await chat('You are an AI agent powered by DeepSeek Harness.');
+    assert.equal(res2.status, 200);
+    await res2.text();
+    const after2 = await healthOf();
+    assert.equal(after2.fingerprints.rewrites, 2, '计数必须累加（第二次后为 2），不能每次请求重置');
+
+    // ④ 不带指纹的请求不得让计数上涨（避免把普通对话误计成「上游又加黑名单」）
+    const res3 = await chat('You are a helpful assistant.');
+    assert.equal(res3.status, 200);
+    await res3.text();
+    const after3 = await healthOf();
+    assert.equal(after3.fingerprints.rewrites, 2, '不含指纹的请求不得改变计数');
+  } finally {
+    await bridge.stop();
+    try { await stub.close(); } catch { /* 忽略 */ }
+    rmSync(bridge.dir, { recursive: true, force: true });
+  }
+});
