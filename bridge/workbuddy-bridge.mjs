@@ -78,26 +78,6 @@ const CHANNEL_BLOCK_DELAYS = [1500, 5000];
 const SSE_HEARTBEAT_MS = Number(process.env.WORKBUDDY_SSE_HEARTBEAT_MS ?? 30_000);
 
 /**
- * 429 降级链（**默认关闭**；WORKBUDDY_FALLBACK_ON_429=1 打开）。
- *
- * 为什么默认关：降级会消耗**另一个模型**的额度 —— 那是用户的钱，不该由桥替他决定。
- * 默认行为仍是如实把 429 交给客户端（带 Retry-After），换不换由用户选。
- *
- * 数据依据（bridge/usage.jsonl 实测，100 次上游 429）：
- *   · 429 后 5 分钟内换**其他模型**：601 次请求 557 次成功（93%）；
- *   · 同账号同模型在 429 后 60 秒内重试：258 次里 135 次仍失败（52%）；
- *   · 同模型恢复间隔中位数 ~38 小时（也有 1 秒的瞬时抖动机）。
- * 结论：换模型有效，死等同一模型无效。上游自己的文案也写着
- * 「alternatively, you can switch to the other models」。
- *
- * **只在 429 上降级**：11128（黑名单）换模型没用；5xx 换模型会掩盖真实故障；
- * 401 是凭据问题 —— 这些都该如实报给用户。
- */
-const FALLBACK_ON_429 = process.env.WORKBUDDY_FALLBACK_ON_429 === '1';
-/** 最多换几个模型（0 = 不换）。上限 3 是防止额度被连锁消耗。 */
-const FALLBACK_MAX = Math.max(0, Math.min(3, Number(process.env.WORKBUDDY_FALLBACK_MAX ?? 1)));
-
-/**
  * 从上游 429 的文案里解析「什么时候恢复」，返回距现在多少秒（解析不出返回 null）。
  *
  * 为什么值得解析：上游的频率限制**不是按秒级窗口**，而是「到某个时刻重置」
@@ -1405,122 +1385,6 @@ async function acquireRateSlot(clientSignal, scope = 'local') {
   }
 }
 
-/**
- * 请求里是否带图片（OpenAI 的 `image_url`；Anthropic 的 image block 会先被转成同一形态）。
- * 降级选模型要用：请求带图而候选不支持图片，上游会**把图丢掉照常回答** —— 静默错结果，
- * 比直接报 429 更糟。
- */
-function requestHasImage(payload) {
-  const messages = payload?.messages;
-  if (!Array.isArray(messages)) return false;
-  for (const m of messages) {
-    if (!m || !Array.isArray(m.content)) continue;
-    for (const part of m.content) {
-      if (part && (part.type === 'image_url' || part.type === 'image')) return true;
-    }
-  }
-  return false;
-}
-
-/**
- * 为降级挑候选模型：与 `model` **能力相当**、且确实在当前目录里。
- *
- * 硬约束（少一条就会让降级变成「换个方式坏掉」）：
- *   1. 原请求带 tools → 候选必须不是 `supportsToolCall === false`。
- *      否则换过去得到的是普通文本而不是工具调用，用户以为成功了。
- *   2. 原请求带图片 → 候选不能是 `supportsImages === false`（理由见 requestHasImage）。
- *   3. 只用目录里真实存在的 id（否则上游回 11102）。
- * 字段缺失时**按支持处理**：目录偶尔漏报（国际版 deepseek-v4.1-flash 就漏报过图片能力），
- * 因为缺字段就误杀候选，会让降级在真正需要时无模型可用。
- *
- * 排序：优先免费/低价（降级是补救，不该比原模型更贵），其次上下文更接近原模型的。
- */
-async function fallbackCandidates(model, payload, limit) {
-  if (limit <= 0) return [];
-  /*
-   * 用 upstreamCatalog() 而不是直接读 catalogCache：
-   * 冷启动（桥刚起、还没人调过 /v1/models）时缓存是**空的**，此时直接读会得到
-   * 空候选 → 降级静默失效。实测踩过：脚本里先调 /v1/models 再发请求仍然失败，
-   * 因为那是异步后台刷新，调用方拿到的仍是空缓存。
-   * upstreamCatalog() 在「完全没有缓存」时才同步抓一次，已有缓存立刻返回 ——
-   * 正好是降级需要的语义（不能为了降级把每个请求都拖慢）。
-   */
-  let models = catalogCache.models;
-  if (!Array.isArray(models) || models.length === 0) {
-    try { models = await upstreamCatalog(); } catch { models = []; }
-  }
-  if (!Array.isArray(models) || models.length === 0) return [];
-  const anyTool = Array.isArray(payload?.tools) && payload.tools.length > 0;
-  const anyImage = requestHasImage(payload);
-  const current = models.find((m) => m.id === model) || null;
-  const usable = models.filter((m) => {
-    if (!m || typeof m.id !== 'string' || !m.id || m.id === model) return false;
-    if (anyTool && m.supportsToolCall === false) return false;
-    if (anyImage && m.supportsImages === false) return false;
-    return true;
-  });
-  const cost = (m) => {
-    if (m.free === true) return 0;
-    const c = typeof m.credits === 'number' ? m.credits : Number.NaN;
-    return Number.isFinite(c) ? c : 99;
-  };
-  const wantCtx = current?.maxInputTokens || 0;
-  usable.sort((a, b) => {
-    const d = cost(a) - cost(b);
-    if (d !== 0) return d;
-    if (wantCtx) {
-      const da = Math.abs((a.maxInputTokens || 0) - wantCtx);
-      const db = Math.abs((b.maxInputTokens || 0) - wantCtx);
-      if (da !== db) return da - db;
-    }
-    return String(a.id).localeCompare(String(b.id));
-  });
-  return usable.slice(0, limit).map((m) => m.id);
-}
-
-/**
- * 撞上上游 429 时换一个能力相当的模型重发一次。
- *
- * 返回「成功的那次响应」包装（与 callUpstream 同形），或 null 表示放弃降级
- * （此时调用方会照原样返回最初的 429 —— 保留它比抛出「最后一个候选的错误」
- * 更能反映真实原因）。
- *
- * 只在**候选真的成功**时采用：候选也 429 / 5xx / 11128 就跳过试下一个。
- *
- * @param {{ auth: object, model: string, bodyString: string, conversationId: string,
- *   clientSignal?: AbortSignal, upEnter: number,
- *   attemptWithStaleRetry: (a: object, m?: string, b?: string) => Promise<any> }} ctx
- */
-async function tryFallbackOn429(ctx) {
-  const { auth, model, bodyString, clientSignal, upEnter, attemptWithStaleRetry } = ctx;
-  let retryPayload;
-  try { retryPayload = JSON.parse(bodyString); } catch { return null; }
-  if (!retryPayload) return null;
-
-  const tried = new Set([model]);
-  for (const candidate of await fallbackCandidates(model, retryPayload, FALLBACK_MAX)) {
-    if (tried.has(candidate) || clientSignal?.aborted) continue;
-    tried.add(candidate);
-    log(`fallback on 429: ${model} -> ${candidate}`);
-    let next;
-    try {
-      next = await attemptWithStaleRetry(auth, candidate, JSON.stringify({ ...retryPayload, model: candidate }));
-    } catch (e) {
-      log(`fallback attempt failed (${candidate}): ${e.message}`);
-      continue;
-    }
-    if (next.ok) {
-      // 标记来源：上层据此写响应头与账本字段（用户能看到「这条其实换了模型」）。
-      next.fallbackFrom = model;
-      next.fallbackModel = candidate;
-      return { res: next, bodyText: null, upstreamStartedAt: upEnter };
-    }
-    // 候选失败：把体读掉，避免 keep-alive 连接处于不一致状态（同 callUpstream 的说明）。
-    await next.text().catch(() => '');
-  }
-  return null;
-}
-
 async function callUpstream(bodyString, model, conversationId, clientSignal) {
   // 限流闸门（opt-in；默认关）。放在最前：超限的请求连凭据都不读、更不打上游。
   // 限流桶按调用方分（local / 各 client key）—— B2 凭据分层的一部分。
@@ -1540,29 +1404,28 @@ async function callUpstream(bodyString, model, conversationId, clientSignal) {
     if (next) auth = next;
   }
 
-  const attempt = (a, useModel = model, useBody = bodyString) => {
+  const attempt = (a) => {
     // WORKBUDDY_TIMEOUT_MS > 0 时给整个上游往返加超时（0/未设 = 不限，
     // LLM 长回答需要）；与客户端取消信号合并。
     const timeoutSignal = UPSTREAM_TIMEOUT_MS > 0 ? AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) : null;
     const signal = clientSignal && timeoutSignal ? AbortSignal.any([clientSignal, timeoutSignal])
       : (clientSignal || timeoutSignal || undefined);
     return upstreamRequest(`${a.endpoint}${CHAT_PATH}`, {
-      // useModel 默认是原模型；只有降级那一次会传入不同 id（body 也一并替换）
-      headers: buildHeaders(a, useModel, conversationId),
-      body: useBody,
+      headers: buildHeaders(a, model, conversationId),
+      body: bodyString,
       signal,
     }).then(shimResponse);
   };
 
-  const attemptWithStaleRetry = async (a, useModel = model, useBody = bodyString) => {
+  const attemptWithStaleRetry = async (a) => {
     try {
-      return await attempt(a, useModel, useBody);
+      return await attempt(a);
     } catch (error) {
       // 复用的空闲连接被上游掐断（服务器先关）→ 换新连接重试一次。
       // 新连接必然不是 reused；首次连接就失败属于真故障，不重试。
       if (!clientSignal?.aborted && /ECONNRESET|socket hang up|EPIPE/i.test(String(error?.message || error?.code || ''))) {
         log('stale keep-alive socket, retrying once on a fresh connection');
-        return attempt(a, useModel, useBody);
+        return attempt(a);
       }
       throw error;
     }
@@ -1592,20 +1455,6 @@ async function callUpstream(bodyString, model, conversationId, clientSignal) {
   const status = res.status;
   if (status !== 400 && (status < 200 || status >= 300)) {
     const text = await res.text().catch(() => '');
-    /*
-     * 429 降级链（opt-in）必须放在这里，而不是下面的函数末尾。
-     *
-     * 血泪教训：最初写在函数末尾，结果**永远不可达** —— 因为 429 是「非 400 且非 2xx」，
-     * 会被上面这条 if 直接 return 掉。表现为「降级代码在、日志也在、就是不生效」，
-     * 排查时极易误以为是候选模型没选出来（实际连分支都没进）。
-     * 现在放在唯一的 429 出口处：既能拿到已经读好的 bodyText，也不会有第二条路径绕过。
-     */
-    if (FALLBACK_ON_429 && FALLBACK_MAX > 0 && status === 429) {
-      const fellBack = await tryFallbackOn429({
-        auth, model, bodyString, conversationId, clientSignal, upEnter, attemptWithStaleRetry,
-      });
-      if (fellBack) return fellBack;
-    }
     return { res, bodyText: text, upstreamStartedAt: upEnter };
   }
 
@@ -1657,7 +1506,7 @@ async function callUpstream(bodyString, model, conversationId, clientSignal) {
       return { res, bodyText: t, upstreamStartedAt: upEnter };
     }
   }
-    return { res, bodyText: null, upstreamStartedAt: upEnter };
+  return { res, bodyText: null, upstreamStartedAt: upEnter };
 }
 
 // ── SSE parsing and aggregation (non-streaming clients only) ─────────────
@@ -2503,12 +2352,6 @@ function recentRequests(limit = 50) {
     ...(typeof r.promptTokens === 'number' ? { promptTokens: r.promptTokens } : {}),
     ...(typeof r.completionTokens === 'number' ? { completionTokens: r.completionTokens } : {}),
     ...(typeof r.credit === 'number' ? { credit: r.credit } : {}),
-    /*
-     * 降级来源：这条请求原本用的模型（本条的 `model` 是**实际服务**的那个）。
-     * 不透传的话，面板上只会看到「m-alt-cheap 被调用了」，而用户点的是 m-primary ——
-     * 排查「为什么回答风格变了 / 为什么这个模型花了钱」时完全对不上号。
-     */
-    ...(typeof r.fallbackFrom === 'string' && r.fallbackFrom ? { fallbackFrom: r.fallbackFrom } : {}),
   }));
 }
 
@@ -4054,12 +3897,6 @@ async function handleRequest(req, res) {
             'Cache-Control': 'no-cache, no-transform',
             Connection: 'keep-alive',
             'X-Accel-Buffering': 'no',
-            /*
-             * 降级留痕：若这次是「原模型 429 → 换了另一个模型才成功」，把原模型名
-             * 回给客户端。只加一个响应头、不改协议语义 —— 排查「为什么回答风格变了」
-             * 时这是唯一线索（内容里看不出来）。没有降级时这个头不出现。
-             */
-            ...(up.fallbackFrom ? { 'X-WorkBuddy-Fallback-From': String(up.fallbackFrom) } : {}),
             ...SECURITY_HEADERS,
           });
           /*
@@ -4142,16 +3979,7 @@ async function handleRequest(req, res) {
               error: streamError.message,
             });
           } else {
-            recordRequest({
-              // 降级发生时记**实际服务的模型**，并把原模型放 fallbackFrom：
-              // 否则账本会显示「deepseek 消耗了额度」，而真正花钱的是候选模型。
-              model: up.fallbackModel || model,
-              ...(up.fallbackFrom ? { fallbackFrom: up.fallbackFrom } : {}),
-              stream: true,
-              ok: true,
-              ms: Date.now() - startedAt,
-              ...usageOf(usageSeen),
-            });
+            recordRequest({ model, stream: true, ok: true, ms: Date.now() - startedAt, ...usageOf(usageSeen) });
           }
           return res.end();
         }
