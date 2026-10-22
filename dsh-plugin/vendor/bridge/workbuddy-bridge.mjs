@@ -62,6 +62,20 @@ const TRANSIENT_400_DELAYS = [1000, 4000, 10000, 25000];
  * 的三类成因逐项排除（尤其 ③ 看日志有没有 `rewrote … audit-template`），别靠重试。
  */
 const CHANNEL_BLOCK_DELAYS = [1500, 5000];
+
+/**
+ * SSE 心跳间隔（0 = 关）。
+ *
+ * 为什么需要：上游在长上下文 / 长时间 reasoning 时可能**几十秒不吐一个字节**
+ * （实测本机账本里有 132 秒才完成的请求）。期间流的 socket 是静默的，而不少
+ * 中间层（反向代理、CDN、企业网关）和客户端读超时会把"长时间无数据的流"判死 ——
+ * 表现是「答到一半断了」或「一直转圈然后报网络错误」，且客户端拿不到任何错误码。
+ *
+ * 用 SSE **注释帧**（`: keepalive`）保活：按 SSE 规范注释行不产生 message 事件，
+ * OpenAI/Anthropic SDK 都会安静忽略，不会污染内容、也不影响 finish_reason。
+ * 30 秒是常见中间层默认空闲超时（60s）的一半，留足余量。
+ */
+const SSE_HEARTBEAT_MS = Number(process.env.WORKBUDDY_SSE_HEARTBEAT_MS ?? 30_000);
 const UPSTREAM_TIMEOUT_MS = Number(process.env.WORKBUDDY_TIMEOUT_MS || 0); // 0 = unlimited (long answers need it)
 
 // ── Upstream keep-alive connection pool ────────────────────────────────────
@@ -1837,6 +1851,24 @@ async function relayAnthropicStream(up, res, model, estInputTokens) {
     'X-Accel-Buffering': 'no',
     ...SECURITY_HEADERS,
   });
+  // 头要立刻发出去（Node 的 writeHead 只登记，等首次 write）。理由见 OpenAI 路径同处注释。
+  res.flushHeaders?.();
+
+  /*
+   * SSE 心跳：Anthropic 路径同样会长时间静默（上游预填充 / 长时间 reasoning）。
+   * 用注释帧而不是事件帧：注释不产生 message 事件，Claude Code 的 SSE 解析器会
+   * 忽略它 —— 绝不伪造 `ping` 事件，也不插进 content_block 的 start/stop 配对里
+   * （那会让客户端判定流损坏）。
+   */
+  let heartbeat = null;
+  if (SSE_HEARTBEAT_MS > 0) {
+    heartbeat = setInterval(() => {
+      if (res.writableEnded) { clearInterval(heartbeat); heartbeat = null; return; }
+      try { res.write(': keepalive\n\n'); } catch { /* 客户端已断，外层统一收尾 */ }
+    }, SSE_HEARTBEAT_MS);
+    if (typeof heartbeat.unref === 'function') heartbeat.unref();
+  }
+  const disarmHeartbeat = () => { if (heartbeat) { clearInterval(heartbeat); heartbeat = null; } };
 
   write('message_start', {
     type: 'message_start',
@@ -1944,6 +1976,9 @@ async function relayAnthropicStream(up, res, model, estInputTokens) {
   } catch (e) {
     streamError = e;
     log('anthropic stream interrupted', e.message);
+  } finally {
+    // 必须先停心跳再 end：否则最后一帧可能落在 message_stop 之后，客户端判定流损坏
+    disarmHeartbeat();
   }
 
   closeOpen();
@@ -3803,6 +3838,35 @@ async function handleRequest(req, res) {
             'X-Accel-Buffering': 'no',
             ...SECURITY_HEADERS,
           });
+          /*
+           * 立刻把响应头刷出去（flushHeaders）。
+           *
+           * 为什么必须显式刷：Node 的 `writeHead()` **只登记头部**，真正的 HEAD 要等到
+           * 第一次 `write()` 才发。而上游在长上下文预填充期间可能几十秒不出字节 ——
+           * 于是客户端连「200 + text/event-stream」都收不到，只能干等；等它超时就是
+           * 「网络错误」，连错误码都没有。刷掉之后：客户端立刻知道「连接已建立、正在
+           * 等模型」，配合下面的心跳注释帧，中间层的空闲超时也不会误判。
+           */
+          res.flushHeaders?.();
+          /*
+           * 心跳定时器：**首个字节到达前也要跳**，因为最长的静默往往就在 TTFT
+           * （长上下文预填充）。每次真实写入都重置计时，避免和正常数据打架。
+           */
+          let heartbeat = null;
+          const armHeartbeat = () => {
+            if (!(SSE_HEARTBEAT_MS > 0)) return;
+            if (heartbeat) clearInterval(heartbeat);
+            heartbeat = setInterval(() => {
+              if (res.writableEnded) { clearInterval(heartbeat); heartbeat = null; return; }
+              try { res.write(': keepalive\n\n'); } catch { /* 客户端已断，下面统一收尾 */ }
+            }, SSE_HEARTBEAT_MS);
+            // 定时器不该拖住进程退出（测试与被 Ctrl+C 停掉的场景）
+            if (typeof heartbeat.unref === 'function') heartbeat.unref();
+          };
+          const disarmHeartbeat = () => {
+            if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+          };
+          armHeartbeat();
           const reader = up.body.getReader();
           const decoder = new TextDecoder();
           let usageSeen = null;
@@ -3834,6 +3898,8 @@ async function handleRequest(req, res) {
           } catch (e) {
             streamError = e;
             log('stream interrupted', e.message);
+          } finally {
+            disarmHeartbeat();
           }
           // 上游在流中途断了（连接被掐 / 网络故障）**不是成功**：客户端的回答
           // 已被截断，账本要如实记一笔失败，否则「回答为什么少了一半」在控制台上

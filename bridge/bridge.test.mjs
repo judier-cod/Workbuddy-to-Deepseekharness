@@ -227,6 +227,23 @@ async function startStubUpstream(models = ['stub-model'], opts = {}) {
          * `opts.chatRaw`：模拟「上游 HTTP 200，但返回的不是 SSE」。
          * 网关把错误包成 200 的 HTML 是真实会发生的（见 BUG-2 的用例）。
          */
+        /*
+         * `opts.chatSilentMs`：先静默这么多毫秒**一个字节都不发**，再正常流式回。
+         * 用来验证「上游长时间不出声时，桥是否会向客户端发 SSE 心跳」——
+         * 上游长上下文预填充/长时间 reasoning 时就是这个形态。
+         */
+        if (opts.chatSilentMs > 0) {
+          res.writeHead(opts.chatSilentStatus || 200, {
+            'content-type': opts.chatSilentType || 'text/event-stream',
+          });
+          res.flushHeaders?.();
+          setTimeout(() => {
+            res.write('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n');
+            res.write('data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}\n\n');
+            res.end('data: [DONE]\n\n');
+          }, opts.chatSilentMs);
+          return;
+        }
         if (opts.chatRaw !== undefined) {
           res.writeHead(opts.chatStatus || 200, { 'content-type': opts.chatType || 'text/html' });
           return res.end(opts.chatRaw);
@@ -2221,6 +2238,93 @@ test('桥：指纹改写命中计数经 /health 暴露（上游悄悄加黑名�
     await res3.text();
     const after3 = await healthOf();
     assert.equal(after3.fingerprints.rewrites, 2, '不含指纹的请求不得改变计数');
+  } finally {
+    await bridge.stop();
+    try { await stub.close(); } catch { /* 忽略 */ }
+    rmSync(bridge.dir, { recursive: true, force: true });
+  }
+});
+
+test('桥：上游长时间静默时必须发 SSE 心跳，且响应头要立刻到（否则客户端干等/被中间层掐断）', { timeout: 90_000 }, async () => {
+  /*
+   * 为什么必须有这条：上游在长上下文预填充 / 长时间 reasoning 时可能几十秒不出字节
+   * （实测本机账本里有 132 秒才完成的请求）。这期间若桥也一声不吭，客户端只能干等；
+   * 而反向代理/CDN/客户端读超时会把「长时间无数据的流」判死，表现为「答到一半断了」
+   * 或「转圈后报网络错误」，且拿不到任何错误码。
+   *
+   * 钉住三件事：① 响应头立刻到（不等上游首字节）；② 静默期有注释帧心跳；
+   * ③ 心跳是 SSE 注释（以 `:` 开头），不会产生 message 事件污染内容。
+   */
+  const stub = await startStubUpstream(['hb-model'], { chatSilentMs: 3000 });
+  const bridge = await startBridge(
+    { CODEBUDDY_ENDPOINT: stub.base, WORKBUDDY_SSE_HEARTBEAT_MS: '400' },
+    { auth: READABLE_FAKE_AUTH },
+  );
+  try {
+    await fetch(bridge.baseUrl + '/v1/models?all=1');
+
+    const t0 = Date.now();
+    const res = await fetch(bridge.baseUrl + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'hb-model', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const headerAt = Date.now() - t0;
+    assert.equal(res.status, 200);
+    assert.ok(headerAt < 2000, `响应头必须立刻到（实测 ${headerAt}ms），不能等上游首字节`);
+
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    const chunks = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push({ at: Date.now() - t0, text: dec.decode(value, { stream: true }) });
+    }
+
+    const duringSilence = chunks.filter((c) => c.at < 2800);
+    const heartbeats = duringSilence.filter((c) => c.text.trim().startsWith(':'));
+    assert.ok(heartbeats.length > 0,
+      `静默期必须有 SSE 注释帧心跳（实际 ${JSON.stringify(duringSilence.map((c) => c.at))}）`);
+    assert.ok(heartbeats.every((c) => c.text.trim().startsWith(':')), '心跳必须是注释帧（以冒号开头），不能是 data: 事件');
+
+    const all = chunks.map((c) => c.text).join('');
+    assert.match(all, /"content":"ok"/, '心跳之后真实数据必须照常到达');
+    assert.match(all, /\[DONE\]/, '流必须正常收尾');
+  } finally {
+    await bridge.stop();
+    try { await stub.close(); } catch { /* 忽略 */ }
+    rmSync(bridge.dir, { recursive: true, force: true });
+  }
+});
+
+test('桥：Anthropic 路径同样有静默期心跳，且心跳不插进 content_block 配对里', { timeout: 90_000 }, async () => {
+  /*
+   * Anthropic 流比 OpenAI 严格：每个 content_block 必须 start/delta/stop 配对。
+   * 所以这里除了「有心跳」，还要钉住「心跳用的是注释帧、没有被伪装成 ping 事件」，
+   * 且 message_start / message_stop 仍然成对出现。
+   */
+  const stub = await startStubUpstream(['hb-a-model'], { chatSilentMs: 2500 });
+  const bridge = await startBridge(
+    { CODEBUDDY_ENDPOINT: stub.base, WORKBUDDY_SSE_HEARTBEAT_MS: '400' },
+    { auth: READABLE_FAKE_AUTH },
+  );
+  try {
+    await fetch(bridge.baseUrl + '/v1/models?all=1');
+    const res = await fetch(bridge.baseUrl + '/v1/messages', {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'hb-a-model', max_tokens: 16, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      signal: AbortSignal.timeout(30000),
+    });
+    assert.equal(res.status, 200);
+    const text = await res.text();
+
+    assert.match(text, /: keepalive/, 'Anthropic 路径静默期必须有注释帧心跳');
+    assert.ok(!/^event: ping$/m.test(text), '心跳不得伪装成 ping 事件');
+    assert.match(text, /event: message_start/, '仍必须有 message_start');
+    assert.match(text, /event: message_stop/, '仍必须有 message_stop');
   } finally {
     await bridge.stop();
     try { await stub.close(); } catch { /* 忽略 */ }

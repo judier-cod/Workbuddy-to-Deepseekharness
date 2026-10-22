@@ -21,6 +21,19 @@
 
 ### Added
 
+- **SSE 静默期心跳 + 立刻 flush 响应头**（借鉴 litellm #31877/#34819、openclaw #70739、
+  CopilotKit #6984 等项目的共同修复）。上游在长上下文预填充 / 长时间 reasoning 时可能
+  **几十秒不吐一个字节**（实测本机账本里有 132 秒才完成的请求）。期间：
+  ① 响应头会被 Node 推迟到首次 `write()` 才发出 —— 客户端连「200 + text/event-stream」
+  都收不到，只能干等；② 流本身静默无声 —— 反向代理 / CDN / 客户端读超时会把
+  「长时间无数据的流」判死，表现为「答到一半断了」或「转圈后报网络错误」，且**没有任何
+  错误码**可查。
+  修法：`res.flushHeaders()` 让头部立刻下发；之后按 `WORKBUDDY_SSE_HEARTBEAT_MS`
+  （默认 30s）发 SSE **注释帧**（`: keepalive`）。选注释帧而不是事件帧，是因为按 SSE
+  规范注释行不产生 message 事件，OpenAI/Anthropic SDK 都会安静忽略 —— 不污染内容、
+  不干扰 `finish_reason`，也不会插进 Anthropic 的 content_block start/stop 配对里
+  （那会让 Claude Code 判定流损坏）。OpenAI 与 Anthropic 两条路径都已覆盖，
+  心跳在流收尾前显式 disarm（避免最后一帧落在 `message_stop` 之后）。
 - **黑名单哨兵：指纹改写命中计数经 `/health` 暴露**。`/health` 新增 `fingerprints`
   段：`rewrites`（本进程累计改写次数，只增不减）+ `byRule`（逐条规则的命中数与句子
   摘要，含 0 命中的）。上游加黑名单是**悄悄的**（2026-10-21 那两句上线时没有任何
